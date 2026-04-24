@@ -41,10 +41,9 @@ pub fn validate(v: &crate::cli::Validate) -> anyhow::Result<()> {
 
         total_read += line.as_bytes().len();
 
-        const MAX_PAIRS: usize = 256;
-        let mut pairs: [(&str, &str); MAX_PAIRS] = [("", ""); MAX_PAIRS];
-        let (n_pairs, overflow) = logfmt::parse_line(line, &mut pairs);
-        total_pairs += n_pairs;
+        let mut buf = logfmt::Buffer::<256>::new();
+        let (pairs, overflow) = buf.parse(line);
+        total_pairs += pairs.len();
         total_overflow += overflow as usize;
 
         line_buf.clear();

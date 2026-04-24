@@ -1,15 +1,57 @@
 //! Small zero-copy logfmt parser.
 
 use memchr::{memchr, memchr2, memchr3};
+use std::mem::MaybeUninit;
 
-/// Parse a single logfmt line into `(key, value)` slices of the input.
+/// Fixed-size stack-allocated scratch buffer for [`Buffer::parse`].
 ///
-/// Fills `out` in order. Returns `(written, overflow)` — the number of pairs
-/// actually stored (≤ `out.len()`) and whether some pairs remain.
-/// Quoted values are returned *including* the
-/// surrounding quotes; call [`unescape_value`] to decode them. Malformed
-/// input is consumed best-effort.
-pub fn parse_line<'a>(line: &'a str, out: &mut [(&'a str, &'a str)]) -> (usize, bool) {
+/// Zero-cost to construct: [`Buffer::new`] doesn't initialize the slots,
+/// so there's no `memset` in the hot path.
+pub struct Buffer<'a, const N: usize> {
+    slots: [MaybeUninit<(&'a str, &'a str)>; N],
+}
+
+impl<'a, const N: usize> Buffer<'a, N> {
+    /// Construct an uninitialized buffer. No allocation, no memset.
+    #[inline]
+    pub const fn new() -> Self {
+        Self {
+            slots: [const { MaybeUninit::uninit() }; N],
+        }
+    }
+
+    /// Parse `line` into this buffer and return an initialized slice of
+    /// `(key, value)` pairs plus a boolean indicating whether additional
+    /// pairs were dropped because the buffer was too small.
+    ///
+    /// Quoted values are returned *including* the surrounding quotes;
+    /// call [`unescape_value`] to decode them.
+    #[inline]
+    pub fn parse(&mut self, line: &'a str) -> (&[(&'a str, &'a str)], bool) {
+        let (written, overflow) = parse_line_impl(line, &mut self.slots);
+        // SAFETY: `parse_line_impl` initialized `self.slots[..written]`.
+        let init: &[(&'a str, &'a str)] = unsafe {
+            std::slice::from_raw_parts(
+                self.slots.as_ptr().cast::<(&'a str, &'a str)>(),
+                written,
+            )
+        };
+        (init, overflow)
+    }
+}
+
+impl<'a, const N: usize> Default for Buffer<'a, N> {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[inline]
+fn parse_line_impl<'a>(
+    line: &'a str,
+    out: &mut [MaybeUninit<(&'a str, &'a str)>],
+) -> (usize, bool) {
     let cap = out.len();
     let mut written = 0usize;
     let bytes = line.as_bytes();
@@ -21,7 +63,10 @@ pub fn parse_line<'a>(line: &'a str, out: &mut [(&'a str, &'a str)]) -> (usize, 
             let k = $k;
             let v = $v;
             if written < cap {
-                out[written] = (k, v);
+                // SAFETY: `written < cap == out.len()`.
+                unsafe {
+                    out.get_unchecked_mut(written).write((k, v));
+                }
                 written += 1;
             } else {
                 return (written, true);
@@ -198,10 +243,10 @@ mod tests {
     use super::*;
 
     fn parse(s: &str) -> Vec<(String, String)> {
-        let mut buf: [(&str, &str); 32] = [("", ""); 32];
-        let (n, overflow) = parse_line(s, &mut buf);
-        assert_eq!(overflow, false, "test buffer too small");
-        buf[..n]
+        let mut buf = Buffer::<32>::new();
+        let (pairs, overflow) = buf.parse(s);
+        assert!(!overflow, "test buffer too small");
+        pairs
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
@@ -209,12 +254,10 @@ mod tests {
 
     #[test]
     fn overflow_reported() {
-        let mut buf: [(&str, &str); 2] = [("", ""); 2];
-        let (n, overflow) = parse_line("a=1 b=2 c=3 d=4", &mut buf);
-        assert_eq!(n, 2);
-        assert_eq!(overflow, true);
-        assert_eq!(buf[0], ("a", "1"));
-        assert_eq!(buf[1], ("b", "2"));
+        let mut buf = Buffer::<2>::new();
+        let (pairs, overflow) = buf.parse("a=1 b=2 c=3 d=4");
+        assert!(overflow);
+        assert_eq!(pairs, &[("a", "1"), ("b", "2")]);
     }
 
     #[test]
