@@ -3,15 +3,15 @@
 use memchr::{memchr, memchr2, memchr3};
 use std::mem::MaybeUninit;
 
-/// Fixed-size stack-allocated scratch buffer for [`Buffer::parse`].
+/// Fixed-size stack-allocated scratch buffer for [`PairsBuffer::parse`].
 ///
-/// Zero-cost to construct: [`Buffer::new`] doesn't initialize the slots,
+/// Zero-cost to construct: [`PairsBuffer::new`] doesn't initialize the slots,
 /// so there's no `memset` in the hot path.
-pub struct Buffer<'a, const N: usize> {
+pub struct PairsBuffer<'a, const N: usize> {
     slots: [MaybeUninit<(&'a str, &'a str)>; N],
 }
 
-impl<'a, const N: usize> Buffer<'a, N> {
+impl<'a, const N: usize> PairsBuffer<'a, N> {
     /// Construct an uninitialized buffer. No allocation, no memset.
     #[inline]
     pub const fn new() -> Self {
@@ -29,7 +29,12 @@ impl<'a, const N: usize> Buffer<'a, N> {
     #[inline]
     pub fn parse(&mut self, line: &'a str) -> (&[(&'a str, &'a str)], bool) {
         let (written, overflow) = parse_line_impl(line, &mut self.slots);
-        // SAFETY: `parse_line_impl` initialized `self.slots[..written]`.
+        debug_assert!(written <= N);
+        // SAFETY: `parse_line_impl` initializes `self.slots[..written]` and
+        // guarantees `written <= N` (asserted above in debug). `MaybeUninit<T>`
+        // has the same layout and alignment as `T`, so the pointer cast is
+        // valid. The output lifetime is bound to `&mut self` via elision, so
+        // the caller cannot alias `self.slots` while the slice is live.
         let init: &[(&'a str, &'a str)] = unsafe {
             std::slice::from_raw_parts(
                 self.slots.as_ptr().cast::<(&'a str, &'a str)>(),
@@ -40,7 +45,7 @@ impl<'a, const N: usize> Buffer<'a, N> {
     }
 }
 
-impl<'a, const N: usize> Default for Buffer<'a, N> {
+impl<'a, const N: usize> Default for PairsBuffer<'a, N> {
     #[inline]
     fn default() -> Self {
         Self::new()
@@ -187,13 +192,20 @@ fn parse_line_impl<'a>(
 pub fn unescape_value(raw: &[u8], out: &mut String) {
     out.clear();
 
-    let raw = if raw.len() >= 2 && raw.first() == Some(&b'"') && raw.last() == Some(&b'"') {
+    // Unquoted values can't contain escapes — ship them as-is.
+    if raw.first() != Some(&b'"') {
+        push_bytes_lossy(out, raw);
+        return;
+    }
+
+    // Strip the opening quote, and the matching closing quote if present.
+    let raw = if raw.len() >= 2 && raw.last() == Some(&b'"') {
         &raw[1..raw.len() - 1]
     } else {
-        raw
+        &raw[1..]
     };
 
-    // Fast path: no backslash.
+    // Fast path: no backslash inside the quoted body.
     if memchr(b'\\', raw).is_none() {
         push_bytes_lossy(out, raw);
         return;
@@ -243,7 +255,7 @@ mod tests {
     use super::*;
 
     fn parse(s: &str) -> Vec<(String, String)> {
-        let mut buf = Buffer::<32>::new();
+        let mut buf = PairsBuffer::<32>::new();
         let (pairs, overflow) = buf.parse(s);
         assert!(!overflow, "test buffer too small");
         pairs
@@ -254,7 +266,7 @@ mod tests {
 
     #[test]
     fn overflow_reported() {
-        let mut buf = Buffer::<2>::new();
+        let mut buf = PairsBuffer::<2>::new();
         let (pairs, overflow) = buf.parse("a=1 b=2 c=3 d=4");
         assert!(overflow);
         assert_eq!(pairs, &[("a", "1"), ("b", "2")]);
@@ -339,5 +351,68 @@ mod tests {
             parse("a= b=2"),
             vec![("a".into(), "".into()), ("b".into(), "2".into())]
         );
+    }
+
+    #[test]
+    fn rfc3339_dates() {
+        // Unquoted RFC 3339 (with timezone).
+        let got = parse("ts=2026-04-24T18:09:03.0696Z next=1");
+        assert_eq!(
+            got,
+            vec![
+                ("ts".into(), "2026-04-24T18:09:03.0696Z".into()),
+                ("next".into(), "1".into()),
+            ]
+        );
+        let mut s = String::new();
+        unescape_value(got[0].1.as_bytes(), &mut s);
+        assert_eq!(s, "2026-04-24T18:09:03.0696Z");
+
+        // With numeric offset, unquoted.
+        let got = parse("ts=2026-04-24T18:09:03+02:00");
+        assert_eq!(got, vec![("ts".into(), "2026-04-24T18:09:03+02:00".into())]);
+
+        // Quoted RFC 3339 — value includes the surrounding quotes.
+        let got = parse(r#"ts="2026-04-24T18:09:03.0696Z""#);
+        assert_eq!(
+            got,
+            vec![("ts".into(), r#""2026-04-24T18:09:03.0696Z""#.into())]
+        );
+        let mut s = String::new();
+        unescape_value(got[0].1.as_bytes(), &mut s);
+        assert_eq!(s, "2026-04-24T18:09:03.0696Z");
+    }
+
+    #[test]
+    fn utf8_emojis() {
+        // Unquoted: emojis are multi-byte UTF-8 but contain no whitespace.
+        let got = parse("who=🦀 mood=🔥🎉");
+        assert_eq!(
+            got,
+            vec![("who".into(), "🦀".into()), ("mood".into(), "🔥🎉".into())]
+        );
+        // Quoted emoji string with spaces.
+        let got = parse(r#"msg="hello 🌍 from 🦀 rust!""#);
+        assert_eq!(
+            got,
+            vec![("msg".into(), r#""hello 🌍 from 🦀 rust!""#.into())]
+        );
+        let mut s = String::new();
+        unescape_value(got[0].1.as_bytes(), &mut s);
+        assert_eq!(s, "hello 🌍 from 🦀 rust!");
+    }
+
+    #[test]
+    fn literal_backslash_n() {
+        // The source contains a backslash followed by an 'n' — not a real LF.
+        // `r#"..."#` ensures no Rust-level escaping.
+        let got = parse(r#"msg="line1\nline2""#);
+        assert_eq!(got, vec![("msg".into(), r#""line1\nline2""#.into())]);
+        // Unescaping turns the two-byte `\n` sequence into an actual newline.
+        let mut s = String::new();
+        unescape_value(got[0].1.as_bytes(), &mut s);
+        assert_eq!(s, "line1\nline2");
+        assert!(s.contains('\n'));
+        assert_eq!(s.len(), "line1".len() + 1 + "line2".len());
     }
 }
