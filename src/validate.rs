@@ -1,0 +1,58 @@
+use humanize_bytes::humanize_bytes_binary;
+use logfmt_zerocopy::Logfmt;
+use std::{io::BufRead, time::Instant};
+
+/// Validate that this is a proper logfmt file
+pub fn validate(v: &crate::cli::Validate) -> anyhow::Result<()> {
+    let file = std::fs::File::open(&v.file)?;
+    let mut reader = std::io::BufReader::new(file);
+
+    let mut line_buf = Vec::new();
+    let mut total_read: usize = 0;
+    let mut invalid_utf: usize = 0;
+
+    let start = Instant::now();
+
+    loop {
+        let n = match reader.read_until(b'\n', &mut line_buf) {
+            Ok(n) => n,
+            Err(err) => {
+                log::debug!("failed after {total_read} bytes: {err}");
+                return Err(err.into());
+            }
+        };
+
+        if n == 0 {
+            break;
+        }
+
+        let line = match str::from_utf8(&line_buf) {
+            Ok(s) => s,
+            Err(err) => {
+                log::debug!("invalid utf at {total_read}: {err}");
+                invalid_utf += 1;
+                line_buf.clear();
+                continue;
+            }
+        };
+
+        total_read += line.as_bytes().len();
+
+        // make sure we can parse
+        //for (_k, _v) in line.logfmt() {
+        //    ()
+        //}
+
+        line_buf.clear();
+    }
+
+    let stop = Instant::now();
+
+    log::info!(
+        "read {total_read} bytes, {invalid_utf} invalid utf8 lines, {}/s",
+        humanize_bytes_binary!(f64::floor(
+            total_read as f64 / stop.duration_since(start).as_secs_f64()
+        ) as u64)
+    );
+    Ok(())
+}
