@@ -1,4 +1,5 @@
 mod cli;
+mod logfmt;
 mod validate;
 
 use clap::Parser;

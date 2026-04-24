@@ -1,6 +1,7 @@
 use humanize_bytes::humanize_bytes_binary;
-use logfmt_zerocopy::Logfmt;
 use std::{io::BufRead, time::Instant};
+
+use crate::logfmt;
 
 /// Validate that this is a proper logfmt file
 pub fn validate(v: &crate::cli::Validate) -> anyhow::Result<()> {
@@ -10,6 +11,8 @@ pub fn validate(v: &crate::cli::Validate) -> anyhow::Result<()> {
     let mut line_buf = Vec::new();
     let mut total_read: usize = 0;
     let mut invalid_utf: usize = 0;
+    let mut total_pairs: usize = 0;
+    let mut total_overflow: usize = 0;
 
     let start = Instant::now();
 
@@ -38,10 +41,11 @@ pub fn validate(v: &crate::cli::Validate) -> anyhow::Result<()> {
 
         total_read += line.as_bytes().len();
 
-        // make sure we can parse
-        //for (_k, _v) in line.logfmt() {
-        //    ()
-        //}
+        const MAX_PAIRS: usize = 256;
+        let mut pairs: [(&str, &str); MAX_PAIRS] = [("", ""); MAX_PAIRS];
+        let (n_pairs, overflow) = logfmt::parse_line(line, &mut pairs);
+        total_pairs += n_pairs;
+        total_overflow += overflow as usize;
 
         line_buf.clear();
     }
@@ -49,7 +53,8 @@ pub fn validate(v: &crate::cli::Validate) -> anyhow::Result<()> {
     let stop = Instant::now();
 
     log::info!(
-        "read {total_read} bytes, {invalid_utf} invalid utf8 lines, {}/s",
+        "read {total_read} bytes, {total_pairs} pairs ({total_overflow} overflow), \
+         {invalid_utf} invalid utf8 lines, {}/s",
         humanize_bytes_binary!(f64::floor(
             total_read as f64 / stop.duration_since(start).as_secs_f64()
         ) as u64)
