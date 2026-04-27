@@ -34,6 +34,11 @@ pub fn validate(v: &crate::cli::Validate) -> anyhow::Result<()> {
             break;
         }
 
+        // The fast parser requires no trailing newline.
+        while matches!(line_buf.last(), Some(b'\n' | b'\r')) {
+            line_buf.pop();
+        }
+
         let line = match str::from_utf8(&line_buf) {
             Ok(s) => s,
             Err(err) => {
@@ -44,7 +49,7 @@ pub fn validate(v: &crate::cli::Validate) -> anyhow::Result<()> {
             }
         };
 
-        total_read += line.as_bytes().len();
+        total_read += n;
 
         // parse logfmt line
         let mut buf = logfmt::PairsBuffer::<256>::new();

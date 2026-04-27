@@ -1,6 +1,6 @@
 //! Small zero-copy logfmt parser.
 
-use memchr::{memchr, memchr2, memchr3};
+use memchr::{memchr, memchr2};
 use std::mem::MaybeUninit;
 
 /// Fixed-size stack-allocated scratch buffer for [`PairsBuffer::parse`].
@@ -26,6 +26,10 @@ impl<'a, const N: usize> PairsBuffer<'a, N> {
     ///
     /// Quoted values are returned *including* the surrounding quotes;
     /// call [`unescape_value`] to decode them.
+    ///
+    /// Only ASCII space (`b' '`) separates pairs (matching brandur's
+    /// `logfmt` crate). Callers must strip trailing `\n` / `\r\n` before
+    /// invoking — newlines inside the input are treated as part of a token.
     #[inline]
     pub fn parse(&mut self, line: &'a str) -> (&[(&'a str, &'a str)], bool) {
         let (written, overflow) = parse_line_impl(line, &mut self.slots);
@@ -80,50 +84,32 @@ fn parse_line_impl<'a>(
     }
 
     while i < n {
-        // Skip whitespace (including \n, \r from BufRead).
-        while i < n {
-            let b = bytes[i];
-            if b == b' ' || b == b'\t' || b == b'\n' || b == b'\r' {
-                i += 1;
-            } else {
-                break;
-            }
+        // Skip leading spaces (only ASCII space separates, per brandur).
+        while i < n && bytes[i] == b' ' {
+            i += 1;
         }
         if i >= n {
             break;
         }
 
-        // Skip stray '=' at key position.
+        // Skip stray '=' at key position: consume until next space.
         if bytes[i] == b'=' {
-            // Consume until whitespace.
-            let end = memchr3(b' ', b'\t', b'\n', &bytes[i..])
-                .map(|p| i + p)
-                .unwrap_or(n);
+            let end = memchr(b' ', &bytes[i..]).map(|p| i + p).unwrap_or(n);
             i = end;
             continue;
         }
 
-        // Find end of key: '=', whitespace, or EOL.
+        // Find end of key: '=' or space.
         let key_start = i;
-        let rel = memchr3(b'=', b' ', b'\t', &bytes[i..]);
+        let rel = memchr2(b'=', b' ', &bytes[i..]);
         let (key_end, term) = match rel {
             Some(p) => (i + p, bytes[i + p]),
             None => (n, 0),
         };
-        // Also stop at \n / \r (rare; handle explicitly).
-        let (key_end, term) = {
-            let mut ke = key_end;
-            let mut t = term;
-            if let Some(p) = memchr2(b'\n', b'\r', &bytes[key_start..key_end]) {
-                ke = key_start + p;
-                t = bytes[ke];
-            }
-            (ke, t)
-        };
 
         // SAFETY: key_start/key_end fall on ASCII boundaries (we stopped on
-        // '=', space, tab, \n, or \r, all single-byte UTF-8), so the slice is
-        // valid UTF-8 since the input is.
+        // '=' or space, both single-byte UTF-8), so the slice is valid UTF-8
+        // since the input is.
         let key = unsafe { std::str::from_utf8_unchecked(&bytes[key_start..key_end]) };
 
         if term != b'=' {
@@ -163,11 +149,7 @@ fn parse_line_impl<'a>(
             }
         } else {
             let vs = i;
-            let ve = memchr3(b' ', b'\t', b'\n', &bytes[i..])
-                .map(|p| i + p)
-                .unwrap_or(n);
-            // Also stop at \r.
-            let ve = memchr(b'\r', &bytes[vs..ve]).map(|p| vs + p).unwrap_or(ve);
+            let ve = memchr(b' ', &bytes[i..]).map(|p| i + p).unwrap_or(n);
             i = ve;
             (vs, ve)
         };
@@ -253,6 +235,7 @@ fn push_bytes_lossy(out: &mut String, bytes: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::strategy::Strategy;
 
     fn parse(s: &str) -> Vec<(String, String)> {
         let mut buf = PairsBuffer::<32>::new();
@@ -317,12 +300,6 @@ mod tests {
             parse("flag other=x"),
             vec![("flag".into(), "".into()), ("other".into(), "x".into())]
         );
-    }
-
-    #[test]
-    fn trailing_newline() {
-        assert_eq!(parse("a=1 b=2\n"), parse("a=1 b=2"));
-        assert_eq!(parse("a=1 b=2\r\n"), parse("a=1 b=2"));
     }
 
     #[test]
@@ -400,6 +377,93 @@ mod tests {
         let mut s = String::new();
         unescape_value(got[0].1.as_bytes(), &mut s);
         assert_eq!(s, "hello 🌍 from 🦀 rust!");
+    }
+
+    /// Run our fast parser + `unescape_value` and produce a list shaped like
+    /// brandur's `Vec<Pair>` output, so the two can be compared directly.
+    fn fast_decoded(line: &str) -> (Vec<(String, String)>, bool) {
+        let mut buf = PairsBuffer::<256>::new();
+        let (pairs, overflow) = buf.parse(line);
+        let mut out = Vec::with_capacity(pairs.len());
+        let mut tmp = String::new();
+        for (k, v) in pairs {
+            tmp.clear();
+            unescape_value(v.as_bytes(), &mut tmp);
+            out.push((k.to_string(), tmp.clone()));
+        }
+        (out, overflow)
+    }
+
+    /// Brandur's `logfmt::parse`, normalized to `(key, value)` with
+    /// `None` collapsed to `""` so it lines up with our representation.
+    fn brandur_decoded(line: &str) -> Vec<(String, String)> {
+        logfmt::parse(line)
+            .into_iter()
+            // brandur emits a trailing empty-key pair on EOF in many cases
+            // (e.g. "", " ", "= "); our parser drops empty keys. Filter
+            // them out so the two views line up.
+            .filter(|p| !p.key.is_empty())
+            .map(|p| (p.key, p.val.unwrap_or_default()))
+            .collect()
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(2048))]
+
+        /// Our fast parser (+ `unescape_value`) must agree with brandur's
+        /// `logfmt` crate on well-formed inputs.
+        ///
+        /// Inputs are generated as a sequence of well-formed pairs joined by
+        /// spaces. Constraints (so `unescape_value` and brandur stay in sync,
+        /// and so brandur's stateful character-by-character behavior on
+        /// malformed input doesn't bite us):
+        ///   - no '\n' anywhere (caller invariant: line endings are stripped);
+        ///   - keys and unquoted values exclude ' ', '=', '"', '\';
+        ///   - inside quoted strings, the only escape is `\"` — no `\\`,
+        ///     `\n`, `\r`, `\t`, etc. (brandur passes those through verbatim
+        ///     while our `unescape_value` decodes them).
+        ///
+        /// `\r` and `\t` are exercised inside keys/values to confirm they're
+        /// treated as ordinary token characters.
+        #[test]
+        fn fast_matches_brandur(
+            pairs in proptest::collection::vec(
+                proptest::prop_oneof![
+                    // bare key
+                    "[a-zA-Z0-9_.\\-\r\t]{1,8}",
+                    // key=unquoted_value (non-empty value — brandur's `key=`
+                    // form absorbs the next token as the value).
+                    ("[a-zA-Z0-9_.\\-\r\t]{1,8}", "[a-zA-Z0-9_.\\-:/\r\t]{1,8}")
+                        .prop_map(|(k, v)| format!("{k}={v}")),
+                    // key="quoted no escapes" (non-empty body — brandur
+                    // collapses empty quoted values into the next token).
+                    ("[a-zA-Z0-9_.\\-\r\t]{1,8}", "[^\"\\\\\n]{1,12}")
+                        .prop_map(|(k, v)| format!("{k}=\"{v}\"")),
+                    // key="quoted with one \" escape"
+                    (
+                        "[a-zA-Z0-9_.\\-\r\t]{1,8}",
+                        "[^\"\\\\\n]{1,4}",
+                        "[^\"\\\\\n]{1,4}",
+                    )
+                        .prop_map(|(k, a, b)| format!(r#"{k}="{a}\"{b}""#)),
+                ],
+                0..64,
+            ),
+        ) {
+            let line: String = pairs.as_slice().join(" ");
+            let expected = brandur_decoded(&line);
+            let (got, overflow) = fast_decoded(&line);
+            let take = expected.len().min(256);
+
+            if expected.len() <= 256 {
+                proptest::prop_assert!(!overflow);
+                proptest::prop_assert_eq!(got.len(), expected.len());
+            } else {
+                proptest::prop_assert!(overflow);
+                proptest::prop_assert_eq!(got.len(), 256);
+            }
+            proptest::prop_assert_eq!(&got[..take], &expected[..take]);
+        }
     }
 
     #[test]

@@ -12,3 +12,7 @@ log = "0.4.29"
 memchr = "2"
 smartstring = "1.0.1"
 vecmap-rs = "0.2.4"
+
+[dev-dependencies]
+proptest = "1"
+logfmt = "0.0.2"
