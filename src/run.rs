@@ -3,7 +3,7 @@
 //! follow.
 
 use humanize_bytes::humanize_bytes_binary;
-use rapidhash::RapidHashMap;
+use rapidhash::{RapidHashMap, RapidHashSet};
 use smallvec::SmallVec;
 use smartstring::alias::String as SmartString;
 use std::{
@@ -20,6 +20,59 @@ use crate::logfmt;
 use crate::timestamp::{self, Timestamp};
 
 type Combo = SmallVec<[SmartString; 3]>;
+
+/// Collects every distinct key seen on matched lines. Active only when
+/// `--list-keys` is set; in that mode line output is suppressed.
+#[derive(Default)]
+struct KeyGather {
+    enabled: bool,
+    keys: RapidHashSet<SmartString>,
+}
+
+impl KeyGather {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            keys: RapidHashSet::default(),
+        }
+    }
+
+    #[inline]
+    fn is_active(&self) -> bool {
+        self.enabled
+    }
+
+    fn record(&mut self, pairs: &[(&str, &str)]) {
+        if !self.enabled {
+            return;
+        }
+        for (k, _) in pairs {
+            if !self.keys.contains(*k) {
+                let mut s = SmartString::new_const();
+                s.push_str(k);
+                self.keys.insert(s);
+            }
+        }
+    }
+
+    fn report(&self) {
+        if !self.enabled {
+            return;
+        }
+        let mut sorted: Vec<&SmartString> = self.keys.iter().collect();
+        sorted.sort_unstable();
+        let mut out = String::from("keys:\n");
+        for k in sorted {
+            out.push_str("  ");
+            out.push_str(k);
+            out.push('\n');
+        }
+        if out.ends_with('\n') {
+            out.pop();
+        }
+        log::info!("{out}");
+    }
+}
 
 /// Counts matched lines grouped by the value tuple of `keys`. Missing keys
 /// produce an empty `SmartString` slot (rendered as `key=` in the report).
@@ -138,6 +191,7 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
 
     let mut stats = Stats::default();
     let mut counter = Counter::new(cli.count_by.clone());
+    let mut keys = KeyGather::new(cli.list_keys);
 
     let need_seek = cli.from.is_some() || cli.to.is_some() || cli.follow;
     let path = match &cli.file {
@@ -152,10 +206,12 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
                 &mut output,
                 &mut stats,
                 &mut counter,
+                &mut keys,
             )?;
             output.flush()?;
             stats.report();
             counter.report();
+            keys.report();
             return Ok(());
         }
     };
@@ -218,16 +274,25 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
         &mut output,
         &mut stats,
         &mut counter,
+        &mut keys,
     )?;
     output.flush()?;
 
     // Phase 2: follow. New lines are assumed monotone, so don't re-apply tf.
     if cli.follow {
-        follow_loop(reader, &filter, &mut output, &mut stats, &mut counter)?;
+        follow_loop(
+            reader,
+            &filter,
+            &mut output,
+            &mut stats,
+            &mut counter,
+            &mut keys,
+        )?;
     }
 
     stats.report();
     counter.report();
+    keys.report();
 
     Ok(())
 }
@@ -276,6 +341,7 @@ fn stream_bounded<R: BufRead, W: Write>(
     output: &mut W,
     stats: &mut Stats,
     counter: &mut Counter,
+    keys: &mut KeyGather,
 ) -> anyhow::Result<()> {
     let mut line_buf = Vec::new();
     let mut total_read: u64 = 0;
@@ -287,7 +353,7 @@ fn stream_bounded<R: BufRead, W: Write>(
             break;
         }
         total_read += n as u64;
-        process_line(&mut line_buf, filter, tf, output, stats, counter, n)?;
+        process_line(&mut line_buf, filter, tf, output, stats, counter, keys, n)?;
     }
     Ok(())
 }
@@ -299,6 +365,7 @@ fn stream_unbounded<R: Read, W: Write>(
     output: &mut W,
     stats: &mut Stats,
     counter: &mut Counter,
+    keys: &mut KeyGather,
 ) -> anyhow::Result<()> {
     let mut reader = BufReader::new(reader);
     let mut line_buf = Vec::new();
@@ -316,6 +383,7 @@ fn stream_unbounded<R: Read, W: Write>(
             output,
             stats,
             counter,
+            keys,
             n,
         )?;
     }
@@ -329,6 +397,7 @@ fn process_line<W: Write>(
     output: &mut W,
     stats: &mut Stats,
     counter: &mut Counter,
+    keys: &mut KeyGather,
     n_bytes: usize,
 ) -> anyhow::Result<()> {
     // Preserve the original bytes for output; trim a trailing newline for parsing.
@@ -362,10 +431,14 @@ fn process_line<W: Write>(
     if matched {
         stats.matched_lines += 1;
         counter.record(parsed);
-        output.write_all(line_buf)?;
-        if raw_len == parse_end {
-            // No trailing newline in the source; add one for tidy output.
-            output.write_all(b"\n")?;
+        keys.record(parsed);
+        // `--list-keys` suppresses line output.
+        if !keys.is_active() {
+            output.write_all(line_buf)?;
+            if raw_len == parse_end {
+                // No trailing newline in the source; add one for tidy output.
+                output.write_all(b"\n")?;
+            }
         }
     }
     line_buf.clear();
@@ -378,6 +451,7 @@ fn follow_loop<W: Write>(
     output: &mut W,
     stats: &mut Stats,
     counter: &mut Counter,
+    keys: &mut KeyGather,
 ) -> anyhow::Result<()> {
     let mut line_buf = Vec::new();
     loop {
@@ -401,8 +475,8 @@ fn follow_loop<W: Write>(
             output,
             stats,
             counter,
+            keys,
             n,
         )?;
     }
 }
-

@@ -108,8 +108,9 @@ fn strip_quotes(s: &str) -> &str {
 
 fn parse_one(spec: &str) -> anyhow::Result<Predicate> {
     // Longest-match operator scan.
-    let (op_pos, op_len, op) = find_op(spec)
-        .ok_or_else(|| anyhow::anyhow!("filter `{spec}` has no operator (=, !=, <, <=, >, >=, =~)"))?;
+    let (op_pos, op_len, op) = find_op(spec).ok_or_else(|| {
+        anyhow::anyhow!("filter `{spec}` has no operator (=, !=, <, <=, >, >=, =~)")
+    })?;
     let key = &spec[..op_pos];
     let rhs = &spec[op_pos + op_len..];
     if key.is_empty() {
@@ -117,10 +118,7 @@ fn parse_one(spec: &str) -> anyhow::Result<Predicate> {
     }
     let rhs_num = rhs.parse::<f64>().ok();
     let re = if matches!(op, Op::ReMatch) {
-        Some(
-            Regex::new(rhs)
-                .map_err(|e| anyhow::anyhow!("invalid regex in `{spec}`: {e}"))?,
-        )
+        Some(Regex::new(rhs).map_err(|e| anyhow::anyhow!("invalid regex in `{spec}`: {e}"))?)
     } else {
         None
     };

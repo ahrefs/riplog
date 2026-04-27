@@ -45,4 +45,9 @@ pub struct Cli {
     /// produces one row per (level, facil) combination.
     #[arg(long = "count-by")]
     pub count_by: Vec<String>,
+
+    /// Suppress line output; instead, gather every distinct key seen on
+    /// matched lines and print the sorted list at the end.
+    #[arg(long = "list-keys")]
+    pub list_keys: bool,
 }

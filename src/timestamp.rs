@@ -179,10 +179,11 @@ pub fn resolve_bound(
 }
 
 fn strip_anchor<'a>(s: &'a str, anchor: &str) -> Option<&'a str> {
+    let s = s.trim();
     if s == anchor {
         return Some("");
     }
-    let rest = s.strip_prefix(anchor)?;
+    let rest = s.strip_prefix(anchor)?.trim_start();
     if rest.starts_with('+') || rest.starts_with('-') {
         Some(rest)
     } else {
@@ -236,6 +237,7 @@ fn parse_time_of_day(s: &str) -> Option<i64> {
 }
 
 fn apply_offset(base: Timestamp, suffix: &str) -> anyhow::Result<Timestamp> {
+    let suffix = suffix.trim();
     if suffix.is_empty() {
         return Ok(base);
     }
@@ -245,12 +247,13 @@ fn apply_offset(base: Timestamp, suffix: &str) -> anyhow::Result<Timestamp> {
         b'-' => -1,
         _ => anyhow::bail!("expected `+` or `-` after anchor: `{suffix}`"),
     };
-    if b.len() < 3 {
+    let inner = suffix[1..].trim();
+    if inner.len() < 2 {
         anyhow::bail!("invalid duration `{suffix}`: expected `<int><unit>`");
     }
-    let unit = b[b.len() - 1];
-    let num_str = std::str::from_utf8(&b[1..b.len() - 1])
-        .map_err(|_| anyhow::anyhow!("invalid duration `{suffix}`"))?;
+    let ib = inner.as_bytes();
+    let unit = ib[ib.len() - 1];
+    let num_str = inner[..inner.len() - 1].trim_end();
     let n: i64 = num_str
         .parse()
         .map_err(|_| anyhow::anyhow!("invalid duration number in `{suffix}`"))?;
