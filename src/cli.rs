@@ -3,26 +3,46 @@ use std::path::PathBuf;
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-pub struct Validate {
-    pub file: PathBuf,
+#[command(about = "Slice and filter logfmt streams.")]
+pub struct Cli {
+    /// Input file. If omitted, reads from stdin.
+    /// Note: `-F`, `--from`, `--to` require a real file (stdin is not seekable).
+    pub file: Option<PathBuf>,
 
-    /// Lower bound (RFC 3339 timestamp). When set together with `--to`,
-    /// bisects the file to a byte range covering `[from, to]` before
-    /// scanning.
+    /// Lower bound. Forms: full RFC 3339 (`2026-04-24T18:09:03Z`),
+    /// date-only (`2026-04-24`), time-of-day (`18:00`, anchored to the
+    /// file's first timestamp), or symbolic (`start`, `start+1h`, `end-30m`).
     #[arg(long)]
     pub from: Option<String>,
 
-    /// Upper bound (RFC 3339 timestamp).
+    /// Upper bound. Same forms as `--from`; time-of-day anchors to the
+    /// file's last timestamp.
     #[arg(long)]
     pub to: Option<String>,
 
-    /// Reorder window in seconds. Used to over-approximate the byte range
-    /// when bisecting; defaults to 300 (5 minutes reorder at worst).
+    /// Reorder window in seconds, used to over-approximate the bisected byte
+    /// range. Defaults to 5 minutes.
     #[arg(long, default_value_t = 300)]
     pub window_secs: u64,
-}
 
-#[derive(Parser, Debug)]
-pub enum Cli {
-    Validate(Validate),
+    /// Repeated key/value filter. Operators: `=`, `!=`, `<`, `<=`, `>`,
+    /// `>=`, `=~`. Examples: `--key level=error`, `--key dur>=100`,
+    /// `--key msg=~"connection.*reset"`. Multiple `--key` flags are AND-ed.
+    #[arg(long = "key")]
+    pub keys: Vec<String>,
+
+    /// Follow the file: bisect to `--from` (if set) or start at EOF, stream
+    /// matching lines, then keep reading new lines as they're appended.
+    #[arg(short = 'F', long)]
+    pub follow: bool,
+
+    /// Write output to FILE instead of stdout.
+    #[arg(short = 'o', long)]
+    pub output: Option<PathBuf>,
+
+    /// Group matched lines by the value of one or more keys; print a count
+    /// table at the end. Repeatable: `--count-by level --count-by facil`
+    /// produces one row per (level, facil) combination.
+    #[arg(long = "count-by")]
+    pub count_by: Vec<String>,
 }
