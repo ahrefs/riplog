@@ -113,7 +113,11 @@ pub fn parse_rfc3339_nanos(s: &str) -> Option<Timestamp> {
     let secs_of_day = hour as i64 * 3600 + minute as i64 * 60 + second as i64;
     let utc_secs = epoch_days * 86_400 + secs_of_day - tz_offset_secs;
 
-    Some(utc_secs.checked_mul(1_000_000_000)?.checked_add(nanos_frac)?)
+    Some(
+        utc_secs
+            .checked_mul(1_000_000_000)?
+            .checked_add(nanos_frac)?,
+    )
 }
 
 /// Find a `time=…` (or `ts=…`) pair and parse it.
@@ -167,7 +171,10 @@ mod tests {
     #[test]
     fn epoch() {
         assert_eq!(parse_rfc3339_nanos("1970-01-01T00:00:00Z"), Some(0));
-        assert_eq!(parse_rfc3339_nanos("1970-01-01T00:00:00.000000000Z"), Some(0));
+        assert_eq!(
+            parse_rfc3339_nanos("1970-01-01T00:00:00.000000000Z"),
+            Some(0)
+        );
     }
 
     #[test]

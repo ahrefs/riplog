@@ -40,10 +40,7 @@ impl<'a, const N: usize> PairsBuffer<'a, N> {
         // valid. The output lifetime is bound to `&mut self` via elision, so
         // the caller cannot alias `self.slots` while the slice is live.
         let init: &[(&'a str, &'a str)] = unsafe {
-            std::slice::from_raw_parts(
-                self.slots.as_ptr().cast::<(&'a str, &'a str)>(),
-                written,
-            )
+            std::slice::from_raw_parts(self.slots.as_ptr().cast::<(&'a str, &'a str)>(), written)
         };
         (init, overflow)
     }

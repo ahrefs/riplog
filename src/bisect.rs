@@ -74,7 +74,11 @@ pub fn bisect<R: Read + Seek>(
         let mid = lo + (hi - lo) / 2;
         match probe(reader, mid, file_len)? {
             Some((line_start, ts)) => {
-                let satisfied = if strict { ts > threshold } else { ts >= threshold };
+                let satisfied = if strict {
+                    ts > threshold
+                } else {
+                    ts >= threshold
+                };
                 if satisfied {
                     // line_start is a valid candidate; pull hi inward.
                     if line_start >= hi {
@@ -120,7 +124,11 @@ pub fn bisect<R: Read + Seek>(
     // A single probe at lo catches that case.
     if lo < hi {
         if let Some((line_start, ts)) = probe(reader, lo, file_len)? {
-            let satisfied = if strict { ts > threshold } else { ts >= threshold };
+            let satisfied = if strict {
+                ts > threshold
+            } else {
+                ts >= threshold
+            };
             if satisfied && line_start < hi {
                 return Ok(line_start);
             }
