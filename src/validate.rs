@@ -1,13 +1,52 @@
 use humanize_bytes::humanize_bytes_binary;
 use smartstring::alias::String as SmartString;
-use std::{io::BufRead, time::Instant};
+use std::{
+    io::{BufRead, Seek, SeekFrom},
+    time::Instant,
+};
 
+use crate::bisect::{self, Side};
 use crate::logfmt;
+use crate::timestamp;
 
 /// Validate that this is a proper logfmt file
 pub fn validate(v: &crate::cli::Validate) -> anyhow::Result<()> {
-    let file = std::fs::File::open(&v.file)?;
+    let mut file = std::fs::File::open(&v.file)?;
+
+    // Optionally narrow to a time window via bisection.
+    let file_len = file.seek(SeekFrom::End(0))?;
+    let window = (v.window_secs as i64).saturating_mul(1_000_000_000);
+
+    let t_bisect = Instant::now();
+    let start_byte: u64 = match v.from.as_deref() {
+        Some(from) => {
+            let t1 = timestamp::parse_rfc3339_nanos(from)
+                .ok_or_else(|| anyhow::anyhow!("invalid --from timestamp: {from}"))?;
+            bisect::bisect(&mut file, t1, window, Side::Lower)?
+        }
+        None => 0,
+    };
+    let end_byte: u64 = match v.to.as_deref() {
+        Some(to) => {
+            let t2 = timestamp::parse_rfc3339_nanos(to)
+                .ok_or_else(|| anyhow::anyhow!("invalid --to timestamp: {to}"))?;
+            bisect::bisect(&mut file, t2, window, Side::Upper)?
+        }
+        None => file_len,
+    };
+    if v.from.is_some() || v.to.is_some() {
+        log::info!(
+            "bisect: [{}, {}] window={}s -> bytes [{start_byte}, {end_byte}) in {}s",
+            v.from.as_deref().unwrap_or("-"),
+            v.to.as_deref().unwrap_or("-"),
+            v.window_secs,
+            t_bisect.elapsed().as_secs_f64()
+        );
+    }
+
+    file.seek(SeekFrom::Start(start_byte))?;
     let mut reader = std::io::BufReader::new(file);
+    let max_bytes = end_byte.saturating_sub(start_byte) as usize;
 
     let mut line_buf = Vec::new();
     let mut total_read: usize = 0;
@@ -22,6 +61,9 @@ pub fn validate(v: &crate::cli::Validate) -> anyhow::Result<()> {
     let mut all_facil: vecmap::VecMap<SmartString, usize> = vecmap::VecMap::new();
 
     loop {
+        if total_read >= max_bytes {
+            break;
+        }
         let n = match reader.read_until(b'\n', &mut line_buf) {
             Ok(n) => n,
             Err(err) => {

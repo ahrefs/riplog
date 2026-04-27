@@ -1,5 +1,7 @@
+mod bisect;
 mod cli;
 mod logfmt;
+mod timestamp;
 mod validate;
 
 use clap::Parser;
