@@ -120,6 +120,157 @@ pub fn parse_rfc3339_nanos(s: &str) -> Option<Timestamp> {
     )
 }
 
+const NANOS_PER_DAY: i64 = 86_400 * 1_000_000_000;
+
+/// Resolve a user-supplied time bound. Accepts:
+/// - full RFC 3339 (`2026-04-24T18:09:03Z`)
+/// - date-only (`2026-04-24` → midnight UTC)
+/// - time-of-day (`18:00`, `18:00:00`, `18:00:00.5`) — anchored to the date of
+///   `time_only_anchor` (UTC).
+/// - `start` / `end` — file's first / last parseable timestamp
+/// - `start±<n><unit>` / `end±<n><unit>` with `unit ∈ {s, m, h, d}`
+pub fn resolve_bound(
+    s: &str,
+    file_first: Option<Timestamp>,
+    file_last: Option<Timestamp>,
+    time_only_anchor: Option<Timestamp>,
+) -> anyhow::Result<Timestamp> {
+    if let Some(t) = parse_rfc3339_nanos(s) {
+        return Ok(t);
+    }
+
+    // Date-only YYYY-MM-DD.
+    let b = s.as_bytes();
+    if b.len() == 10 && b[4] == b'-' && b[7] == b'-' {
+        let mut padded = String::with_capacity(20);
+        padded.push_str(s);
+        padded.push_str("T00:00:00Z");
+        if let Some(t) = parse_rfc3339_nanos(&padded) {
+            return Ok(t);
+        }
+    }
+
+    // Symbolic anchors.
+    if let Some(rest) = strip_anchor(s, "start") {
+        let base = file_first.ok_or_else(|| {
+            anyhow::anyhow!("`start` requires at least one parseable timestamp in the file")
+        })?;
+        return apply_offset(base, rest);
+    }
+    if let Some(rest) = strip_anchor(s, "end") {
+        let base = file_last.ok_or_else(|| {
+            anyhow::anyhow!("`end` requires at least one parseable timestamp in the file")
+        })?;
+        return apply_offset(base, rest);
+    }
+
+    // Time-of-day.
+    if let Some(time_nanos) = parse_time_of_day(s) {
+        let anchor = time_only_anchor.ok_or_else(|| {
+            anyhow::anyhow!(
+                "time-only bound `{s}` requires a parseable timestamp in the file to anchor the date"
+            )
+        })?;
+        let day_start = anchor.div_euclid(NANOS_PER_DAY) * NANOS_PER_DAY;
+        return Ok(day_start + time_nanos);
+    }
+
+    anyhow::bail!("unrecognized time bound: {s}")
+}
+
+fn strip_anchor<'a>(s: &'a str, anchor: &str) -> Option<&'a str> {
+    if s == anchor {
+        return Some("");
+    }
+    let rest = s.strip_prefix(anchor)?;
+    if rest.starts_with('+') || rest.starts_with('-') {
+        Some(rest)
+    } else {
+        None
+    }
+}
+
+fn parse_time_of_day(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    if b.len() < 5 || b[2] != b':' {
+        return None;
+    }
+    let h = parse_uint(&b[0..2])? as i64;
+    let m = parse_uint(&b[3..5])? as i64;
+    if h > 23 || m > 59 {
+        return None;
+    }
+    let mut nanos = h * 3600 * 1_000_000_000 + m * 60 * 1_000_000_000;
+    if b.len() == 5 {
+        return Some(nanos);
+    }
+    if b[5] != b':' || b.len() < 8 {
+        return None;
+    }
+    let sec = parse_uint(&b[6..8])? as i64;
+    if sec > 60 {
+        return None;
+    }
+    nanos += sec * 1_000_000_000;
+    if b.len() == 8 {
+        return Some(nanos);
+    }
+    if b[8] != b'.' {
+        return None;
+    }
+    let digits = b.len() - 9;
+    if digits == 0 || digits > 9 {
+        return None;
+    }
+    let mut acc: i64 = 0;
+    for &c in &b[9..] {
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        acc = acc * 10 + (c - b'0') as i64;
+    }
+    for _ in digits..9 {
+        acc *= 10;
+    }
+    Some(nanos + acc)
+}
+
+fn apply_offset(base: Timestamp, suffix: &str) -> anyhow::Result<Timestamp> {
+    if suffix.is_empty() {
+        return Ok(base);
+    }
+    let b = suffix.as_bytes();
+    let sign: i64 = match b[0] {
+        b'+' => 1,
+        b'-' => -1,
+        _ => anyhow::bail!("expected `+` or `-` after anchor: `{suffix}`"),
+    };
+    if b.len() < 3 {
+        anyhow::bail!("invalid duration `{suffix}`: expected `<int><unit>`");
+    }
+    let unit = b[b.len() - 1];
+    let num_str = std::str::from_utf8(&b[1..b.len() - 1])
+        .map_err(|_| anyhow::anyhow!("invalid duration `{suffix}`"))?;
+    let n: i64 = num_str
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid duration number in `{suffix}`"))?;
+    let unit_nanos: i64 = match unit {
+        b's' => 1_000_000_000,
+        b'm' => 60 * 1_000_000_000,
+        b'h' => 3600 * 1_000_000_000,
+        b'd' => 86_400 * 1_000_000_000,
+        _ => anyhow::bail!(
+            "unknown duration unit `{}` in `{suffix}`; expected s/m/h/d",
+            unit as char
+        ),
+    };
+    let delta = n
+        .checked_mul(unit_nanos)
+        .ok_or_else(|| anyhow::anyhow!("duration overflow in `{suffix}`"))?;
+    base.checked_add(sign * delta)
+        .ok_or_else(|| anyhow::anyhow!("timestamp overflow applying `{suffix}`"))
+}
+
 /// Find a `time=…` (or `ts=…`) pair and parse it.
 pub fn extract_timestamp(pairs: &[(&str, &str)]) -> Option<Timestamp> {
     for (k, v) in pairs {
@@ -271,5 +422,88 @@ mod tests {
     fn extract_strips_quotes() {
         let pairs = vec![("time", "\"2026-04-24T18:09:03Z\"")];
         assert!(extract_timestamp(&pairs).is_some());
+    }
+
+    #[test]
+    fn resolve_full_rfc3339() {
+        let t = resolve_bound("2026-04-24T18:09:03Z", None, None, None).unwrap();
+        assert_eq!(t, parse_rfc3339_nanos("2026-04-24T18:09:03Z").unwrap());
+    }
+
+    #[test]
+    fn resolve_date_only() {
+        let t = resolve_bound("2026-04-24", None, None, None).unwrap();
+        assert_eq!(t, parse_rfc3339_nanos("2026-04-24T00:00:00Z").unwrap());
+    }
+
+    #[test]
+    fn resolve_time_only_hhmm() {
+        let anchor = parse_rfc3339_nanos("2026-04-24T05:30:11Z").unwrap();
+        let t = resolve_bound("18:00", None, None, Some(anchor)).unwrap();
+        assert_eq!(t, parse_rfc3339_nanos("2026-04-24T18:00:00Z").unwrap());
+    }
+
+    #[test]
+    fn resolve_time_only_with_seconds_and_frac() {
+        let anchor = parse_rfc3339_nanos("2026-04-24T00:00:00Z").unwrap();
+        let t = resolve_bound("18:00:00.5", None, None, Some(anchor)).unwrap();
+        assert_eq!(t, parse_rfc3339_nanos("2026-04-24T18:00:00.5Z").unwrap());
+    }
+
+    #[test]
+    fn resolve_time_only_no_anchor_errors() {
+        assert!(resolve_bound("18:00", None, None, None).is_err());
+    }
+
+    #[test]
+    fn resolve_start_end_no_offset() {
+        let first = parse_rfc3339_nanos("2026-04-24T10:00:00Z").unwrap();
+        let last = parse_rfc3339_nanos("2026-04-24T20:00:00Z").unwrap();
+        assert_eq!(
+            resolve_bound("start", Some(first), Some(last), None).unwrap(),
+            first
+        );
+        assert_eq!(
+            resolve_bound("end", Some(first), Some(last), None).unwrap(),
+            last
+        );
+    }
+
+    #[test]
+    fn resolve_start_plus_duration() {
+        let first = parse_rfc3339_nanos("2026-04-24T10:00:00Z").unwrap();
+        let t = resolve_bound("start+1h", Some(first), None, None).unwrap();
+        assert_eq!(t, parse_rfc3339_nanos("2026-04-24T11:00:00Z").unwrap());
+    }
+
+    #[test]
+    fn resolve_end_minus_duration() {
+        let last = parse_rfc3339_nanos("2026-04-24T20:00:00Z").unwrap();
+        let t = resolve_bound("end-30m", None, Some(last), None).unwrap();
+        assert_eq!(t, parse_rfc3339_nanos("2026-04-24T19:30:00Z").unwrap());
+    }
+
+    #[test]
+    fn resolve_start_minus_days() {
+        let first = parse_rfc3339_nanos("2026-04-24T00:00:00Z").unwrap();
+        let t = resolve_bound("start-2d", Some(first), None, None).unwrap();
+        assert_eq!(t, parse_rfc3339_nanos("2026-04-22T00:00:00Z").unwrap());
+    }
+
+    #[test]
+    fn resolve_unknown_unit_errors() {
+        let first = parse_rfc3339_nanos("2026-04-24T10:00:00Z").unwrap();
+        assert!(resolve_bound("start+1y", Some(first), None, None).is_err());
+    }
+
+    #[test]
+    fn resolve_garbage_errors() {
+        assert!(resolve_bound("hello", None, None, None).is_err());
+    }
+
+    #[test]
+    fn resolve_anchor_missing_errors() {
+        assert!(resolve_bound("start+1h", None, None, None).is_err());
+        assert!(resolve_bound("end", None, None, None).is_err());
     }
 }
