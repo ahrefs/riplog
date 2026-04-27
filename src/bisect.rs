@@ -138,6 +138,65 @@ pub fn bisect<R: Read + Seek>(
     Ok(hi)
 }
 
+/// First parseable timestamp at or near the start of the stream.
+pub fn peek_first_timestamp<R: Read + Seek>(reader: &mut R) -> anyhow::Result<Option<Timestamp>> {
+    let file_len = reader.seek(SeekFrom::End(0))?;
+    if file_len == 0 {
+        return Ok(None);
+    }
+    Ok(probe(reader, 0, file_len)?.map(|(_, ts)| ts))
+}
+
+/// Last parseable timestamp in the stream. Scans the trailing
+/// [`PROBE_SCAN_BYTES`]; if no parseable line is found in the tail returns
+/// `None`.
+pub fn peek_last_timestamp<R: Read + Seek>(reader: &mut R) -> anyhow::Result<Option<Timestamp>> {
+    let file_len = reader.seek(SeekFrom::End(0))?;
+    if file_len == 0 {
+        return Ok(None);
+    }
+    let chunk = PROBE_SCAN_BYTES.min(file_len);
+    let chunk_start = file_len - chunk;
+    reader.seek(SeekFrom::Start(chunk_start))?;
+    let mut buf = vec![0u8; chunk as usize];
+    let n = read_fully(reader, &mut buf)?;
+    buf.truncate(n);
+
+    // Skip a partial first line if we didn't start at byte 0.
+    let mut idx = if chunk_start == 0 {
+        0
+    } else {
+        match memchr::memchr(b'\n', &buf) {
+            Some(i) => i + 1,
+            None => return Ok(None),
+        }
+    };
+
+    let mut last_ts: Option<Timestamp> = None;
+    while idx < buf.len() {
+        let end = memchr::memchr(b'\n', &buf[idx..])
+            .map(|i| idx + i)
+            .unwrap_or(buf.len());
+        let line_end = if end > idx && buf[end - 1] == b'\r' {
+            end - 1
+        } else {
+            end
+        };
+        if let Ok(line) = std::str::from_utf8(&buf[idx..line_end]) {
+            let mut pairs = logfmt::PairsBuffer::<256>::new();
+            let (parsed, _) = pairs.parse(line);
+            if let Some(ts) = extract_timestamp(parsed) {
+                last_ts = Some(ts);
+            }
+        }
+        if end >= buf.len() {
+            break;
+        }
+        idx = end + 1;
+    }
+    Ok(last_ts)
+}
+
 /// Seek to `offset`, snap forward to the next line boundary, and return the
 /// byte offset and timestamp of the first line within the next
 /// [`PROBE_SCAN_BYTES`] bytes that has a parseable `time=…` value.
@@ -304,6 +363,24 @@ mod tests {
 
         // Suppress unused warning on `data` alias.
         let _ = &mut data;
+    }
+
+    #[test]
+    fn peek_first_and_last() {
+        let (data, ts) = build_sorted_log(120);
+        let mut cur = Cursor::new(data);
+        assert_eq!(peek_first_timestamp(&mut cur).unwrap(), Some(ts[0]));
+        assert_eq!(
+            peek_last_timestamp(&mut cur).unwrap(),
+            Some(*ts.last().unwrap())
+        );
+    }
+
+    #[test]
+    fn peek_empty() {
+        let mut cur = Cursor::new(Vec::<u8>::new());
+        assert_eq!(peek_first_timestamp(&mut cur).unwrap(), None);
+        assert_eq!(peek_last_timestamp(&mut cur).unwrap(), None);
     }
 
     #[test]
