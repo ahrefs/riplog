@@ -33,8 +33,15 @@ pub struct Cli {
 
     /// Follow the file: bisect to `--from` (if set) or start at EOF, stream
     /// matching lines, then keep reading new lines as they're appended.
-    #[arg(short = 'F', long)]
+    /// Like `tail -f`: stays on the same inode; if the file is rotated or
+    /// truncated, no further lines will be read.
+    #[arg(short = 'f', long)]
     pub follow: bool,
+
+    /// Like `-f`, but reopen the file on rotation (inode change) or
+    /// truncation, like `tail -F`.
+    #[arg(short = 'F', long = "follow-reopen")]
+    pub follow_reopen: bool,
 
     /// Write output to FILE instead of stdout.
     #[arg(short = 'o', long)]
@@ -50,4 +57,9 @@ pub struct Cli {
     /// matched lines and print the sorted list at the end.
     #[arg(long = "list-keys")]
     pub list_keys: bool,
+
+    /// Suppress line output; print only the count of matched lines at the
+    /// end. Combine with `-F` and Ctrl-C to count live.
+    #[arg(long)]
+    pub count: bool,
 }

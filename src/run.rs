@@ -2,6 +2,7 @@
 //! lines through the filter, write matches to the chosen output, optionally
 //! follow.
 
+use anyhow::Context as _;
 use humanize_bytes::humanize_bytes_binary;
 use rapidhash::{RapidHashMap, RapidHashSet};
 use smallvec::SmallVec;
@@ -10,6 +11,8 @@ use std::{
     fmt::Write as _,
     fs::File,
     io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
+    path::Path,
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
 
@@ -18,6 +21,21 @@ use crate::cli::Cli;
 use crate::filter::Filter;
 use crate::logfmt;
 use crate::timestamp::{self, Timestamp};
+
+/// Set by the SIGINT handler; checked in tight loops so we can exit cleanly
+/// and still emit `--count` / `--list-keys` / `--count-by` summaries.
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+fn install_signal_handler() {
+    // Idempotent — `set_handler` errors if called twice. Ignore that path so
+    // the binary stays usable when run as a library.
+    let _ = ctrlc::set_handler(|| INTERRUPTED.store(true, Ordering::SeqCst));
+}
+
+#[inline]
+fn interrupted() -> bool {
+    INTERRUPTED.load(Ordering::Relaxed)
+}
 
 type Combo = SmallVec<[SmartString; 3]>;
 
@@ -35,11 +53,6 @@ impl KeyGather {
             enabled,
             keys: RapidHashSet::default(),
         }
-    }
-
-    #[inline]
-    fn is_active(&self) -> bool {
-        self.enabled
     }
 
     fn record(&mut self, pairs: &[(&str, &str)]) {
@@ -182,7 +195,11 @@ impl TimeFilter {
 const FOLLOW_POLL: Duration = Duration::from_millis(200);
 
 pub fn run(cli: &Cli) -> anyhow::Result<()> {
+    install_signal_handler();
+
     let filter = Filter::parse(&cli.keys)?;
+    let following = cli.follow || cli.follow_reopen;
+    let suppress_lines = cli.list_keys || cli.count;
 
     let mut output: Box<dyn Write> = match &cli.output {
         Some(path) => Box::new(BufWriter::new(File::create(path)?)),
@@ -193,7 +210,7 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
     let mut counter = Counter::new(cli.count_by.clone());
     let mut keys = KeyGather::new(cli.list_keys);
 
-    let need_seek = cli.from.is_some() || cli.to.is_some() || cli.follow;
+    let need_seek = cli.from.is_some() || cli.to.is_some() || following;
     let path = match &cli.file {
         Some(p) => p,
         None => {
@@ -207,11 +224,10 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
                 &mut stats,
                 &mut counter,
                 &mut keys,
+                suppress_lines,
             )?;
             output.flush()?;
-            stats.report();
-            counter.report();
-            keys.report();
+            emit_summaries(&stats, &counter, &keys, cli.count, &mut output)?;
             return Ok(());
         }
     };
@@ -238,11 +254,11 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
             tf.from = Some(t1);
             bisect::bisect(&mut file, t1, window, Side::Lower)?
         }
-        None if cli.follow => file_len, // tail-from-EOF when no --from
+        None if following => file_len, // tail-from-EOF when no --from
         None => 0,
     };
     let end_byte: u64 = match cli.to.as_deref() {
-        Some(to) if !cli.follow => {
+        Some(to) if !following => {
             let t2 = timestamp::resolve_bound(to, file_first, file_last, file_last)?;
             tf.to = Some(t2);
             bisect::bisect(&mut file, t2, window, Side::Upper)?
@@ -262,6 +278,16 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
     }
 
     file.seek(SeekFrom::Start(start_byte))?;
+    let file_for_reopen = if following {
+        Some(file.try_clone().with_context(|| {
+            format!(
+                "dup file handle for follow-mode rotation tracking: {}",
+                path.display()
+            )
+        })?)
+    } else {
+        None
+    };
     let mut reader = BufReader::new(file);
 
     // Phase 1: stream up to end_byte.
@@ -275,25 +301,48 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
         &mut stats,
         &mut counter,
         &mut keys,
+        suppress_lines,
     )?;
     output.flush()?;
 
     // Phase 2: follow. New lines are assumed monotone, so don't re-apply tf.
-    if cli.follow {
+    if let Some(handle) = file_for_reopen
+        && !interrupted()
+    {
         follow_loop(
+            path,
+            handle,
             reader,
+            cli.follow_reopen,
             &filter,
             &mut output,
             &mut stats,
             &mut counter,
             &mut keys,
+            suppress_lines,
         )?;
     }
 
+    output.flush()?;
+    emit_summaries(&stats, &counter, &keys, cli.count, &mut output)?;
+
+    Ok(())
+}
+
+fn emit_summaries<W: Write>(
+    stats: &Stats,
+    counter: &Counter,
+    keys: &KeyGather,
+    count_only: bool,
+    output: &mut W,
+) -> anyhow::Result<()> {
     stats.report();
     counter.report();
     keys.report();
-
+    if count_only {
+        writeln!(output, "{}", stats.matched_lines)?;
+        output.flush()?;
+    }
     Ok(())
 }
 
@@ -342,18 +391,29 @@ fn stream_bounded<R: BufRead, W: Write>(
     stats: &mut Stats,
     counter: &mut Counter,
     keys: &mut KeyGather,
+    suppress_lines: bool,
 ) -> anyhow::Result<()> {
     let mut line_buf = Vec::new();
     let mut total_read: u64 = 0;
     stats.started.get_or_insert_with(Instant::now);
 
-    while total_read < max_bytes {
+    while total_read < max_bytes && !interrupted() {
         let n = reader.read_until(b'\n', &mut line_buf)?;
         if n == 0 {
             break;
         }
         total_read += n as u64;
-        process_line(&mut line_buf, filter, tf, output, stats, counter, keys, n)?;
+        process_line(
+            &mut line_buf,
+            filter,
+            tf,
+            output,
+            stats,
+            counter,
+            keys,
+            suppress_lines,
+            n,
+        )?;
     }
     Ok(())
 }
@@ -366,12 +426,13 @@ fn stream_unbounded<R: Read, W: Write>(
     stats: &mut Stats,
     counter: &mut Counter,
     keys: &mut KeyGather,
+    suppress_lines: bool,
 ) -> anyhow::Result<()> {
     let mut reader = BufReader::new(reader);
     let mut line_buf = Vec::new();
     stats.started.get_or_insert_with(Instant::now);
 
-    loop {
+    while !interrupted() {
         let n = reader.read_until(b'\n', &mut line_buf)?;
         if n == 0 {
             break;
@@ -384,6 +445,7 @@ fn stream_unbounded<R: Read, W: Write>(
             stats,
             counter,
             keys,
+            suppress_lines,
             n,
         )?;
     }
@@ -398,6 +460,7 @@ fn process_line<W: Write>(
     stats: &mut Stats,
     counter: &mut Counter,
     keys: &mut KeyGather,
+    suppress_lines: bool,
     n_bytes: usize,
 ) -> anyhow::Result<()> {
     // Preserve the original bytes for output; trim a trailing newline for parsing.
@@ -432,8 +495,7 @@ fn process_line<W: Write>(
         stats.matched_lines += 1;
         counter.record(parsed);
         keys.record(parsed);
-        // `--list-keys` suppresses line output.
-        if !keys.is_active() {
+        if !suppress_lines {
             output.write_all(line_buf)?;
             if raw_len == parse_end {
                 // No trailing newline in the source; add one for tidy output.
@@ -445,29 +507,46 @@ fn process_line<W: Write>(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn follow_loop<W: Write>(
+    path: &Path,
+    mut handle: File,
     mut reader: BufReader<File>,
+    reopen: bool,
     filter: &Filter,
     output: &mut W,
     stats: &mut Stats,
     counter: &mut Counter,
     keys: &mut KeyGather,
+    suppress_lines: bool,
 ) -> anyhow::Result<()> {
     let mut line_buf = Vec::new();
-    loop {
+    let mut pos = reader.stream_position()?;
+
+    while !interrupted() {
         let n = reader.read_until(b'\n', &mut line_buf)?;
         if n == 0 {
             output.flush()?;
+            if reopen && let Some((new_handle, new_reader)) = check_rotation(path, &handle, pos)? {
+                log::info!(
+                    "follow: file rotated/truncated; reopening {}",
+                    path.display()
+                );
+                handle = new_handle;
+                reader = new_reader;
+                pos = 0;
+                line_buf.clear();
+                continue;
+            }
             std::thread::sleep(FOLLOW_POLL);
             continue;
         }
-        // Only process complete lines (terminated by '\n'). If not, hold for
-        // more bytes to arrive.
         if !line_buf.ends_with(b"\n") {
-            // Partial — put back via short-circuit: keep accumulating.
+            // Partial line — wait for the rest.
             std::thread::sleep(FOLLOW_POLL);
             continue;
         }
+        pos += n as u64;
         process_line(
             &mut line_buf,
             filter,
@@ -476,7 +555,46 @@ fn follow_loop<W: Write>(
             stats,
             counter,
             keys,
+            suppress_lines,
             n,
         )?;
     }
+    Ok(())
+}
+
+/// On EOF, decide whether the path now resolves to a different file (rotation)
+/// or has shrunk below our position (truncation). Returns a fresh
+/// `(File, BufReader)` if so.
+fn check_rotation(
+    path: &Path,
+    current: &File,
+    pos: u64,
+) -> anyhow::Result<Option<(File, BufReader<File>)>> {
+    let path_meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return Ok(None), // file may be momentarily missing during rotation
+    };
+
+    let mut should_reopen = path_meta.len() < pos;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if !should_reopen
+            && let Ok(cur_meta) = current.metadata()
+            && (path_meta.ino() != cur_meta.ino() || path_meta.dev() != cur_meta.dev())
+        {
+            should_reopen = true;
+        }
+    }
+    // `current` is only used on unix; silence the warning elsewhere.
+    #[cfg(not(unix))]
+    let _ = current;
+
+    if !should_reopen {
+        return Ok(None);
+    }
+    let f = File::open(path)?;
+    let dup = f.try_clone()?;
+    Ok(Some((f, BufReader::new(dup))))
 }
