@@ -1,6 +1,14 @@
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+
+#[derive(ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ColorMode {
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
 
 #[derive(Parser, Debug)]
 #[command(about = "Slice and filter logfmt streams.")]
@@ -80,4 +88,9 @@ pub struct Cli {
     /// is unchanged.
     #[arg(long)]
     pub tz: Option<String>,
+
+    /// Colorize output. `auto` (default) enables when stdout is a terminal
+    /// and `-o` is not used.
+    #[arg(long, value_enum, default_value_t = ColorMode::Auto)]
+    pub color: ColorMode,
 }

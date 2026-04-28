@@ -9,17 +9,27 @@ use smallvec::SmallVec;
 use smartstring::alias::String as SmartString;
 use std::{
     fs::File,
-    io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
+    io::{BufRead, BufReader, BufWriter, IsTerminal, Read, Seek, SeekFrom, Write},
     path::Path,
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
 
 use crate::bisect::{self, Side};
-use crate::cli::Cli;
+use crate::cli::{Cli, ColorMode};
 use crate::filter::Filter;
 use crate::logfmt;
 use crate::timestamp::{self, Timestamp};
+
+// ANSI escapes for colorized output.
+const RESET: &str = "\x1b[0m";
+const BOLD: &str = "\x1b[1m";
+const COL_BLUE: &str = "\x1b[34m";
+const COL_RED: &str = "\x1b[31m";
+const COL_YELLOW: &str = "\x1b[33m";
+const COL_GREEN: &str = "\x1b[32m";
+const COL_GRAY: &str = "\x1b[90m";
+const COL_QUOTE: &str = "\x1b[1;34m";
 
 /// Set by the SIGINT handler; checked in tight loops so we can exit cleanly
 /// and still emit `--count` / `--list-keys` / `--count-by` summaries.
@@ -257,9 +267,14 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
 
     let filter = Filter::parse(&cli.keys)?;
     let following = cli.follow || cli.follow_reopen;
-    let suppress_lines =
-        cli.list_keys || cli.count || !cli.list_values_for.is_empty();
+    let suppress_lines = cli.list_keys || cli.count || !cli.list_values_for.is_empty();
     let tz = timestamp::resolve_tz(cli.tz.as_deref())?;
+
+    let colorize = match cli.color {
+        ColorMode::Always => true,
+        ColorMode::Never => false,
+        ColorMode::Auto => cli.output.is_none() && std::io::stdout().is_terminal(),
+    };
 
     let mut output: Box<dyn Write> = match &cli.output {
         Some(path) => Box::new(BufWriter::new(File::create(path)?)),
@@ -272,6 +287,7 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
         keys: KeyGather::new(cli.list_keys),
         values: ValueGather::new(cli.list_values_for.clone()),
         suppress_lines,
+        colorize,
     };
 
     let need_seek = cli.from.is_some() || cli.to.is_some() || following || cli.time_range;
@@ -403,11 +419,7 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn emit_summaries<W: Write>(
-    sinks: &Sinks,
-    count_only: bool,
-    output: &mut W,
-) -> anyhow::Result<()> {
+fn emit_summaries<W: Write>(sinks: &Sinks, count_only: bool, output: &mut W) -> anyhow::Result<()> {
     sinks.stats.report();
     sinks.counter.report(output)?;
     sinks.keys.report(output)?;
@@ -472,6 +484,7 @@ struct Sinks {
     keys: KeyGather,
     values: ValueGather,
     suppress_lines: bool,
+    colorize: bool,
 }
 
 /// Read a fixed byte budget from `reader`, write matching lines to `output`.
@@ -566,14 +579,85 @@ fn process_line<W: Write>(
         sinks.keys.record(parsed);
         sinks.values.record(parsed);
         if !sinks.suppress_lines {
-            output.write_all(line_buf)?;
-            if raw_len == parse_end {
-                // No trailing newline in the source; add one for tidy output.
-                output.write_all(b"\n")?;
+            if sinks.colorize {
+                write_colored_line(output, parsed)?;
+            } else {
+                output.write_all(line_buf)?;
+                if raw_len == parse_end {
+                    // No trailing newline in the source; add one for tidy output.
+                    output.write_all(b"\n")?;
+                }
             }
         }
     }
     line_buf.clear();
+    Ok(())
+}
+
+fn level_color(value: &str) -> &'static str {
+    // Match against the value with quotes already stripped where needed.
+    let v = value.trim_matches('"');
+    match v {
+        "error" | "fatal" | "crit" | "critical" | "ERROR" | "FATAL" => COL_RED,
+        "warn" | "warning" | "WARN" | "WARNING" => COL_YELLOW,
+        "info" | "INFO" => COL_GREEN,
+        "debug" | "trace" | "DEBUG" | "TRACE" => COL_GRAY,
+        _ => "",
+    }
+}
+
+fn write_colored_line<W: Write>(out: &mut W, pairs: &[(&str, &str)]) -> std::io::Result<()> {
+    let lvl_sgr = pairs
+        .iter()
+        .find_map(|(k, v)| (*k == "level").then(|| level_color(v)))
+        .unwrap_or("");
+
+    for (i, (k, v)) in pairs.iter().enumerate() {
+        if i > 0 {
+            out.write_all(b" ")?;
+        }
+        write!(out, "{BOLD}{k}{RESET}=")?;
+        let color: &str = match *k {
+            "time" | "ts" => COL_BLUE,
+            "level" => lvl_sgr,
+            _ => "",
+        };
+        write_value(out, v, color, *k == "level")?;
+    }
+    out.write_all(b"\n")?;
+    Ok(())
+}
+
+/// Emit a value with optional color and bold. If the value is wrapped in
+/// double quotes, the quote characters are highlighted in gray so the
+/// content boundary is easy to spot.
+fn write_value<W: Write>(out: &mut W, v: &str, color: &str, bold: bool) -> std::io::Result<()> {
+    let b = v.as_bytes();
+    let quoted = b.len() >= 2 && b[0] == b'"' && b[b.len() - 1] == b'"';
+    let prefix = match (bold, color.is_empty()) {
+        (true, true) => BOLD,
+        (true, false) => "", // emitted as `BOLD + color` below
+        (false, _) => "",
+    };
+    let inner = if quoted { &v[1..v.len() - 1] } else { v };
+
+    if quoted {
+        write!(out, "{COL_QUOTE}\"{RESET}")?;
+    }
+    if bold && !color.is_empty() {
+        write!(out, "{BOLD}{color}")?;
+    } else if bold {
+        out.write_all(prefix.as_bytes())?;
+    } else if !color.is_empty() {
+        out.write_all(color.as_bytes())?;
+    }
+    out.write_all(inner.as_bytes())?;
+    if bold || !color.is_empty() {
+        out.write_all(RESET.as_bytes())?;
+    }
+    if quoted {
+        write!(out, "{COL_QUOTE}\"{RESET}")?;
+    }
     Ok(())
 }
 
