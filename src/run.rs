@@ -466,8 +466,9 @@ impl Stats {
             0
         };
         log::info!(
-            "{} read, {}/{} lines matched ({} invalid utf8), {} pairs ({} overflow), {}/s",
+            "{} read in {:.3}s, {}/{} lines matched ({} invalid utf8), {} pairs ({} overflow), {}/s",
             humanize_bytes_binary!(self.bytes),
+            elapsed,
             self.matched_lines,
             self.total_lines,
             self.invalid_utf,
