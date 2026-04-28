@@ -293,21 +293,16 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
     let suppress_lines = cli.list_keys || cli.count || !cli.list_values_for.is_empty();
     let tz = timestamp::resolve_tz(cli.tz.as_deref())?;
 
-    let sampler = match cli.sample_rate {
-        Some(rate) if (0.0..=1.0).contains(&rate) => {
-            let sample_if = match cli.sample_if.as_ref() {
-                Some(s) => Some(Filter::parse(std::slice::from_ref(s))?),
-                None => None,
-            };
-            Some(Sampler { rate, sample_if })
+    let sampler = match (cli.sample_rate, cli.sample_if.as_deref()) {
+        (None, Some(_)) => anyhow::bail!("--sample-if requires --sample-rate"),
+        (None, None) => None,
+        (Some(rate), _) if !(0.0..=1.0).contains(&rate) => {
+            anyhow::bail!("--sample-rate must be in [0, 1], got {rate}")
         }
-        Some(rate) => anyhow::bail!("--sample-rate must be in [0, 1], got {rate}"),
-        None => {
-            if cli.sample_if.is_some() {
-                anyhow::bail!("--sample-if requires --sample-rate");
-            }
-            None
-        }
+        (Some(rate), sample_if) => Some(Sampler {
+            rate,
+            sample_if: sample_if.map(Filter::parse_one).transpose()?,
+        }),
     };
 
     let colorize = match cli.color {

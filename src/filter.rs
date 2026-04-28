@@ -151,6 +151,12 @@ impl Filter {
         Ok(Filter { exprs })
     }
 
+    pub fn parse_one(spec: &str) -> anyhow::Result<Self> {
+        Ok(Filter {
+            exprs: vec![parse_expr(spec)?],
+        })
+    }
+
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.exprs.is_empty()
