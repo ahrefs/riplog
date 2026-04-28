@@ -287,7 +287,7 @@ pub fn extract_timestamp(pairs: &[(&str, &str)]) -> Option<Timestamp> {
     None
 }
 
-fn strip_quotes(s: &str) -> &str {
+pub fn strip_quotes(s: &str) -> &str {
     let b = s.as_bytes();
     if b.len() >= 2 && b[0] == b'"' && b[b.len() - 1] == b'"' {
         &s[1..s.len() - 1]

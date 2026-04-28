@@ -33,10 +33,14 @@ pub struct Cli {
     #[arg(long, default_value_t = 10)]
     pub window_secs: u64,
 
-    /// Repeated key/value filter. Operators: `=`, `!=`, `<`, `<=`, `>`,
-    /// `>=`, `=~`. Examples: `--key level=error`, `--key dur>=100`,
-    /// `--key msg=~"connection.*reset"`. Multiple `--key` flags are AND-ed.
-    #[arg(long = "key")]
+    /// Filter expression. Combine leaf predicates `<key> <op> <value>`
+    /// (`=`, `!=`, `<`, `<=`, `>`, `>=`, `=~`) with `and`, `or`, `not`,
+    /// and parentheses. Repeatable; multiple `--if` flags are AND-ed.
+    /// Examples: `--if 'level>=warn'`,
+    /// `--if 'level=error and (facil=net or facil=db)'`,
+    /// `--if 'not msg =~ "noisy.*timeout"'`.
+    /// `--where` is an alias.
+    #[arg(long = "if", visible_alias = "where")]
     pub keys: Vec<String>,
 
     /// Follow the file: bisect to `--from` (if set) or start at EOF, stream

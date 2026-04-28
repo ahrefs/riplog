@@ -88,7 +88,7 @@ fn count_no_filter() {
 #[test]
 fn count_filtered_by_level() {
     let path = fixture_path().to_str().unwrap();
-    let out = run(&["--count", "--key=level=error", path]);
+    let out = run(&["--count", "--if=level=error", path]);
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
         N_ERROR.to_string()
@@ -98,7 +98,7 @@ fn count_filtered_by_level() {
 #[test]
 fn count_filtered_by_regex() {
     let path = fixture_path().to_str().unwrap();
-    let out = run(&["--count", "--key=msg=~connection", path]);
+    let out = run(&["--count", "--if=msg=~connection", path]);
     let n: usize = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
     assert!(n > 0, "expected some msg matches for `connection`, got 0");
     assert!(n < COUNT);
@@ -190,7 +190,7 @@ fn output_file_flag_writes_to_file() {
     let path = fixture_path().to_str().unwrap();
     let out_file = std::env::temp_dir().join("riplog-it-out.log");
     let _ = fs::remove_file(&out_file);
-    let _ = run(&["--key=level=warn", "-o", out_file.to_str().unwrap(), path]);
+    let _ = run(&["--if=level=warn", "-o", out_file.to_str().unwrap(), path]);
     let written = fs::read_to_string(&out_file).unwrap();
     let lines_n = written.lines().count();
     assert_eq!(lines_n, N_WARN);
@@ -245,7 +245,11 @@ fn follow_reopen_handles_rotation() {
     );
     thread::sleep(FOLLOW_TICK);
 
-    fs::write(&path, "level=info time=2026-04-24T18:00:10Z msg=after_rotate\n").unwrap();
+    fs::write(
+        &path,
+        "level=info time=2026-04-24T18:00:10Z msg=after_rotate\n",
+    )
+    .unwrap();
     thread::sleep(FOLLOW_TICK);
 
     assert_eq!(
