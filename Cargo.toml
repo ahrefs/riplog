@@ -19,5 +19,6 @@ smartstring = "1.0.1"
 vecmap-rs = "0.2.4"
 
 [dev-dependencies]
+libc = "0.2"
 proptest = "1"
 logfmt = "0.0.2"

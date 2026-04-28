@@ -623,6 +623,7 @@ dependencies = [
  "env_logger",
  "humanize-bytes",
  "jiff",
+ "libc",
  "log",
  "logfmt",
  "memchr",
