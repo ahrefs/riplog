@@ -175,9 +175,7 @@ pub fn time_range<R: Read + Seek>(
 
 /// Minimum parseable timestamp in the head [`PROBE_SCAN_BYTES`] of the
 /// stream. Tolerates a small reorder near the beginning.
-pub fn min_timestamp_in_head<R: Read + Seek>(
-    reader: &mut R,
-) -> anyhow::Result<Option<Timestamp>> {
+pub fn min_timestamp_in_head<R: Read + Seek>(reader: &mut R) -> anyhow::Result<Option<Timestamp>> {
     let buf = read_head(reader)?;
     Ok(fold_timestamps_in_chunk(&buf, false, |acc, ts| {
         Some(acc.map_or(ts, |a: Timestamp| a.min(ts)))
@@ -186,9 +184,7 @@ pub fn min_timestamp_in_head<R: Read + Seek>(
 
 /// Maximum parseable timestamp in the tail [`PROBE_SCAN_BYTES`] of the
 /// stream. Tolerates a small reorder near the end.
-pub fn max_timestamp_in_tail<R: Read + Seek>(
-    reader: &mut R,
-) -> anyhow::Result<Option<Timestamp>> {
+pub fn max_timestamp_in_tail<R: Read + Seek>(reader: &mut R) -> anyhow::Result<Option<Timestamp>> {
     let (buf, skip) = read_tail(reader)?;
     Ok(fold_timestamps_in_chunk(&buf, skip, |acc, ts| {
         Some(acc.map_or(ts, |a: Timestamp| a.max(ts)))
