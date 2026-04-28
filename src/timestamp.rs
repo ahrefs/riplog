@@ -1,5 +1,7 @@
 //! Fast RFC 3339 timestamp parsing into nanoseconds since the Unix epoch.
 
+use std::fmt::Write as _;
+
 pub type Timestamp = i64;
 
 /// Parse an RFC 3339 / ISO 8601 timestamp into nanoseconds since the Unix epoch.
@@ -303,6 +305,127 @@ fn parse_uint(b: &[u8]) -> Option<u32> {
         acc = acc * 10 + (c - b'0') as u32;
     }
     Some(acc)
+}
+
+/// Resolve a `--tz` argument. Accepts `utc`, `local`, an IANA name like
+/// `Europe/Paris`, or a fixed offset like `+02:00` / `-0530`.
+pub fn resolve_tz(spec: Option<&str>) -> anyhow::Result<jiff::tz::TimeZone> {
+    let spec = match spec {
+        None => return Ok(jiff::tz::TimeZone::UTC),
+        Some(s) => s,
+    };
+    if spec.eq_ignore_ascii_case("utc") {
+        return Ok(jiff::tz::TimeZone::UTC);
+    }
+    if spec.eq_ignore_ascii_case("local") {
+        return Ok(jiff::tz::TimeZone::system());
+    }
+    // Named (Europe/Paris, America/New_York, …).
+    if let Ok(tz) = jiff::tz::TimeZone::get(spec) {
+        return Ok(tz);
+    }
+    // Fixed offset like `+02:00`, `-05:30`, `+0200`, `+02`.
+    if let Some(offset) = parse_fixed_offset(spec) {
+        return Ok(jiff::tz::TimeZone::fixed(offset));
+    }
+    anyhow::bail!("unknown timezone `{spec}` (try utc, local, IANA name, or ±HH[:MM])")
+}
+
+fn parse_fixed_offset(spec: &str) -> Option<jiff::tz::Offset> {
+    let b = spec.as_bytes();
+    if b.is_empty() {
+        return None;
+    }
+    let sign: i32 = match b[0] {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let rest = &spec[1..];
+    let (h, m) = match rest.len() {
+        2 => (rest.parse::<u32>().ok()?, 0),
+        4 => (
+            rest[..2].parse::<u32>().ok()?,
+            rest[2..].parse::<u32>().ok()?,
+        ),
+        5 if rest.as_bytes()[2] == b':' => (
+            rest[..2].parse::<u32>().ok()?,
+            rest[3..].parse::<u32>().ok()?,
+        ),
+        _ => return None,
+    };
+    if h > 23 || m > 59 {
+        return None;
+    }
+    let total = sign * ((h * 3600 + m * 60) as i32);
+    jiff::tz::Offset::from_seconds(total).ok()
+}
+
+/// Format a nanosecond timestamp in the given timezone as RFC 3339.
+/// Trailing zeros in the fractional part are stripped.
+pub fn format_rfc3339(ts: Timestamp, tz: &jiff::tz::TimeZone) -> String {
+    let stamp = match jiff::Timestamp::from_nanosecond(ts as i128) {
+        Ok(t) => t,
+        Err(_) => return "<out-of-range>".to_string(),
+    };
+    let zoned = stamp.to_zoned(tz.clone());
+    let dt = zoned.datetime();
+    let off = zoned.offset();
+    let off_str = if off.is_zero() {
+        "Z".to_string()
+    } else {
+        let total = off.seconds();
+        let sign = if total < 0 { '-' } else { '+' };
+        let abs = total.unsigned_abs();
+        format!("{sign}{:02}:{:02}", abs / 3600, (abs / 60) % 60)
+    };
+    let nanos = dt.subsec_nanosecond();
+    let base = format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+        dt.year(),
+        dt.month(),
+        dt.day(),
+        dt.hour(),
+        dt.minute(),
+        dt.second(),
+    );
+    if nanos == 0 {
+        format!("{base}{off_str}")
+    } else {
+        let mut frac = format!("{nanos:09}");
+        while frac.ends_with('0') {
+            frac.pop();
+        }
+        format!("{base}.{frac}{off_str}")
+    }
+}
+
+/// Format a duration in nanoseconds as a compact `[Nd][Nh][Nm]Ns` string.
+/// Always emits at least the seconds component.
+pub fn format_duration(nanos: i64) -> String {
+    let neg = nanos < 0;
+    let mut secs = nanos.unsigned_abs() / 1_000_000_000;
+    let days = secs / 86_400;
+    secs %= 86_400;
+    let h = secs / 3600;
+    secs %= 3600;
+    let m = secs / 60;
+    let s = secs % 60;
+    let mut out = String::new();
+    if neg {
+        out.push('-');
+    }
+    if days > 0 {
+        let _ = write!(out, "{days}d");
+    }
+    if h > 0 || days > 0 {
+        let _ = write!(out, "{h}h");
+    }
+    if m > 0 || h > 0 || days > 0 {
+        let _ = write!(out, "{m}m");
+    }
+    let _ = write!(out, "{s}s");
+    out
 }
 
 /// Howard Hinnant's days_from_civil. Returns days since 1970-01-01 (negative

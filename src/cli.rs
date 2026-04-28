@@ -21,8 +21,8 @@ pub struct Cli {
     pub to: Option<String>,
 
     /// Reorder window in seconds, used to over-approximate the bisected byte
-    /// range. Defaults to 5 minutes.
-    #[arg(long, default_value_t = 300)]
+    /// range. Defaults to 10s.
+    #[arg(long, default_value_t = 10)]
     pub window_secs: u64,
 
     /// Repeated key/value filter. Operators: `=`, `!=`, `<`, `<=`, `>`,
@@ -58,8 +58,26 @@ pub struct Cli {
     #[arg(long = "list-keys")]
     pub list_keys: bool,
 
+    /// Suppress line output; gather every distinct value seen for the given
+    /// key on matched lines. Repeatable.
+    #[arg(long = "list-values-for")]
+    pub list_values_for: Vec<String>,
+
     /// Suppress line output; print only the count of matched lines at the
     /// end. Combine with `-F` and Ctrl-C to count live.
     #[arg(long)]
     pub count: bool,
+
+    /// Print the first and last timestamps in the file. Scans the head and
+    /// tail (≈1 MiB each) and returns the min/max so slight reordering at
+    /// the edges doesn't skew the result. Suppresses normal output.
+    #[arg(long = "time-range")]
+    pub time_range: bool,
+
+    /// Timezone for displayed timestamps. Accepts `utc`, `local`, an IANA
+    /// name like `Europe/Paris`, or a fixed offset like `+02:00`.
+    /// Defaults to `utc`. Only affects display; parsing of input timestamps
+    /// is unchanged.
+    #[arg(long)]
+    pub tz: Option<String>,
 }

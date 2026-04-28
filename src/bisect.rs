@@ -147,6 +147,98 @@ pub fn peek_first_timestamp<R: Read + Seek>(reader: &mut R) -> anyhow::Result<Op
     Ok(probe(reader, 0, file_len)?.map(|(_, ts)| ts))
 }
 
+/// Minimum parseable timestamp in the head [`PROBE_SCAN_BYTES`] of the
+/// stream. Use this when you need the file's earliest time and want to
+/// tolerate a small reorder near the beginning.
+pub fn min_timestamp_in_head<R: Read + Seek>(
+    reader: &mut R,
+) -> anyhow::Result<Option<Timestamp>> {
+    let file_len = reader.seek(SeekFrom::End(0))?;
+    if file_len == 0 {
+        return Ok(None);
+    }
+    reader.seek(SeekFrom::Start(0))?;
+    let chunk = PROBE_SCAN_BYTES.min(file_len);
+    let mut buf = vec![0u8; chunk as usize];
+    let n = read_fully(reader, &mut buf)?;
+    buf.truncate(n);
+
+    let mut idx = 0;
+    let mut min_ts: Option<Timestamp> = None;
+    while idx < buf.len() {
+        let end = memchr::memchr(b'\n', &buf[idx..])
+            .map(|i| idx + i)
+            .unwrap_or(buf.len());
+        let line_end = if end > idx && buf[end - 1] == b'\r' {
+            end - 1
+        } else {
+            end
+        };
+        if let Ok(line) = std::str::from_utf8(&buf[idx..line_end]) {
+            let mut pairs = logfmt::PairsBuffer::<256>::new();
+            let (parsed, _) = pairs.parse(line);
+            if let Some(ts) = extract_timestamp(parsed) {
+                min_ts = Some(min_ts.map_or(ts, |m| m.min(ts)));
+            }
+        }
+        if end >= buf.len() {
+            break;
+        }
+        idx = end + 1;
+    }
+    Ok(min_ts)
+}
+
+/// Maximum parseable timestamp in the tail [`PROBE_SCAN_BYTES`] of the
+/// stream. Tolerates small reorder near the end.
+pub fn max_timestamp_in_tail<R: Read + Seek>(
+    reader: &mut R,
+) -> anyhow::Result<Option<Timestamp>> {
+    let file_len = reader.seek(SeekFrom::End(0))?;
+    if file_len == 0 {
+        return Ok(None);
+    }
+    let chunk = PROBE_SCAN_BYTES.min(file_len);
+    let chunk_start = file_len - chunk;
+    reader.seek(SeekFrom::Start(chunk_start))?;
+    let mut buf = vec![0u8; chunk as usize];
+    let n = read_fully(reader, &mut buf)?;
+    buf.truncate(n);
+
+    let mut idx = if chunk_start == 0 {
+        0
+    } else {
+        match memchr::memchr(b'\n', &buf) {
+            Some(i) => i + 1,
+            None => return Ok(None),
+        }
+    };
+
+    let mut max_ts: Option<Timestamp> = None;
+    while idx < buf.len() {
+        let end = memchr::memchr(b'\n', &buf[idx..])
+            .map(|i| idx + i)
+            .unwrap_or(buf.len());
+        let line_end = if end > idx && buf[end - 1] == b'\r' {
+            end - 1
+        } else {
+            end
+        };
+        if let Ok(line) = std::str::from_utf8(&buf[idx..line_end]) {
+            let mut pairs = logfmt::PairsBuffer::<256>::new();
+            let (parsed, _) = pairs.parse(line);
+            if let Some(ts) = extract_timestamp(parsed) {
+                max_ts = Some(max_ts.map_or(ts, |m| m.max(ts)));
+            }
+        }
+        if end >= buf.len() {
+            break;
+        }
+        idx = end + 1;
+    }
+    Ok(max_ts)
+}
+
 /// Last parseable timestamp in the stream. Scans the trailing
 /// [`PROBE_SCAN_BYTES`]; if no parseable line is found in the tail returns
 /// `None`.

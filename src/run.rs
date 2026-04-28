@@ -8,7 +8,6 @@ use rapidhash::{RapidHashMap, RapidHashSet};
 use smallvec::SmallVec;
 use smartstring::alias::String as SmartString;
 use std::{
-    fmt::Write as _,
     fs::File,
     io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::Path,
@@ -68,22 +67,80 @@ impl KeyGather {
         }
     }
 
-    fn report(&self) {
+    fn report<W: Write>(&self, out: &mut W) -> std::io::Result<()> {
         if !self.enabled {
-            return;
+            return Ok(());
         }
         let mut sorted: Vec<&SmartString> = self.keys.iter().collect();
         sorted.sort_unstable();
-        let mut out = String::from("keys:\n");
         for k in sorted {
-            out.push_str("  ");
-            out.push_str(k);
-            out.push('\n');
+            writeln!(out, "{k}")?;
         }
-        if out.ends_with('\n') {
-            out.pop();
+        Ok(())
+    }
+}
+
+/// Collects every distinct value seen for each requested key, on matched
+/// lines. Active when at least one `--list-values-for=<key>` is given;
+/// suppresses line output.
+#[derive(Default)]
+struct ValueGather {
+    keys: Vec<String>,
+    values: Vec<RapidHashSet<SmartString>>,
+    scratch: String,
+}
+
+impl ValueGather {
+    fn new(keys: Vec<String>) -> Self {
+        let n = keys.len();
+        Self {
+            keys,
+            values: (0..n).map(|_| RapidHashSet::default()).collect(),
+            scratch: String::new(),
         }
-        log::info!("{out}");
+    }
+
+    #[inline]
+    fn is_active(&self) -> bool {
+        !self.keys.is_empty()
+    }
+
+    fn record(&mut self, pairs: &[(&str, &str)]) {
+        if !self.is_active() {
+            return;
+        }
+        for (i, key) in self.keys.iter().enumerate() {
+            for (pk, pv) in pairs {
+                if *pk == key.as_str() {
+                    self.scratch.clear();
+                    logfmt::unescape_value(pv.as_bytes(), &mut self.scratch);
+                    if !self.values[i].contains(self.scratch.as_str()) {
+                        let mut s = SmartString::new_const();
+                        s.push_str(&self.scratch);
+                        self.values[i].insert(s);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    fn report<W: Write>(&self, out: &mut W) -> std::io::Result<()> {
+        if !self.is_active() {
+            return Ok(());
+        }
+        let multi = self.keys.len() > 1;
+        for (key, set) in self.keys.iter().zip(self.values.iter()) {
+            if multi {
+                writeln!(out, "# {key}")?;
+            }
+            let mut sorted: Vec<&SmartString> = set.iter().collect();
+            sorted.sort_unstable();
+            for v in sorted {
+                writeln!(out, "{v}")?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -130,27 +187,22 @@ impl Counter {
         *self.counts.entry(combo).or_insert(0) += 1;
     }
 
-    fn report(&self) {
+    fn report<W: Write>(&self, out: &mut W) -> std::io::Result<()> {
         if !self.is_active() || self.counts.is_empty() {
-            return;
+            return Ok(());
         }
         let mut entries: Vec<(&Combo, &usize)> = self.counts.iter().collect();
         // Descending by count, ties broken by combo for deterministic output.
         entries.sort_unstable_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
         let count_w = entries[0].1.to_string().len();
-        let mut out = String::from("count-by:\n");
         for (combo, count) in entries {
-            let _ = write!(out, "  {:>w$}", count, w = count_w);
+            write!(out, "{count:>count_w$}")?;
             for (k, v) in self.keys.iter().zip(combo.iter()) {
-                let _ = write!(out, " {k}={}", v.as_str());
+                write!(out, " {k}={}", v.as_str())?;
             }
-            out.push('\n');
+            writeln!(out)?;
         }
-        // Trim trailing newline so log formatter doesn't add a blank line.
-        if out.ends_with('\n') {
-            out.pop();
-        }
-        log::info!("{out}");
+        Ok(())
     }
 }
 
@@ -197,9 +249,15 @@ const FOLLOW_POLL: Duration = Duration::from_millis(200);
 pub fn run(cli: &Cli) -> anyhow::Result<()> {
     install_signal_handler();
 
+    if cli.time_range && (cli.follow || cli.follow_reopen) {
+        anyhow::bail!("`--time-range` cannot be combined with `-f` or `-F`");
+    }
+
     let filter = Filter::parse(&cli.keys)?;
     let following = cli.follow || cli.follow_reopen;
-    let suppress_lines = cli.list_keys || cli.count;
+    let suppress_lines =
+        cli.list_keys || cli.count || !cli.list_values_for.is_empty();
+    let tz = timestamp::resolve_tz(cli.tz.as_deref())?;
 
     let mut output: Box<dyn Write> = match &cli.output {
         Some(path) => Box::new(BufWriter::new(File::create(path)?)),
@@ -209,13 +267,16 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
     let mut stats = Stats::default();
     let mut counter = Counter::new(cli.count_by.clone());
     let mut keys = KeyGather::new(cli.list_keys);
+    let mut values = ValueGather::new(cli.list_values_for.clone());
 
-    let need_seek = cli.from.is_some() || cli.to.is_some() || following;
+    let need_seek = cli.from.is_some() || cli.to.is_some() || following || cli.time_range;
     let path = match &cli.file {
         Some(p) => p,
         None => {
             if need_seek {
-                anyhow::bail!("`-F`, `--from`, `--to` require a file argument");
+                anyhow::bail!(
+                    "`-f`, `-F`, `--from`, `--to`, `--time-range` require a file argument"
+                );
             }
             stream_unbounded(
                 &mut std::io::stdin().lock(),
@@ -224,15 +285,35 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
                 &mut stats,
                 &mut counter,
                 &mut keys,
+                &mut values,
                 suppress_lines,
             )?;
             output.flush()?;
-            emit_summaries(&stats, &counter, &keys, cli.count, &mut output)?;
+            emit_summaries(&stats, &counter, &keys, &values, cli.count, &mut output)?;
             return Ok(());
         }
     };
 
     let mut file = File::open(path)?;
+
+    // Time-range mode: scan head/tail for min/max, print, and exit.
+    if cli.time_range {
+        let first = bisect::min_timestamp_in_head(&mut file)?;
+        let last = bisect::max_timestamp_in_tail(&mut file)?;
+        match (first, last) {
+            (Some(a), Some(b)) => writeln!(
+                output,
+                "{} .. {}  ({})",
+                timestamp::format_rfc3339(a, &tz),
+                timestamp::format_rfc3339(b, &tz),
+                timestamp::format_duration(b - a),
+            )?,
+            _ => writeln!(output, "no parseable timestamps in file")?,
+        }
+        output.flush()?;
+        return Ok(());
+    }
+
     let file_len = file.seek(SeekFrom::End(0))?;
     let window = (cli.window_secs as i64).saturating_mul(1_000_000_000);
 
@@ -301,6 +382,7 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
         &mut stats,
         &mut counter,
         &mut keys,
+        &mut values,
         suppress_lines,
     )?;
     output.flush()?;
@@ -319,12 +401,13 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
             &mut stats,
             &mut counter,
             &mut keys,
+            &mut values,
             suppress_lines,
         )?;
     }
 
     output.flush()?;
-    emit_summaries(&stats, &counter, &keys, cli.count, &mut output)?;
+    emit_summaries(&stats, &counter, &keys, &values, cli.count, &mut output)?;
 
     Ok(())
 }
@@ -333,16 +416,18 @@ fn emit_summaries<W: Write>(
     stats: &Stats,
     counter: &Counter,
     keys: &KeyGather,
+    values: &ValueGather,
     count_only: bool,
     output: &mut W,
 ) -> anyhow::Result<()> {
     stats.report();
-    counter.report();
-    keys.report();
+    counter.report(output)?;
+    keys.report(output)?;
+    values.report(output)?;
     if count_only {
         writeln!(output, "{}", stats.matched_lines)?;
-        output.flush()?;
     }
+    output.flush()?;
     Ok(())
 }
 
@@ -382,6 +467,7 @@ impl Stats {
 }
 
 /// Read a fixed byte budget from `reader`, write matching lines to `output`.
+#[allow(clippy::too_many_arguments)]
 fn stream_bounded<R: BufRead, W: Write>(
     reader: &mut R,
     max_bytes: u64,
@@ -391,6 +477,7 @@ fn stream_bounded<R: BufRead, W: Write>(
     stats: &mut Stats,
     counter: &mut Counter,
     keys: &mut KeyGather,
+    values: &mut ValueGather,
     suppress_lines: bool,
 ) -> anyhow::Result<()> {
     let mut line_buf = Vec::new();
@@ -411,6 +498,7 @@ fn stream_bounded<R: BufRead, W: Write>(
             stats,
             counter,
             keys,
+            values,
             suppress_lines,
             n,
         )?;
@@ -419,6 +507,7 @@ fn stream_bounded<R: BufRead, W: Write>(
 }
 
 /// Read until EOF (e.g. stdin), write matching lines to `output`.
+#[allow(clippy::too_many_arguments)]
 fn stream_unbounded<R: Read, W: Write>(
     reader: &mut R,
     filter: &Filter,
@@ -426,6 +515,7 @@ fn stream_unbounded<R: Read, W: Write>(
     stats: &mut Stats,
     counter: &mut Counter,
     keys: &mut KeyGather,
+    values: &mut ValueGather,
     suppress_lines: bool,
 ) -> anyhow::Result<()> {
     let mut reader = BufReader::new(reader);
@@ -445,6 +535,7 @@ fn stream_unbounded<R: Read, W: Write>(
             stats,
             counter,
             keys,
+            values,
             suppress_lines,
             n,
         )?;
@@ -452,6 +543,7 @@ fn stream_unbounded<R: Read, W: Write>(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_line<W: Write>(
     line_buf: &mut Vec<u8>,
     filter: &Filter,
@@ -460,6 +552,7 @@ fn process_line<W: Write>(
     stats: &mut Stats,
     counter: &mut Counter,
     keys: &mut KeyGather,
+    values: &mut ValueGather,
     suppress_lines: bool,
     n_bytes: usize,
 ) -> anyhow::Result<()> {
@@ -495,6 +588,7 @@ fn process_line<W: Write>(
         stats.matched_lines += 1;
         counter.record(parsed);
         keys.record(parsed);
+        values.record(parsed);
         if !suppress_lines {
             output.write_all(line_buf)?;
             if raw_len == parse_end {
@@ -518,6 +612,7 @@ fn follow_loop<W: Write>(
     stats: &mut Stats,
     counter: &mut Counter,
     keys: &mut KeyGather,
+    values: &mut ValueGather,
     suppress_lines: bool,
 ) -> anyhow::Result<()> {
     let mut line_buf = Vec::new();
@@ -555,6 +650,7 @@ fn follow_loop<W: Write>(
             stats,
             counter,
             keys,
+            values,
             suppress_lines,
             n,
         )?;
