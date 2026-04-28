@@ -147,105 +147,81 @@ pub fn peek_first_timestamp<R: Read + Seek>(reader: &mut R) -> anyhow::Result<Op
     Ok(probe(reader, 0, file_len)?.map(|(_, ts)| ts))
 }
 
+/// (min, max) parseable timestamps from the head and tail of the stream.
+/// When the file fits in a single [`PROBE_SCAN_BYTES`] chunk, scans once
+/// to avoid reading overlapping regions twice.
+pub fn time_range<R: Read + Seek>(
+    reader: &mut R,
+) -> anyhow::Result<(Option<Timestamp>, Option<Timestamp>)> {
+    let file_len = reader.seek(SeekFrom::End(0))?;
+    if file_len == 0 {
+        return Ok((None, None));
+    }
+    if file_len <= PROBE_SCAN_BYTES {
+        let buf = read_head(reader)?;
+        let mut min: Option<Timestamp> = None;
+        let mut max: Option<Timestamp> = None;
+        fold_timestamps_in_chunk(&buf, false, |_, ts| {
+            min = Some(min.map_or(ts, |m| m.min(ts)));
+            max = Some(max.map_or(ts, |m| m.max(ts)));
+            None
+        });
+        return Ok((min, max));
+    }
+    let min = min_timestamp_in_head(reader)?;
+    let max = max_timestamp_in_tail(reader)?;
+    Ok((min, max))
+}
+
 /// Minimum parseable timestamp in the head [`PROBE_SCAN_BYTES`] of the
-/// stream. Use this when you need the file's earliest time and want to
-/// tolerate a small reorder near the beginning.
+/// stream. Tolerates a small reorder near the beginning.
 pub fn min_timestamp_in_head<R: Read + Seek>(
     reader: &mut R,
 ) -> anyhow::Result<Option<Timestamp>> {
-    let file_len = reader.seek(SeekFrom::End(0))?;
-    if file_len == 0 {
-        return Ok(None);
-    }
-    reader.seek(SeekFrom::Start(0))?;
-    let chunk = PROBE_SCAN_BYTES.min(file_len);
-    let mut buf = vec![0u8; chunk as usize];
-    let n = read_fully(reader, &mut buf)?;
-    buf.truncate(n);
-
-    let mut idx = 0;
-    let mut min_ts: Option<Timestamp> = None;
-    while idx < buf.len() {
-        let end = memchr::memchr(b'\n', &buf[idx..])
-            .map(|i| idx + i)
-            .unwrap_or(buf.len());
-        let line_end = if end > idx && buf[end - 1] == b'\r' {
-            end - 1
-        } else {
-            end
-        };
-        if let Ok(line) = std::str::from_utf8(&buf[idx..line_end]) {
-            let mut pairs = logfmt::PairsBuffer::<256>::new();
-            let (parsed, _) = pairs.parse(line);
-            if let Some(ts) = extract_timestamp(parsed) {
-                min_ts = Some(min_ts.map_or(ts, |m| m.min(ts)));
-            }
-        }
-        if end >= buf.len() {
-            break;
-        }
-        idx = end + 1;
-    }
-    Ok(min_ts)
+    let buf = read_head(reader)?;
+    Ok(fold_timestamps_in_chunk(&buf, false, |acc, ts| {
+        Some(acc.map_or(ts, |a: Timestamp| a.min(ts)))
+    }))
 }
 
 /// Maximum parseable timestamp in the tail [`PROBE_SCAN_BYTES`] of the
-/// stream. Tolerates small reorder near the end.
+/// stream. Tolerates a small reorder near the end.
 pub fn max_timestamp_in_tail<R: Read + Seek>(
     reader: &mut R,
 ) -> anyhow::Result<Option<Timestamp>> {
-    let file_len = reader.seek(SeekFrom::End(0))?;
-    if file_len == 0 {
-        return Ok(None);
-    }
-    let chunk = PROBE_SCAN_BYTES.min(file_len);
-    let chunk_start = file_len - chunk;
-    reader.seek(SeekFrom::Start(chunk_start))?;
-    let mut buf = vec![0u8; chunk as usize];
-    let n = read_fully(reader, &mut buf)?;
-    buf.truncate(n);
-
-    let mut idx = if chunk_start == 0 {
-        0
-    } else {
-        match memchr::memchr(b'\n', &buf) {
-            Some(i) => i + 1,
-            None => return Ok(None),
-        }
-    };
-
-    let mut max_ts: Option<Timestamp> = None;
-    while idx < buf.len() {
-        let end = memchr::memchr(b'\n', &buf[idx..])
-            .map(|i| idx + i)
-            .unwrap_or(buf.len());
-        let line_end = if end > idx && buf[end - 1] == b'\r' {
-            end - 1
-        } else {
-            end
-        };
-        if let Ok(line) = std::str::from_utf8(&buf[idx..line_end]) {
-            let mut pairs = logfmt::PairsBuffer::<256>::new();
-            let (parsed, _) = pairs.parse(line);
-            if let Some(ts) = extract_timestamp(parsed) {
-                max_ts = Some(max_ts.map_or(ts, |m| m.max(ts)));
-            }
-        }
-        if end >= buf.len() {
-            break;
-        }
-        idx = end + 1;
-    }
-    Ok(max_ts)
+    let (buf, skip) = read_tail(reader)?;
+    Ok(fold_timestamps_in_chunk(&buf, skip, |acc, ts| {
+        Some(acc.map_or(ts, |a: Timestamp| a.max(ts)))
+    }))
 }
 
 /// Last parseable timestamp in the stream. Scans the trailing
-/// [`PROBE_SCAN_BYTES`]; if no parseable line is found in the tail returns
-/// `None`.
+/// [`PROBE_SCAN_BYTES`]; if no parseable line is found returns `None`.
 pub fn peek_last_timestamp<R: Read + Seek>(reader: &mut R) -> anyhow::Result<Option<Timestamp>> {
+    let (buf, skip) = read_tail(reader)?;
+    Ok(fold_timestamps_in_chunk(&buf, skip, |_, ts| Some(ts)))
+}
+
+fn read_head<R: Read + Seek>(reader: &mut R) -> anyhow::Result<Vec<u8>> {
     let file_len = reader.seek(SeekFrom::End(0))?;
     if file_len == 0 {
-        return Ok(None);
+        return Ok(Vec::new());
+    }
+    let chunk = PROBE_SCAN_BYTES.min(file_len) as usize;
+    reader.seek(SeekFrom::Start(0))?;
+    let mut buf = vec![0u8; chunk];
+    let n = read_fully(reader, &mut buf)?;
+    buf.truncate(n);
+    Ok(buf)
+}
+
+/// Returns `(buf, skip_partial_first_line)`. The skip flag is true when the
+/// chunk begins mid-file and the caller must drop everything up to the first
+/// newline.
+fn read_tail<R: Read + Seek>(reader: &mut R) -> anyhow::Result<(Vec<u8>, bool)> {
+    let file_len = reader.seek(SeekFrom::End(0))?;
+    if file_len == 0 {
+        return Ok((Vec::new(), false));
     }
     let chunk = PROBE_SCAN_BYTES.min(file_len);
     let chunk_start = file_len - chunk;
@@ -253,18 +229,26 @@ pub fn peek_last_timestamp<R: Read + Seek>(reader: &mut R) -> anyhow::Result<Opt
     let mut buf = vec![0u8; chunk as usize];
     let n = read_fully(reader, &mut buf)?;
     buf.truncate(n);
+    Ok((buf, chunk_start != 0))
+}
 
-    // Skip a partial first line if we didn't start at byte 0.
-    let mut idx = if chunk_start == 0 {
-        0
-    } else {
-        match memchr::memchr(b'\n', &buf) {
+/// Walks every newline-delimited line in `buf`, parses each as logfmt,
+/// extracts a timestamp, and threads it through `fold`. If `skip_partial`
+/// is set, the first (potentially incomplete) line is discarded.
+fn fold_timestamps_in_chunk(
+    buf: &[u8],
+    skip_partial: bool,
+    mut fold: impl FnMut(Option<Timestamp>, Timestamp) -> Option<Timestamp>,
+) -> Option<Timestamp> {
+    let mut idx = if skip_partial {
+        match memchr::memchr(b'\n', buf) {
             Some(i) => i + 1,
-            None => return Ok(None),
+            None => return None,
         }
+    } else {
+        0
     };
-
-    let mut last_ts: Option<Timestamp> = None;
+    let mut acc: Option<Timestamp> = None;
     while idx < buf.len() {
         let end = memchr::memchr(b'\n', &buf[idx..])
             .map(|i| idx + i)
@@ -278,7 +262,7 @@ pub fn peek_last_timestamp<R: Read + Seek>(reader: &mut R) -> anyhow::Result<Opt
             let mut pairs = logfmt::PairsBuffer::<256>::new();
             let (parsed, _) = pairs.parse(line);
             if let Some(ts) = extract_timestamp(parsed) {
-                last_ts = Some(ts);
+                acc = fold(acc, ts);
             }
         }
         if end >= buf.len() {
@@ -286,7 +270,7 @@ pub fn peek_last_timestamp<R: Read + Seek>(reader: &mut R) -> anyhow::Result<Opt
         }
         idx = end + 1;
     }
-    Ok(last_ts)
+    acc
 }
 
 /// Seek to `offset`, snap forward to the next line boundary, and return the

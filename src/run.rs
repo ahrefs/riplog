@@ -59,11 +59,7 @@ impl KeyGather {
             return;
         }
         for (k, _) in pairs {
-            if !self.keys.contains(*k) {
-                let mut s = SmartString::new_const();
-                s.push_str(k);
-                self.keys.insert(s);
-            }
+            intern_into_set(&mut self.keys, k);
         }
     }
 
@@ -71,13 +67,27 @@ impl KeyGather {
         if !self.enabled {
             return Ok(());
         }
-        let mut sorted: Vec<&SmartString> = self.keys.iter().collect();
-        sorted.sort_unstable();
-        for k in sorted {
-            writeln!(out, "{k}")?;
-        }
-        Ok(())
+        emit_sorted(&self.keys, out)
     }
+}
+
+/// Insert `s` into `set` only if not already present, allocating a
+/// `SmartString` lazily.
+fn intern_into_set(set: &mut RapidHashSet<SmartString>, s: &str) {
+    if !set.contains(s) {
+        let mut x = SmartString::new_const();
+        x.push_str(s);
+        set.insert(x);
+    }
+}
+
+fn emit_sorted<W: Write>(set: &RapidHashSet<SmartString>, out: &mut W) -> std::io::Result<()> {
+    let mut sorted: Vec<&SmartString> = set.iter().collect();
+    sorted.sort_unstable();
+    for v in sorted {
+        writeln!(out, "{v}")?;
+    }
+    Ok(())
 }
 
 /// Collects every distinct value seen for each requested key, on matched
@@ -114,11 +124,7 @@ impl ValueGather {
                 if *pk == key.as_str() {
                     self.scratch.clear();
                     logfmt::unescape_value(pv.as_bytes(), &mut self.scratch);
-                    if !self.values[i].contains(self.scratch.as_str()) {
-                        let mut s = SmartString::new_const();
-                        s.push_str(&self.scratch);
-                        self.values[i].insert(s);
-                    }
+                    intern_into_set(&mut self.values[i], &self.scratch);
                     break;
                 }
             }
@@ -134,11 +140,7 @@ impl ValueGather {
             if multi {
                 writeln!(out, "# {key}")?;
             }
-            let mut sorted: Vec<&SmartString> = set.iter().collect();
-            sorted.sort_unstable();
-            for v in sorted {
-                writeln!(out, "{v}")?;
-            }
+            emit_sorted(set, out)?;
         }
         Ok(())
     }
@@ -264,10 +266,13 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
         None => Box::new(BufWriter::new(std::io::stdout().lock())),
     };
 
-    let mut stats = Stats::default();
-    let mut counter = Counter::new(cli.count_by.clone());
-    let mut keys = KeyGather::new(cli.list_keys);
-    let mut values = ValueGather::new(cli.list_values_for.clone());
+    let mut sinks = Sinks {
+        stats: Stats::default(),
+        counter: Counter::new(cli.count_by.clone()),
+        keys: KeyGather::new(cli.list_keys),
+        values: ValueGather::new(cli.list_values_for.clone()),
+        suppress_lines,
+    };
 
     let need_seek = cli.from.is_some() || cli.to.is_some() || following || cli.time_range;
     let path = match &cli.file {
@@ -282,24 +287,18 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
                 &mut std::io::stdin().lock(),
                 &filter,
                 &mut output,
-                &mut stats,
-                &mut counter,
-                &mut keys,
-                &mut values,
-                suppress_lines,
+                &mut sinks,
             )?;
             output.flush()?;
-            emit_summaries(&stats, &counter, &keys, &values, cli.count, &mut output)?;
+            emit_summaries(&sinks, cli.count, &mut output)?;
             return Ok(());
         }
     };
 
     let mut file = File::open(path)?;
 
-    // Time-range mode: scan head/tail for min/max, print, and exit.
     if cli.time_range {
-        let first = bisect::min_timestamp_in_head(&mut file)?;
-        let last = bisect::max_timestamp_in_tail(&mut file)?;
+        let (first, last) = bisect::time_range(&mut file)?;
         match (first, last) {
             (Some(a), Some(b)) => writeln!(
                 output,
@@ -379,11 +378,7 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
         &filter,
         &tf,
         &mut output,
-        &mut stats,
-        &mut counter,
-        &mut keys,
-        &mut values,
-        suppress_lines,
+        &mut sinks,
     )?;
     output.flush()?;
 
@@ -398,40 +393,32 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
             cli.follow_reopen,
             &filter,
             &mut output,
-            &mut stats,
-            &mut counter,
-            &mut keys,
-            &mut values,
-            suppress_lines,
+            &mut sinks,
         )?;
     }
 
     output.flush()?;
-    emit_summaries(&stats, &counter, &keys, &values, cli.count, &mut output)?;
+    emit_summaries(&sinks, cli.count, &mut output)?;
 
     Ok(())
 }
 
 fn emit_summaries<W: Write>(
-    stats: &Stats,
-    counter: &Counter,
-    keys: &KeyGather,
-    values: &ValueGather,
+    sinks: &Sinks,
     count_only: bool,
     output: &mut W,
 ) -> anyhow::Result<()> {
-    stats.report();
-    counter.report(output)?;
-    keys.report(output)?;
-    values.report(output)?;
+    sinks.stats.report();
+    sinks.counter.report(output)?;
+    sinks.keys.report(output)?;
+    sinks.values.report(output)?;
     if count_only {
-        writeln!(output, "{}", stats.matched_lines)?;
+        writeln!(output, "{}", sinks.stats.matched_lines)?;
     }
     output.flush()?;
     Ok(())
 }
 
-#[derive(Default)]
 struct Stats {
     bytes: usize,
     matched_lines: usize,
@@ -439,15 +426,26 @@ struct Stats {
     invalid_utf: usize,
     pairs: usize,
     overflow: usize,
-    started: Option<Instant>,
+    started: Instant,
+}
+
+impl Default for Stats {
+    fn default() -> Self {
+        Self {
+            bytes: 0,
+            matched_lines: 0,
+            total_lines: 0,
+            invalid_utf: 0,
+            pairs: 0,
+            overflow: 0,
+            started: Instant::now(),
+        }
+    }
 }
 
 impl Stats {
     fn report(&self) {
-        let elapsed = self
-            .started
-            .map(|t| t.elapsed().as_secs_f64())
-            .unwrap_or(0.0);
+        let elapsed = self.started.elapsed().as_secs_f64();
         let rate = if elapsed > 0.0 {
             (self.bytes as f64 / elapsed) as u64
         } else {
@@ -466,23 +464,27 @@ impl Stats {
     }
 }
 
+/// Bundles per-line bookkeeping (stats + summarisers) so the streaming
+/// helpers don't drown in arguments.
+struct Sinks {
+    stats: Stats,
+    counter: Counter,
+    keys: KeyGather,
+    values: ValueGather,
+    suppress_lines: bool,
+}
+
 /// Read a fixed byte budget from `reader`, write matching lines to `output`.
-#[allow(clippy::too_many_arguments)]
 fn stream_bounded<R: BufRead, W: Write>(
     reader: &mut R,
     max_bytes: u64,
     filter: &Filter,
     tf: &TimeFilter,
     output: &mut W,
-    stats: &mut Stats,
-    counter: &mut Counter,
-    keys: &mut KeyGather,
-    values: &mut ValueGather,
-    suppress_lines: bool,
+    sinks: &mut Sinks,
 ) -> anyhow::Result<()> {
     let mut line_buf = Vec::new();
     let mut total_read: u64 = 0;
-    stats.started.get_or_insert_with(Instant::now);
 
     while total_read < max_bytes && !interrupted() {
         let n = reader.read_until(b'\n', &mut line_buf)?;
@@ -490,37 +492,20 @@ fn stream_bounded<R: BufRead, W: Write>(
             break;
         }
         total_read += n as u64;
-        process_line(
-            &mut line_buf,
-            filter,
-            tf,
-            output,
-            stats,
-            counter,
-            keys,
-            values,
-            suppress_lines,
-            n,
-        )?;
+        process_line(&mut line_buf, filter, tf, output, sinks, n)?;
     }
     Ok(())
 }
 
 /// Read until EOF (e.g. stdin), write matching lines to `output`.
-#[allow(clippy::too_many_arguments)]
 fn stream_unbounded<R: Read, W: Write>(
     reader: &mut R,
     filter: &Filter,
     output: &mut W,
-    stats: &mut Stats,
-    counter: &mut Counter,
-    keys: &mut KeyGather,
-    values: &mut ValueGather,
-    suppress_lines: bool,
+    sinks: &mut Sinks,
 ) -> anyhow::Result<()> {
     let mut reader = BufReader::new(reader);
     let mut line_buf = Vec::new();
-    stats.started.get_or_insert_with(Instant::now);
 
     while !interrupted() {
         let n = reader.read_until(b'\n', &mut line_buf)?;
@@ -532,28 +517,19 @@ fn stream_unbounded<R: Read, W: Write>(
             filter,
             &TimeFilter::default(),
             output,
-            stats,
-            counter,
-            keys,
-            values,
-            suppress_lines,
+            sinks,
             n,
         )?;
     }
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn process_line<W: Write>(
     line_buf: &mut Vec<u8>,
     filter: &Filter,
     tf: &TimeFilter,
     output: &mut W,
-    stats: &mut Stats,
-    counter: &mut Counter,
-    keys: &mut KeyGather,
-    values: &mut ValueGather,
-    suppress_lines: bool,
+    sinks: &mut Sinks,
     n_bytes: usize,
 ) -> anyhow::Result<()> {
     // Preserve the original bytes for output; trim a trailing newline for parsing.
@@ -567,9 +543,9 @@ fn process_line<W: Write>(
     let line_str = match std::str::from_utf8(parse_slice) {
         Ok(s) => s,
         Err(_) => {
-            stats.invalid_utf += 1;
-            stats.bytes += n_bytes;
-            stats.total_lines += 1;
+            sinks.stats.invalid_utf += 1;
+            sinks.stats.bytes += n_bytes;
+            sinks.stats.total_lines += 1;
             line_buf.clear();
             return Ok(());
         }
@@ -580,16 +556,16 @@ fn process_line<W: Write>(
 
     let matched = tf.matches(parsed) && (filter.is_empty() || filter.matches(parsed));
 
-    stats.bytes += n_bytes;
-    stats.total_lines += 1;
-    stats.pairs += parsed.len();
-    stats.overflow += overflow as usize;
+    sinks.stats.bytes += n_bytes;
+    sinks.stats.total_lines += 1;
+    sinks.stats.pairs += parsed.len();
+    sinks.stats.overflow += overflow as usize;
     if matched {
-        stats.matched_lines += 1;
-        counter.record(parsed);
-        keys.record(parsed);
-        values.record(parsed);
-        if !suppress_lines {
+        sinks.stats.matched_lines += 1;
+        sinks.counter.record(parsed);
+        sinks.keys.record(parsed);
+        sinks.values.record(parsed);
+        if !sinks.suppress_lines {
             output.write_all(line_buf)?;
             if raw_len == parse_end {
                 // No trailing newline in the source; add one for tidy output.
@@ -609,11 +585,7 @@ fn follow_loop<W: Write>(
     reopen: bool,
     filter: &Filter,
     output: &mut W,
-    stats: &mut Stats,
-    counter: &mut Counter,
-    keys: &mut KeyGather,
-    values: &mut ValueGather,
-    suppress_lines: bool,
+    sinks: &mut Sinks,
 ) -> anyhow::Result<()> {
     let mut line_buf = Vec::new();
     let mut pos = reader.stream_position()?;
@@ -647,11 +619,7 @@ fn follow_loop<W: Write>(
             filter,
             &TimeFilter::default(),
             output,
-            stats,
-            counter,
-            keys,
-            values,
-            suppress_lines,
+            sinks,
             n,
         )?;
     }
