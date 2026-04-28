@@ -555,13 +555,14 @@ fn process_line<W: Write>(
         parse_end -= 1;
     }
 
+    sinks.stats.bytes += n_bytes;
+    sinks.stats.total_lines += 1;
+
     let parse_slice = &line_buf[..parse_end];
     let line_str = match std::str::from_utf8(parse_slice) {
         Ok(s) => s,
         Err(_) => {
             sinks.stats.invalid_utf += 1;
-            sinks.stats.bytes += n_bytes;
-            sinks.stats.total_lines += 1;
             line_buf.clear();
             return Ok(());
         }
@@ -572,8 +573,6 @@ fn process_line<W: Write>(
 
     let matched = tf.matches(parsed) && (filter.is_empty() || filter.matches(parsed));
 
-    sinks.stats.bytes += n_bytes;
-    sinks.stats.total_lines += 1;
     sinks.stats.pairs += parsed.len();
     sinks.stats.overflow += overflow as usize;
     if matched {
