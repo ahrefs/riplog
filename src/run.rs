@@ -511,6 +511,8 @@ fn stream_bounded<R: BufRead, W: Write>(
 }
 
 /// Read until EOF (e.g. stdin), write matching lines to `output`.
+/// Flushes after every line so interactive pipelines (`tail -f | riplog`)
+/// don't stall in the output BufWriter.
 fn stream_unbounded<R: Read, W: Write>(
     reader: &mut R,
     filter: &Filter,
@@ -533,6 +535,7 @@ fn stream_unbounded<R: Read, W: Write>(
             sinks,
             n,
         )?;
+        output.flush()?;
     }
     Ok(())
 }
