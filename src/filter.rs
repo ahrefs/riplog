@@ -121,6 +121,7 @@ impl Predicate {
 #[derive(Debug)]
 enum Expr {
     Pred(Predicate),
+    Exists(String),
     And(Vec<Expr>),
     Or(Vec<Expr>),
     Not(Box<Expr>),
@@ -130,6 +131,7 @@ impl Expr {
     fn matches(&self, pairs: &[(&str, &str)]) -> bool {
         match self {
             Self::Pred(p) => p.matches(pairs),
+            Self::Exists(key) => pairs.iter().any(|(k, _)| *k == key),
             Self::And(xs) => xs.iter().all(|x| x.matches(pairs)),
             Self::Or(xs) => xs.iter().any(|x| x.matches(pairs)),
             Self::Not(x) => !x.matches(pairs),
@@ -200,6 +202,7 @@ enum Token {
     And,
     Or,
     Not,
+    Exists,
     Op(Op),
     Word(String),
 }
@@ -310,6 +313,7 @@ fn tokenize(input: &str) -> anyhow::Result<Vec<Token>> {
                     "and" => Token::And,
                     "or" => Token::Or,
                     "not" => Token::Not,
+                    "exists" => Token::Exists,
                     _ => Token::Word(word.to_string()),
                 };
                 out.push(tok);
@@ -388,6 +392,14 @@ impl ParserState {
                 match self.advance() {
                     Some(Token::RParen) => Ok(e),
                     _ => anyhow::bail!("expected `)`"),
+                }
+            }
+            Some(Token::Exists) => {
+                self.advance();
+                match self.advance() {
+                    Some(Token::Word(k)) => Ok(Expr::Exists(k)),
+                    Some(t) => anyhow::bail!("expected key after `exists`, got {t:?}"),
+                    None => anyhow::bail!("expected key after `exists`"),
                 }
             }
             _ => Ok(Expr::Pred(self.parse_predicate()?)),
@@ -592,6 +604,30 @@ mod tests {
         assert!(f.matches(&[("facil", "db")]));
         let f = filter(&["NOT level=info"]);
         assert!(f.matches(&[("level", "warn")]));
+    }
+
+    #[test]
+    fn exists_key() {
+        let f = filter(&["exists trace_id"]);
+        assert!(f.matches(&[("trace_id", "abc"), ("level", "info")]));
+        assert!(f.matches(&[("trace_id", "")])); // present with empty value
+        assert!(!f.matches(&[("level", "info")]));
+
+        // Combines with boolean ops.
+        let f = filter(&["level=error and exists trace_id"]);
+        assert!(f.matches(&[("level", "error"), ("trace_id", "x")]));
+        assert!(!f.matches(&[("level", "error")]));
+
+        // Negatable.
+        let f = filter(&["not exists trace_id"]);
+        assert!(f.matches(&[("level", "info")]));
+        assert!(!f.matches(&[("trace_id", "x")]));
+    }
+
+    #[test]
+    fn exists_requires_key() {
+        assert!(Filter::parse(&["exists".to_string()]).is_err());
+        assert!(Filter::parse(&["exists =".to_string()]).is_err());
     }
 
     #[test]

@@ -34,11 +34,13 @@ pub struct Cli {
     pub window_secs: u64,
 
     /// Filter expression. Combine leaf predicates `<key> <op> <value>`
-    /// (`=`, `!=`, `<`, `<=`, `>`, `>=`, `=~`) with `and`, `or`, `not`,
-    /// and parentheses. Repeatable; multiple `--if` flags are AND-ed.
+    /// (`=`, `!=`, `<`, `<=`, `>`, `>=`, `=~`) and existence checks
+    /// `exists <key>` with `and`, `or`, `not`, and parentheses. Repeatable;
+    /// multiple `--if` flags are AND-ed.
     /// Examples: `--if 'level>=warn'`,
     /// `--if 'level=error and (facil=net or facil=db)'`,
-    /// `--if 'not msg =~ "noisy.*timeout"'`.
+    /// `--if 'not msg =~ "noisy.*timeout"'`,
+    /// `--if 'exists trace_id and level>=warn'`.
     /// `--where` is an alias.
     #[arg(long = "if", visible_alias = "where")]
     pub keys: Vec<String>,
