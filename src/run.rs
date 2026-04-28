@@ -289,6 +289,7 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
         values: ValueGather::new(cli.list_values_for.clone()),
         suppress_lines,
         colorize,
+        limit: cli.limit,
     };
 
     let need_seek = cli.from.is_some() || cli.to.is_some() || following || cli.time_range;
@@ -486,6 +487,14 @@ struct Sinks {
     values: ValueGather,
     suppress_lines: bool,
     colorize: bool,
+    limit: Option<usize>,
+}
+
+impl Sinks {
+    #[inline]
+    fn done(&self) -> bool {
+        matches!(self.limit, Some(n) if self.stats.matched_lines >= n)
+    }
 }
 
 /// Read a fixed byte budget from `reader`, write matching lines to `output`.
@@ -507,6 +516,9 @@ fn stream_bounded<R: BufRead, W: Write>(
         }
         total_read += n as u64;
         process_line(&mut line_buf, filter, tf, output, sinks, n)?;
+        if sinks.done() {
+            break;
+        }
     }
     Ok(())
 }
@@ -537,6 +549,9 @@ fn stream_unbounded<R: Read, W: Write>(
             n,
         )?;
         output.flush()?;
+        if sinks.done() {
+            break;
+        }
     }
     Ok(())
 }
@@ -704,6 +719,9 @@ fn follow_loop<W: Write>(
             sinks,
             n,
         )?;
+        if sinks.done() {
+            break;
+        }
     }
     Ok(())
 }

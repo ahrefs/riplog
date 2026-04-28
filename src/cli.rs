@@ -80,6 +80,10 @@ pub struct Cli {
     #[arg(long)]
     pub count: bool,
 
+    /// Stop after this many matched lines.
+    #[arg(short = 'n', long)]
+    pub limit: Option<usize>,
+
     /// Print the first and last timestamps in the file. Scans the head and
     /// tail (≈1 MiB each) and returns the min/max so slight reordering at
     /// the edges doesn't skew the result. Suppresses normal output.

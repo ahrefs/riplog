@@ -186,6 +186,20 @@ fn from_to_filters_strictly() {
 }
 
 #[test]
+fn limit_caps_matched_lines() {
+    let path = fixture_path().to_str().unwrap();
+    let out = run(&["--count", "--limit=5", path]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "5");
+}
+
+#[test]
+fn limit_caps_streamed_output() {
+    let path = fixture_path().to_str().unwrap();
+    let out = run(&["--limit=3", path]);
+    assert_eq!(out.stdout.iter().filter(|&&b| b == b'\n').count(), 3);
+}
+
+#[test]
 fn output_file_flag_writes_to_file() {
     let path = fixture_path().to_str().unwrap();
     let out_file = std::env::temp_dir().join("riplog-it-out.log");
