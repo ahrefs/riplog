@@ -82,6 +82,24 @@ impl KeyGather {
     }
 }
 
+/// Find the first pair with key `key`, unescape its value into `scratch`,
+/// and return a borrow of the unescaped string. Returns `None` if no pair
+/// matches; in that case `scratch` is unspecified.
+fn unescape_for_key<'s>(
+    pairs: &[(&str, &str)],
+    key: &str,
+    scratch: &'s mut String,
+) -> Option<&'s str> {
+    for (pk, pv) in pairs {
+        if *pk == key {
+            scratch.clear();
+            logfmt::unescape_value(pv.as_bytes(), scratch);
+            return Some(scratch.as_str());
+        }
+    }
+    None
+}
+
 /// Insert `s` into `set` only if not already present, allocating a
 /// `SmartString` lazily.
 fn intern_into_set(set: &mut RapidHashSet<SmartString>, s: &str) {
@@ -131,13 +149,8 @@ impl ValueGather {
             return;
         }
         for (i, key) in self.keys.iter().enumerate() {
-            for (pk, pv) in pairs {
-                if *pk == key.as_str() {
-                    self.scratch.clear();
-                    logfmt::unescape_value(pv.as_bytes(), &mut self.scratch);
-                    intern_into_set(&mut self.values[i], &self.scratch);
-                    break;
-                }
+            if unescape_for_key(pairs, key, &mut self.scratch).is_some() {
+                intern_into_set(&mut self.values[i], &self.scratch);
             }
         }
     }
@@ -187,13 +200,8 @@ impl Counter {
         let mut combo: Combo = SmallVec::with_capacity(self.keys.len());
         for k in &self.keys {
             let mut value = SmartString::new_const();
-            for (pk, pv) in pairs {
-                if *pk == k.as_str() {
-                    self.scratch.clear();
-                    logfmt::unescape_value(pv.as_bytes(), &mut self.scratch);
-                    value.push_str(&self.scratch);
-                    break;
-                }
+            if let Some(v) = unescape_for_key(pairs, k, &mut self.scratch) {
+                value.push_str(v);
             }
             combo.push(value);
         }
@@ -732,7 +740,7 @@ fn follow_loop<W: Write>(
 /// `(File, BufReader)` if so.
 fn check_rotation(
     path: &Path,
-    current: &File,
+    #[cfg_attr(not(unix), allow(unused_variables))] current: &File,
     pos: u64,
 ) -> anyhow::Result<Option<(File, BufReader<File>)>> {
     let path_meta = match std::fs::metadata(path) {
@@ -752,10 +760,6 @@ fn check_rotation(
             should_reopen = true;
         }
     }
-    // `current` is only used on unix; silence the warning elsewhere.
-    #[cfg(not(unix))]
-    let _ = current;
-
     if !should_reopen {
         return Ok(None);
     }

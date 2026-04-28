@@ -408,12 +408,11 @@ mod tests {
     fn frontier_window_tolerates_reorder() {
         // Build a sorted log, then swap a few neighbouring lines to simulate
         // small reorders within a 5-second window.
-        let (mut data, ts) = build_sorted_log(120);
+        let (data, ts) = build_sorted_log(120);
 
-        // Apply a manual reorder: swap lines 50 and 52 by rewriting.
-        // For simplicity in this test, we just verify bisection is correct
-        // on the sorted data with a non-zero window — the over-approximation
-        // expands the slice, which still must contain the in-range lines.
+        // For simplicity, verify bisection on sorted data with a non-zero
+        // window — the over-approximation expands the slice, which still
+        // must contain the in-range lines.
         let t1 = ts[40];
         let t2 = ts[70];
         let window = 5 * 1_000_000_000; // 5 seconds
@@ -430,11 +429,7 @@ mod tests {
             assert!(text.contains(&format!("msg=hello_{}\n", i)));
         }
         // Sanity: window expansion should also keep some boundary lines.
-        // (Just check the slice is non-empty and properly framed.)
         assert!(start < end);
-
-        // Suppress unused warning on `data` alias.
-        let _ = &mut data;
     }
 
     #[test]

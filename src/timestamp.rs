@@ -52,19 +52,7 @@ pub fn parse_rfc3339_nanos(s: &str) -> Option<Timestamp> {
         while idx < b.len() && b[idx].is_ascii_digit() {
             idx += 1;
         }
-        let digits = idx - frac_start;
-        if digits == 0 || digits > 9 {
-            return None;
-        }
-        let mut acc: i64 = 0;
-        for &c in &b[frac_start..idx] {
-            acc = acc * 10 + (c - b'0') as i64;
-        }
-        // Scale to nanoseconds: pad with zeros to 9 digits.
-        for _ in digits..9 {
-            acc *= 10;
-        }
-        nanos_frac = acc;
+        nanos_frac = parse_frac_nanos(&b[frac_start..idx])?;
     }
 
     let tz_offset_secs: i64 = if idx >= b.len() {
@@ -221,21 +209,27 @@ fn parse_time_of_day(s: &str) -> Option<i64> {
     if b[8] != b'.' {
         return None;
     }
-    let digits = b.len() - 9;
-    if digits == 0 || digits > 9 {
+    Some(nanos + parse_frac_nanos(&b[9..])?)
+}
+
+/// Parse 1..=9 ASCII-digit bytes as a fractional second, scaled to
+/// nanoseconds (e.g. `b"5"` → 500_000_000). Returns `None` for empty input,
+/// more than 9 digits, or any non-digit byte.
+fn parse_frac_nanos(b: &[u8]) -> Option<i64> {
+    if b.is_empty() || b.len() > 9 {
         return None;
     }
     let mut acc: i64 = 0;
-    for &c in &b[9..] {
+    for &c in b {
         if !c.is_ascii_digit() {
             return None;
         }
         acc = acc * 10 + (c - b'0') as i64;
     }
-    for _ in digits..9 {
+    for _ in b.len()..9 {
         acc *= 10;
     }
-    Some(nanos + acc)
+    Some(acc)
 }
 
 fn apply_offset(base: Timestamp, suffix: &str) -> anyhow::Result<Timestamp> {
@@ -364,23 +358,14 @@ fn parse_fixed_offset(spec: &str) -> Option<jiff::tz::Offset> {
 /// Format a nanosecond timestamp in the given timezone as RFC 3339.
 /// Trailing zeros in the fractional part are stripped.
 pub fn format_rfc3339(ts: Timestamp, tz: &jiff::tz::TimeZone) -> String {
-    let stamp = match jiff::Timestamp::from_nanosecond(ts as i128) {
-        Ok(t) => t,
-        Err(_) => return "<out-of-range>".to_string(),
+    let Ok(stamp) = jiff::Timestamp::from_nanosecond(ts as i128) else {
+        return "<out-of-range>".to_string();
     };
     let zoned = stamp.to_zoned(tz.clone());
     let dt = zoned.datetime();
-    let off = zoned.offset();
-    let off_str = if off.is_zero() {
-        "Z".to_string()
-    } else {
-        let total = off.seconds();
-        let sign = if total < 0 { '-' } else { '+' };
-        let abs = total.unsigned_abs();
-        format!("{sign}{:02}:{:02}", abs / 3600, (abs / 60) % 60)
-    };
-    let nanos = dt.subsec_nanosecond();
-    let base = format!(
+    let mut out = String::with_capacity(35);
+    let _ = write!(
+        out,
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
         dt.year(),
         dt.month(),
@@ -389,15 +374,23 @@ pub fn format_rfc3339(ts: Timestamp, tz: &jiff::tz::TimeZone) -> String {
         dt.minute(),
         dt.second(),
     );
-    if nanos == 0 {
-        format!("{base}{off_str}")
-    } else {
-        let mut frac = format!("{nanos:09}");
-        while frac.ends_with('0') {
-            frac.pop();
+    let nanos = dt.subsec_nanosecond();
+    if nanos != 0 {
+        let _ = write!(out, ".{nanos:09}");
+        while out.ends_with('0') {
+            out.pop();
         }
-        format!("{base}.{frac}{off_str}")
     }
+    let off = zoned.offset();
+    if off.is_zero() {
+        out.push('Z');
+    } else {
+        let total = off.seconds();
+        let sign = if total < 0 { '-' } else { '+' };
+        let abs = total.unsigned_abs();
+        let _ = write!(out, "{sign}{:02}:{:02}", abs / 3600, (abs / 60) % 60);
+    }
+    out
 }
 
 /// Format a duration in nanoseconds as a compact `[Nd][Nh][Nm]Ns` string.

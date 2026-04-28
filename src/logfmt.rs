@@ -221,12 +221,8 @@ pub fn unescape_value(raw: &[u8], out: &mut String) {
     }
 }
 
-#[allow(dead_code)]
 fn push_bytes_lossy(out: &mut String, bytes: &[u8]) {
-    match std::str::from_utf8(bytes) {
-        Ok(s) => out.push_str(s),
-        Err(_) => out.push_str(&String::from_utf8_lossy(bytes)),
-    }
+    out.push_str(&String::from_utf8_lossy(bytes));
 }
 
 #[cfg(test)]
