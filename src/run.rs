@@ -27,9 +27,10 @@ const BOLD: &str = "\x1b[1m";
 const COL_BLUE: &str = "\x1b[34m";
 const COL_RED: &str = "\x1b[31m";
 const COL_YELLOW: &str = "\x1b[33m";
-const COL_GREEN: &str = "\x1b[32m";
 const COL_GRAY: &str = "\x1b[90m";
 const COL_QUOTE: &str = "\x1b[1;34m";
+// Bright white on red background — used for `critical`/`crit` so it really pops.
+const COL_CRIT: &str = "\x1b[97;41m";
 
 /// Set by the SIGINT handler; checked in tight loops so we can exit cleanly
 /// and still emit `--count` / `--list-keys` / `--count-by` summaries.
@@ -597,12 +598,12 @@ fn process_line<W: Write>(
 }
 
 fn level_color(value: &str) -> &'static str {
-    // Match against the value with quotes already stripped where needed.
     let v = value.trim_matches('"');
     match v {
-        "error" | "fatal" | "crit" | "critical" | "ERROR" | "FATAL" => COL_RED,
+        "critical" | "CRITICAL" | "crit" | "CRIT" => COL_CRIT,
+        "error" | "fatal" | "ERROR" | "FATAL" => COL_RED,
         "warn" | "warning" | "WARN" | "WARNING" => COL_YELLOW,
-        "info" | "INFO" => COL_GREEN,
+        "info" | "INFO" => COL_BLUE,
         "debug" | "trace" | "DEBUG" | "TRACE" => COL_GRAY,
         _ => "",
     }
@@ -631,30 +632,25 @@ fn write_colored_line<W: Write>(out: &mut W, pairs: &[(&str, &str)]) -> std::io:
 }
 
 /// Emit a value with optional color and bold. If the value is wrapped in
-/// double quotes, the quote characters are highlighted in gray so the
-/// content boundary is easy to spot.
+/// double quotes, the quote characters are highlighted so the content
+/// boundary is easy to spot.
 fn write_value<W: Write>(out: &mut W, v: &str, color: &str, bold: bool) -> std::io::Result<()> {
     let b = v.as_bytes();
     let quoted = b.len() >= 2 && b[0] == b'"' && b[b.len() - 1] == b'"';
-    let prefix = match (bold, color.is_empty()) {
-        (true, true) => BOLD,
-        (true, false) => "", // emitted as `BOLD + color` below
-        (false, _) => "",
-    };
     let inner = if quoted { &v[1..v.len() - 1] } else { v };
+    let styled = bold || !color.is_empty();
 
     if quoted {
         write!(out, "{COL_QUOTE}\"{RESET}")?;
     }
-    if bold && !color.is_empty() {
-        write!(out, "{BOLD}{color}")?;
-    } else if bold {
-        out.write_all(prefix.as_bytes())?;
-    } else if !color.is_empty() {
+    if bold {
+        out.write_all(BOLD.as_bytes())?;
+    }
+    if !color.is_empty() {
         out.write_all(color.as_bytes())?;
     }
     out.write_all(inner.as_bytes())?;
-    if bold || !color.is_empty() {
+    if styled {
         out.write_all(RESET.as_bytes())?;
     }
     if quoted {

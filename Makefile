@@ -8,9 +8,12 @@ release:
 	cargo build --release
 
 release-static:
-	cargo build --release --target $(TARGET_MUSL)
+	cargo build --release --features bundled-tzdb --target $(TARGET_MUSL)
 	@bin="$${CARGO_TARGET_DIR:-target}/$(TARGET_MUSL)/release/riplog"; \
 		ls -lh "$$bin"; file "$$bin"
+
+install:
+	cargo install --path=.
 
 test:
 	cargo test

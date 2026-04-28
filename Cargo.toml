@@ -3,16 +3,23 @@ name = "riplog"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+# Embed the IANA tzdb in the binary so named timezones (`Europe/Paris`, …)
+# work on hosts that don't ship `/usr/share/zoneinfo` (e.g. scratch/alpine
+# containers). Adds ~600 KiB; enable for static release builds.
+bundled-tzdb = ["jiff/tzdb-bundle-always"]
+
 [dependencies]
 anyhow = "1.0.102"
 clap = { version = "4.6.1", features = ["derive"] }
 ctrlc = "3"
 env_logger = "0.11.10"
 humanize-bytes = "1.0.6"
-jiff = { version = "0.2", features = ["tzdb-bundle-always"] }
+jiff = "0.2"
 log = "0.4.29"
 memchr = "2"
-rapidhash = "1"
+rapidhash = "4"
 regex = "1"
 smallvec = "1"
 smartstring = "1.0.1"

@@ -196,90 +196,88 @@ fn output_file_flag_writes_to_file() {
     assert_eq!(lines_n, N_WARN);
 }
 
-/// End-to-end test for `-F` rotation. Starts riplog tailing a file, appends
-/// lines, replaces the file, then sends SIGINT and checks the count includes
-/// post-rotation lines.
 #[cfg(unix)]
-#[test]
-fn follow_reopen_handles_rotation() {
-    let path = std::env::temp_dir().join("riplog-it-follow.log");
-    fs::write(&path, b"").unwrap();
-
-    let mut child = Command::new(riplog_bin())
-        .arg("-F")
+fn spawn_follow(flag: &str, path: &Path) -> std::process::Child {
+    Command::new(riplog_bin())
+        .arg(flag)
         .arg("--count")
-        .arg(&path)
+        .arg(path)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .unwrap();
+        .unwrap()
+}
 
-    thread::sleep(Duration::from_millis(400));
-
-    {
-        let f = fs::OpenOptions::new().append(true).open(&path).unwrap();
-        (&f).write_all(b"level=info time=2026-04-24T18:00:00Z msg=appended1\n")
-            .unwrap();
-        (&f).write_all(b"level=info time=2026-04-24T18:00:01Z msg=appended2\n")
-            .unwrap();
+#[cfg(unix)]
+fn append_lines(path: &Path, lines: &[&str]) {
+    let mut f = fs::OpenOptions::new().append(true).open(path).unwrap();
+    for line in lines {
+        writeln!(f, "{line}").unwrap();
     }
-    thread::sleep(Duration::from_millis(400));
+}
 
-    // Replace the file to trigger reopen-on-rotation.
-    fs::write(
-        &path,
-        "level=info time=2026-04-24T18:00:10Z msg=after_rotate\n",
-    )
-    .unwrap();
-    thread::sleep(Duration::from_millis(400));
-
-    // Send SIGINT so riplog exits cleanly and emits its --count line.
+#[cfg(unix)]
+fn finish_with_sigint(child: std::process::Child) -> usize {
     let pid = child.id() as libc::pid_t;
     unsafe {
         libc::kill(pid, libc::SIGINT);
     }
-
     let out = child.wait_with_output().unwrap();
-    let count: usize = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
-    assert_eq!(count, 3, "expected 2 appended + 1 post-rotation");
+    String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
 }
 
-/// `-f` (no reopen) must NOT pick up lines after the file is replaced.
+const FOLLOW_TICK: Duration = Duration::from_millis(400);
+
+#[cfg(unix)]
+#[test]
+fn follow_reopen_handles_rotation() {
+    let path = std::env::temp_dir().join("riplog-it-follow-F.log");
+    fs::write(&path, b"").unwrap();
+    let child = spawn_follow("-F", &path);
+    thread::sleep(FOLLOW_TICK);
+
+    append_lines(
+        &path,
+        &[
+            "level=info time=2026-04-24T18:00:00Z msg=appended1",
+            "level=info time=2026-04-24T18:00:01Z msg=appended2",
+        ],
+    );
+    thread::sleep(FOLLOW_TICK);
+
+    fs::write(&path, "level=info time=2026-04-24T18:00:10Z msg=after_rotate\n").unwrap();
+    thread::sleep(FOLLOW_TICK);
+
+    assert_eq!(
+        finish_with_sigint(child),
+        3,
+        "expected 2 appended + 1 post-rotation"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn follow_no_reopen_misses_rotation() {
     let path = std::env::temp_dir().join("riplog-it-follow-f.log");
     fs::write(&path, b"").unwrap();
+    let child = spawn_follow("-f", &path);
+    thread::sleep(FOLLOW_TICK);
 
-    let mut child = Command::new(riplog_bin())
-        .arg("-f")
-        .arg("--count")
-        .arg(&path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-
-    thread::sleep(Duration::from_millis(400));
-
-    {
-        let f = fs::OpenOptions::new().append(true).open(&path).unwrap();
-        (&f).write_all(b"level=info time=2026-04-24T18:00:00Z msg=line1\n")
-            .unwrap();
-        (&f).write_all(b"level=info time=2026-04-24T18:00:01Z msg=line2\n")
-            .unwrap();
-    }
-    thread::sleep(Duration::from_millis(400));
+    append_lines(
+        &path,
+        &[
+            "level=info time=2026-04-24T18:00:00Z msg=line1",
+            "level=info time=2026-04-24T18:00:01Z msg=line2",
+        ],
+    );
+    thread::sleep(FOLLOW_TICK);
 
     fs::write(&path, "level=info time=2026-04-24T18:00:10Z msg=missed\n").unwrap();
-    thread::sleep(Duration::from_millis(400));
+    thread::sleep(FOLLOW_TICK);
 
-    let pid = child.id() as libc::pid_t;
-    unsafe {
-        libc::kill(pid, libc::SIGINT);
-    }
-
-    let out = child.wait_with_output().unwrap();
-    let count: usize = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
-    assert_eq!(count, 2, "-f should miss the post-rotation line");
+    assert_eq!(
+        finish_with_sigint(child),
+        2,
+        "-f should miss the post-rotation line"
+    );
 }

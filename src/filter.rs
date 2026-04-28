@@ -23,7 +23,33 @@ struct Predicate {
     op: Op,
     rhs: String,
     rhs_num: Option<f64>,
+    rhs_level: Option<u8>,
     re: Option<Regex>,
+}
+
+/// Severity rank for log-level strings. Ascending order:
+/// trace < debug < info < notice < warn < error < critical < fatal.
+/// Returns `None` for unknown strings.
+fn level_rank(s: &str) -> Option<u8> {
+    let mut buf = [0u8; 16];
+    let bytes = s.as_bytes();
+    if bytes.len() > buf.len() {
+        return None;
+    }
+    for (i, b) in bytes.iter().enumerate() {
+        buf[i] = b.to_ascii_lowercase();
+    }
+    match &buf[..bytes.len()] {
+        b"trace" => Some(0),
+        b"debug" => Some(1),
+        b"info" => Some(2),
+        b"notice" => Some(3),
+        b"warn" | b"warning" => Some(4),
+        b"error" | b"err" => Some(5),
+        b"critical" | b"crit" => Some(6),
+        b"fatal" | b"alert" | b"emerg" | b"panic" => Some(7),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Default)]
@@ -77,22 +103,23 @@ impl Predicate {
             Op::Eq => value == self.rhs,
             Op::Ne => value != self.rhs,
             Op::ReMatch => self.re.as_ref().is_some_and(|re| re.is_match(value)),
-            Op::Lt | Op::Le | Op::Gt | Op::Ge => match (value.parse::<f64>(), self.rhs_num) {
-                (Ok(lhs), Some(rhs)) => match self.op {
-                    Op::Lt => lhs < rhs,
-                    Op::Le => lhs <= rhs,
-                    Op::Gt => lhs > rhs,
-                    Op::Ge => lhs >= rhs,
+            Op::Lt | Op::Le | Op::Gt | Op::Ge => {
+                use std::cmp::Ordering;
+                let cmp = if let (Some(a), Some(b)) = (level_rank(value), self.rhs_level) {
+                    a.cmp(&b)
+                } else if let (Ok(a), Some(b)) = (value.parse::<f64>(), self.rhs_num) {
+                    a.partial_cmp(&b).unwrap_or(Ordering::Equal)
+                } else {
+                    value.cmp(self.rhs.as_str())
+                };
+                match self.op {
+                    Op::Lt => cmp == Ordering::Less,
+                    Op::Le => cmp != Ordering::Greater,
+                    Op::Gt => cmp == Ordering::Greater,
+                    Op::Ge => cmp != Ordering::Less,
                     _ => unreachable!(),
-                },
-                _ => match self.op {
-                    Op::Lt => value < self.rhs.as_str(),
-                    Op::Le => value <= self.rhs.as_str(),
-                    Op::Gt => value > self.rhs.as_str(),
-                    Op::Ge => value >= self.rhs.as_str(),
-                    _ => unreachable!(),
-                },
-            },
+                }
+            }
         }
     }
 }
@@ -117,6 +144,7 @@ fn parse_one(spec: &str) -> anyhow::Result<Predicate> {
         anyhow::bail!("filter `{spec}` has empty key");
     }
     let rhs_num = rhs.parse::<f64>().ok();
+    let rhs_level = level_rank(rhs);
     let re = if matches!(op, Op::ReMatch) {
         Some(Regex::new(rhs).map_err(|e| anyhow::anyhow!("invalid regex in `{spec}`: {e}"))?)
     } else {
@@ -127,6 +155,7 @@ fn parse_one(spec: &str) -> anyhow::Result<Predicate> {
         op,
         rhs: rhs.to_string(),
         rhs_num,
+        rhs_level,
         re,
     })
 }
@@ -231,6 +260,32 @@ mod tests {
         let f = Filter::default();
         assert!(f.matches(&[]));
         assert!(f.matches(&[("anything", "goes")]));
+    }
+
+    #[test]
+    fn level_severity_ordering() {
+        // debug < info < warn < error < critical
+        let f = filter(&["level>=warn"]);
+        assert!(!f.matches(&[("level", "debug")]));
+        assert!(!f.matches(&[("level", "info")]));
+        assert!(f.matches(&[("level", "warn")]));
+        assert!(f.matches(&[("level", "error")]));
+        assert!(f.matches(&[("level", "critical")]));
+
+        let f = filter(&["level<error"]);
+        assert!(f.matches(&[("level", "debug")]));
+        assert!(f.matches(&[("level", "info")]));
+        assert!(f.matches(&[("level", "warn")]));
+        assert!(!f.matches(&[("level", "error")]));
+        assert!(!f.matches(&[("level", "critical")]));
+    }
+
+    #[test]
+    fn level_severity_case_insensitive() {
+        let f = filter(&["level>=ERROR"]);
+        assert!(f.matches(&[("level", "Error")]));
+        assert!(f.matches(&[("level", "CRITICAL")]));
+        assert!(!f.matches(&[("level", "warn")]));
     }
 
     #[test]
