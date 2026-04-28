@@ -625,6 +625,7 @@ dependencies = [
  "clap",
  "ctrlc",
  "env_logger",
+ "fastrand",
  "humanize-bytes",
  "jiff",
  "libc",

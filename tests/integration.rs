@@ -123,6 +123,39 @@ fn list_values_for_level() {
 }
 
 #[test]
+fn sample_rate_zero_drops_everything() {
+    let path = fixture_path().to_str().unwrap();
+    let out = run(&["--count", "--sample-rate=0", path]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "0");
+}
+
+#[test]
+fn sample_rate_one_keeps_everything() {
+    let path = fixture_path().to_str().unwrap();
+    let out = run(&["--count", "--sample-rate=1", path]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "200");
+}
+
+#[test]
+fn sample_if_scopes_the_dice_roll() {
+    // Drop all `info` lines (sample-rate 0 within the sample-if subset);
+    // every other level passes through untouched.
+    let path = fixture_path().to_str().unwrap();
+    let out = run(&["--count", "--sample-rate=0", "--sample-if=level=info", path]);
+    let n: usize = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
+    assert_eq!(n, COUNT - N_INFO);
+}
+
+#[test]
+fn sample_rate_out_of_range_errors() {
+    let out = Command::new(riplog_bin())
+        .args(["--sample-rate=1.5", fixture_path().to_str().unwrap()])
+        .output()
+        .expect("spawn riplog");
+    assert!(!out.status.success());
+}
+
+#[test]
 fn count_by_level_matches_distribution() {
     let path = fixture_path().to_str().unwrap();
     let out = run(&["--count-by=level", path]);

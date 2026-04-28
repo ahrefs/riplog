@@ -227,6 +227,20 @@ impl Counter {
     }
 }
 
+/// Random per-line sampling. When `sample_if` is set, only lines matching it
+/// are subject to the dice roll; all other matched lines pass through.
+struct Sampler {
+    rate: f64,
+    sample_if: Option<Filter>,
+}
+
+impl Sampler {
+    fn keep(&self, pairs: &[(&str, &str)]) -> bool {
+        let subject = self.sample_if.as_ref().is_none_or(|f| f.matches(pairs));
+        !subject || fastrand::f64() < self.rate
+    }
+}
+
 /// Strict timestamp filter applied per-line on top of the bisected byte range.
 /// The bisect is an over-approximation, so the byte range can include lines
 /// outside `[from, to]`; this filter drops them.
@@ -279,6 +293,23 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
     let suppress_lines = cli.list_keys || cli.count || !cli.list_values_for.is_empty();
     let tz = timestamp::resolve_tz(cli.tz.as_deref())?;
 
+    let sampler = match cli.sample_rate {
+        Some(rate) if (0.0..=1.0).contains(&rate) => {
+            let sample_if = match cli.sample_if.as_ref() {
+                Some(s) => Some(Filter::parse(std::slice::from_ref(s))?),
+                None => None,
+            };
+            Some(Sampler { rate, sample_if })
+        }
+        Some(rate) => anyhow::bail!("--sample-rate must be in [0, 1], got {rate}"),
+        None => {
+            if cli.sample_if.is_some() {
+                anyhow::bail!("--sample-if requires --sample-rate");
+            }
+            None
+        }
+    };
+
     let colorize = match cli.color {
         ColorMode::Always => true,
         ColorMode::Never => false,
@@ -295,6 +326,7 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
         counter: Counter::new(cli.count_by.clone()),
         keys: KeyGather::new(cli.list_keys),
         values: ValueGather::new(cli.list_values_for.clone()),
+        sampler,
         suppress_lines,
         colorize,
         limit: cli.limit,
@@ -494,6 +526,7 @@ struct Sinks {
     counter: Counter,
     keys: KeyGather,
     values: ValueGather,
+    sampler: Option<Sampler>,
     suppress_lines: bool,
     colorize: bool,
     limit: Option<usize>,
@@ -596,7 +629,9 @@ fn process_line<W: Write>(
     let mut pairs = logfmt::PairsBuffer::<256>::new();
     let (parsed, overflow) = pairs.parse(line_str);
 
-    let matched = tf.matches(parsed) && (filter.is_empty() || filter.matches(parsed));
+    let matched = tf.matches(parsed)
+        && (filter.is_empty() || filter.matches(parsed))
+        && sinks.sampler.as_ref().is_none_or(|s| s.keep(parsed));
 
     sinks.stats.pairs += parsed.len();
     sinks.stats.overflow += overflow as usize;

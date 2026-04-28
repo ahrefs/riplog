@@ -84,6 +84,20 @@ pub struct Cli {
     #[arg(short = 'n', long)]
     pub limit: Option<usize>,
 
+    /// Randomly drop matched lines, keeping each with probability `rate`
+    /// (a float in `[0, 1]`). Applied after `--if` and time-window filters,
+    /// before counters/sinks — so `--count`, `--count-by`, etc. reflect the
+    /// post-sampling set. Combine with `--sample-if` to scope the sampling.
+    #[arg(long = "sample-rate", value_name = "RATE")]
+    pub sample_rate: Option<f64>,
+
+    /// Restrict `--sample-rate` to lines matching this expression. Same
+    /// syntax as `--if`. Lines that don't match `--sample-if` are kept
+    /// unconditionally; matching lines are sampled at `--sample-rate`.
+    /// Useful for downsampling chatty subsets without thinning the rest.
+    #[arg(long = "sample-if", value_name = "EXPR")]
+    pub sample_if: Option<String>,
+
     /// Print the first and last timestamps in the file. Scans the head and
     /// tail (≈1 MiB each) and returns the min/max so slight reordering at
     /// the edges doesn't skew the result. Suppresses normal output.
