@@ -9,7 +9,7 @@ clap = { version = "4.6.1", features = ["derive"] }
 ctrlc = "3"
 env_logger = "0.11.10"
 humanize-bytes = "1.0.6"
-jiff = "0.2"
+jiff = { version = "0.2", features = ["tzdb-bundle-always"] }
 log = "0.4.29"
 memchr = "2"
 rapidhash = "1"
