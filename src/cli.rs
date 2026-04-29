@@ -115,6 +115,6 @@ pub struct Cli {
 
     /// Colorize output. `auto` (default) enables when stdout is a terminal
     /// and `-o` is not used.
-    #[arg(long, value_enum, default_value_t = ColorMode::Auto)]
+    #[arg(long, value_enum, default_value_t = ColorMode::Auto, env="COLOR")]
     pub color: ColorMode,
 }
