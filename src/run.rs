@@ -290,7 +290,8 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
 
     let filter = Filter::parse(&cli.keys)?;
     let following = cli.follow || cli.follow_reopen;
-    let suppress_lines = cli.list_keys || cli.count || !cli.list_values_for.is_empty();
+    let suppress_lines =
+        cli.list_keys || cli.count || !cli.list_values_for.is_empty() || !cli.count_by.is_empty();
     let tz = timestamp::resolve_tz(cli.tz.as_deref())?;
 
     let sampler = match (cli.sample_rate, cli.sample_if.as_deref()) {
