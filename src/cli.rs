@@ -88,8 +88,10 @@ pub struct Cli {
     pub list_keys: bool,
 
     /// Suppress line output; gather every distinct value seen for the given
-    /// key on matched lines. Repeatable.
-    #[arg(long = "list-values-for")]
+    /// key on matched lines. Repeatable, and a single flag may carry a
+    /// comma-separated list — `--list-values-for level,facil` and
+    /// `--list-values-for level --list-values-for facil` are equivalent.
+    #[arg(long = "list-values-for", value_delimiter = ',')]
     pub list_values_for: Vec<String>,
 
     /// Suppress line output; print only the count of matched lines at the
