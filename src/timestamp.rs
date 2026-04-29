@@ -118,7 +118,9 @@ const NANOS_PER_DAY: i64 = 86_400 * 1_000_000_000;
 /// - time-of-day (`18:00`, `18:00:00`, `18:00:00.5`) — anchored to the date of
 ///   `time_only_anchor` (UTC).
 /// - `start` / `end` — file's first / last parseable timestamp
-/// - `start±<n><unit>` / `end±<n><unit>` with `unit ∈ {s, m, h, d}`
+/// - `start±<n><unit>` / `end±<n><unit>` (whitespace optional). Units:
+///   `s/sec/seconds`, `m/min/minutes`, `h/hour/hours`, `d/day/days`
+///   (case-insensitive, plurals accepted).
 pub fn resolve_bound(
     s: &str,
     file_first: Option<Timestamp>,
@@ -244,23 +246,28 @@ fn apply_offset(base: Timestamp, suffix: &str) -> anyhow::Result<Timestamp> {
         _ => anyhow::bail!("expected `+` or `-` after anchor: `{suffix}`"),
     };
     let inner = suffix[1..].trim();
-    if inner.len() < 2 {
+    // Split number prefix from unit suffix at the first non-digit; allow
+    // optional whitespace between them (`5 min`, `2 days`).
+    let split = inner
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(inner.len());
+    if split == 0 || split == inner.len() {
         anyhow::bail!("invalid duration `{suffix}`: expected `<int><unit>`");
     }
-    let ib = inner.as_bytes();
-    let unit = ib[ib.len() - 1];
-    let num_str = inner[..inner.len() - 1].trim_end();
+    let num_str = &inner[..split];
+    let unit_raw = inner[split..].trim();
     let n: i64 = num_str
         .parse()
         .map_err(|_| anyhow::anyhow!("invalid duration number in `{suffix}`"))?;
-    let unit_nanos: i64 = match unit {
-        b's' => 1_000_000_000,
-        b'm' => 60 * 1_000_000_000,
-        b'h' => 3600 * 1_000_000_000,
-        b'd' => 86_400 * 1_000_000_000,
+    let unit_lc = unit_raw.to_ascii_lowercase();
+    let unit_nanos: i64 = match unit_lc.as_str() {
+        "s" | "sec" | "secs" | "second" | "seconds" => 1_000_000_000,
+        "m" | "min" | "mins" | "minute" | "minutes" => 60 * 1_000_000_000,
+        "h" | "hr" | "hrs" | "hour" | "hours" => 3600 * 1_000_000_000,
+        "d" | "day" | "days" => 86_400 * 1_000_000_000,
         _ => anyhow::bail!(
-            "unknown duration unit `{}` in `{suffix}`; expected s/m/h/d",
-            unit as char
+            "unknown duration unit `{unit_raw}` in `{suffix}`; expected one of \
+             s/sec/seconds, m/min/minutes, h/hour/hours, d/day/days"
         ),
     };
     let delta = n
@@ -613,6 +620,34 @@ mod tests {
     fn resolve_unknown_unit_errors() {
         let first = parse_rfc3339_nanos("2026-04-24T10:00:00Z").unwrap();
         assert!(resolve_bound("start+1y", Some(first), None, None).is_err());
+        // Two-letter near-misses also fail.
+        assert!(resolve_bound("start+5 mn", Some(first), None, None).is_err());
+        assert!(resolve_bound("start+1ms", Some(first), None, None).is_err());
+    }
+
+    #[test]
+    fn resolve_word_units() {
+        let first = parse_rfc3339_nanos("2026-04-24T10:00:00Z").unwrap();
+        let last = parse_rfc3339_nanos("2026-04-24T20:00:00Z").unwrap();
+        let cases: &[(&str, &str)] = &[
+            ("start+5 min", "start+5m"),
+            ("start+5min", "start+5m"),
+            ("start+5mins", "start+5m"),
+            ("start+5 minutes", "start+5m"),
+            ("start+1 hour", "start+1h"),
+            ("start+2 hours", "start+2h"),
+            ("end-2 day", "end-2d"),
+            ("end-2 days", "end-2d"),
+            ("end-2days", "end-2d"),
+            ("start+30 seconds", "start+30s"),
+            ("start + 30 SECONDS", "start+30s"),
+        ];
+        for (got, want) in cases {
+            let a = resolve_bound(got, Some(first), Some(last), None)
+                .unwrap_or_else(|e| panic!("{got}: {e}"));
+            let b = resolve_bound(want, Some(first), Some(last), None).unwrap();
+            assert_eq!(a, b, "{got} should equal {want}");
+        }
     }
 
     #[test]
