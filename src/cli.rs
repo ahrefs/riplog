@@ -11,7 +11,7 @@ pub enum ColorMode {
 }
 
 #[derive(Parser, Debug)]
-#[command(about = "Slice and filter logfmt streams.")]
+#[command(about = "Slice and filter logfmt streams.", term_width = 80)]
 pub struct Cli {
     /// Input file(s). If omitted, reads from stdin. Multiple files are
     /// processed in order; aggregated output (`--count`, `--count-by`,
