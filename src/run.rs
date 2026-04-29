@@ -328,31 +328,49 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
     };
 
     let need_seek = cli.from.is_some() || cli.to.is_some() || following || cli.time_range;
-    let path = match &cli.file {
-        Some(p) => p,
-        None => {
-            if need_seek {
-                anyhow::bail!(
-                    "`-f`, `-F`, `--from`, `--to`, `--time-range` require a file argument"
-                );
-            }
-            stream_unbounded(
-                &mut std::io::stdin().lock(),
-                &filter,
-                &mut output,
-                &mut sinks,
-            )?;
-            output.flush()?;
-            emit_summaries(&sinks, cli.count, &mut output)?;
-            return Ok(());
+    if cli.files.is_empty() {
+        if need_seek {
+            anyhow::bail!("`-f`, `-F`, `--from`, `--to`, `--time-range` require a file argument");
         }
-    };
-
-    let mut file = File::open(path)?;
+        stream_unbounded(
+            &mut std::io::stdin().lock(),
+            &filter,
+            &mut output,
+            &mut sinks,
+        )?;
+        output.flush()?;
+        emit_summaries(&sinks, cli.count, &mut output)?;
+        return Ok(());
+    }
 
     if cli.time_range {
-        let (first, last) = bisect::time_range(&mut file)?;
-        match (first, last) {
+        // Min of per-file firsts, max of per-file lasts — the union span.
+        let mut overall_first: Option<Timestamp> = None;
+        let mut overall_last: Option<Timestamp> = None;
+        for path in &cli.files {
+            let mut file = File::open(path)?;
+            let t0 = Instant::now();
+            let (first, last) = bisect::time_range(&mut file)?;
+            log::info!(
+                "time-range {}: {} .. {} in {:.3}s",
+                path.display(),
+                first
+                    .map(|t| timestamp::format_rfc3339(t, &tz))
+                    .as_deref()
+                    .unwrap_or("-"),
+                last.map(|t| timestamp::format_rfc3339(t, &tz))
+                    .as_deref()
+                    .unwrap_or("-"),
+                t0.elapsed().as_secs_f64(),
+            );
+            if let Some(t) = first {
+                overall_first = Some(overall_first.map_or(t, |cur| cur.min(t)));
+            }
+            if let Some(t) = last {
+                overall_last = Some(overall_last.map_or(t, |cur| cur.max(t)));
+            }
+        }
+        match (overall_first, overall_last) {
             (Some(a), Some(b)) => writeln!(
                 output,
                 "{} .. {}  ({})",
@@ -366,10 +384,60 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Phase 1: bisect every file up front. Each file is planned independently,
+    // so a `--from`/`--to` window that straddles a log rotation is honored on
+    // both sides. Output is suppressed during planning — only summaries and
+    // matched lines are written, in file order, in phase 2.
+    let last_idx = cli.files.len() - 1;
+    let plans: Vec<FilePlan<'_>> = cli
+        .files
+        .iter()
+        .enumerate()
+        .map(|(i, path)| plan_file(path, cli, following && i == last_idx))
+        .collect::<anyhow::Result<_>>()?;
+
+    // Phase 2: stream each planned range in order. Only the last file may
+    // attach the follow loop (set during planning).
+    for plan in plans {
+        if interrupted() || sinks.done() {
+            break;
+        }
+        stream_plan(plan, cli, &filter, &mut output, &mut sinks)?;
+    }
+
+    output.flush()?;
+    emit_summaries(&sinks, cli.count, &mut output)?;
+
+    Ok(())
+}
+
+/// Resolved per-file plan produced by phase 1: an open `File` already seeked
+/// to the bisected start, the size of the byte slice to read, the strict
+/// time-filter to apply on top of it, and whether this file should be
+/// followed after EOF.
+struct FilePlan<'a> {
+    path: &'a Path,
+    /// Already positioned at the bisected start byte.
+    file: File,
+    /// `end_byte - start_byte`. Phase 2 reads exactly this many bytes.
+    max_bytes: u64,
+    tf: TimeFilter,
+    follow_this_file: bool,
+}
+
+/// Phase 1: open `path`, resolve `--from`/`--to` against it, bisect, and seek
+/// to the start byte. No streaming happens here — this phase is pure I/O for
+/// bounds resolution and is independent across files (so it parallelizes
+/// cleanly).
+fn plan_file<'a>(
+    path: &'a Path,
+    cli: &Cli,
+    follow_this_file: bool,
+) -> anyhow::Result<FilePlan<'a>> {
+    let mut file = File::open(path)?;
     let file_len = file.seek(SeekFrom::End(0))?;
     let window = (cli.window_secs as i64).saturating_mul(1_000_000_000);
 
-    // Resolve bounds (with shorthand) and bisect.
     let t_bisect = Instant::now();
     let (file_first, file_last) = if cli.from.is_some() || cli.to.is_some() {
         (
@@ -387,11 +455,11 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
             tf.from = Some(t1);
             bisect::bisect(&mut file, t1, window, Side::Lower)?
         }
-        None if following => file_len, // tail-from-EOF when no --from
+        None if follow_this_file => file_len, // tail-from-EOF when no --from
         None => 0,
     };
     let end_byte: u64 = match cli.to.as_deref() {
-        Some(to) if !following => {
+        Some(to) if !follow_this_file => {
             let t2 = timestamp::resolve_bound(to, file_first, file_last, file_last)?;
             tf.to = Some(t2);
             bisect::bisect(&mut file, t2, window, Side::Upper)?
@@ -401,7 +469,8 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
 
     if cli.from.is_some() || cli.to.is_some() {
         log::info!(
-            "bisect: [{}, {}] window={}s -> bytes [{start_byte}, {end_byte}) ({}) in {:.3}s",
+            "bisect {}: [{}, {}] window={}s -> bytes [{start_byte}, {end_byte}) ({}) in {:.3}s",
+            path.display(),
             cli.from.as_deref().unwrap_or("-"),
             cli.to.as_deref().unwrap_or("-"),
             cli.window_secs,
@@ -411,7 +480,34 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
     }
 
     file.seek(SeekFrom::Start(start_byte))?;
-    let file_for_reopen = if following {
+    Ok(FilePlan {
+        path,
+        file,
+        max_bytes: end_byte.saturating_sub(start_byte),
+        tf,
+        follow_this_file,
+    })
+}
+
+/// Phase 2: consume a `FilePlan` — wrap it in a `BufReader`, stream the
+/// bounded byte range through filters and sinks, then optionally attach the
+/// follow loop.
+fn stream_plan(
+    plan: FilePlan<'_>,
+    cli: &Cli,
+    filter: &Filter,
+    output: &mut Box<dyn Write>,
+    sinks: &mut Sinks,
+) -> anyhow::Result<()> {
+    let FilePlan {
+        path,
+        file,
+        max_bytes,
+        tf,
+        follow_this_file,
+    } = plan;
+
+    let file_for_reopen = if follow_this_file {
         Some(file.try_clone().with_context(|| {
             format!(
                 "dup file handle for follow-mode rotation tracking: {}",
@@ -423,35 +519,23 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
     };
     let mut reader = BufReader::new(file);
 
-    // Phase 1: stream up to end_byte.
-    let max_bytes = end_byte.saturating_sub(start_byte);
-    stream_bounded(
-        &mut reader,
-        max_bytes,
-        &filter,
-        &tf,
-        &mut output,
-        &mut sinks,
-    )?;
+    stream_bounded(&mut reader, max_bytes, filter, &tf, output, sinks)?;
     output.flush()?;
 
-    // Phase 2: follow. New lines are assumed monotone, so don't re-apply tf.
     if let Some(handle) = file_for_reopen
         && !interrupted()
+        && !sinks.done()
     {
         follow_loop(
             path,
             handle,
             reader,
             cli.follow_reopen,
-            &filter,
-            &mut output,
-            &mut sinks,
+            filter,
+            output,
+            sinks,
         )?;
     }
-
-    output.flush()?;
-    emit_summaries(&sinks, cli.count, &mut output)?;
 
     Ok(())
 }

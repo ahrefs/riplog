@@ -13,13 +13,26 @@ pub enum ColorMode {
 #[derive(Parser, Debug)]
 #[command(about = "Slice and filter logfmt streams.")]
 pub struct Cli {
-    /// Input file. If omitted, reads from stdin.
-    /// Note: `-F`, `--from`, `--to` require a real file (stdin is not seekable).
-    pub file: Option<PathBuf>,
+    /// Input file(s). If omitted, reads from stdin. Multiple files are
+    /// processed in order; aggregated output (`--count`, `--count-by`,
+    /// `--list-keys`, `--list-values-for`) is emitted once at the end and
+    /// reflects the union of all files.
+    /// Note: `--from`/`--to` are applied per file (each file is bisected
+    /// independently, then strictly time-filtered), so a time range that
+    /// straddles a log rotation works as expected. `-f`/`-F` is attached
+    /// only to the *last* file — e.g. `riplog foo.log.1 foo.log -F` reads
+    /// the rotated log, then the current log, then keeps tailing it.
+    /// `--time-range` reports the span across all given files (min of
+    /// per-file firsts, max of per-file lasts). Stdin (no file) is not
+    /// seekable, so none of `-f`, `-F`, `--from`, `--to`, `--time-range`
+    /// work without a file argument.
+    pub files: Vec<PathBuf>,
 
     /// Lower bound. Forms: full RFC 3339 (`2026-04-24T18:09:03Z`),
     /// date-only (`2026-04-24`), time-of-day (`18:00`, anchored to the
-    /// file's first timestamp), or symbolic (`start`, `start+1h`, `end-30m`).
+    /// file's first timestamp), or symbolic (`start`, `start+1h`,
+    /// `end-30m`). Duration units accept word and plural forms with optional
+    /// whitespace, e.g. `start+5 min`, `end-2 days`, `start+1 hour`.
     #[arg(long)]
     pub from: Option<String>,
 
