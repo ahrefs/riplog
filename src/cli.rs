@@ -74,10 +74,12 @@ pub struct Cli {
     #[arg(short = 'o', long)]
     pub output: Option<PathBuf>,
 
-    /// Group matched lines by the value of one or more keys; print a count
-    /// table at the end. Repeatable: `--count-by level --count-by facil`
-    /// produces one row per (level, facil) combination.
-    #[arg(long = "count-by")]
+    /// Suppress line output; group matched lines by the value of one or more
+    /// keys and print a count table at the end. Repeatable, and a single
+    /// flag may carry a comma-separated list — `--count-by level,facil` and
+    /// `--count-by level --count-by facil` both produce one row per
+    /// (level, facil) combination.
+    #[arg(long = "count-by", value_delimiter = ',')]
     pub count_by: Vec<String>,
 
     /// Suppress line output; instead, gather every distinct key seen on
