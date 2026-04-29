@@ -40,7 +40,7 @@ def quote(value: str) -> str:
 
 
 def line(when: datetime) -> str:
-    level = random.choice(LEVELS)
+    level = 'critical' if random.random() <= 0.01 else random.choice(LEVELS)
     msg = random.choice(MESSAGES)
     return f"time={rfc3339(when)} level={level} msg={quote(msg)}"
 
