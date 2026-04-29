@@ -23,6 +23,7 @@
 //! is true only if no value is info.
 
 use regex::Regex;
+use smartstring::alias::String as SmartString;
 
 use crate::timestamp::strip_quotes;
 
@@ -39,16 +40,16 @@ enum Op {
 
 #[derive(Debug)]
 struct Predicate {
-    key: String,
+    key: SmartString,
     op: Op,
-    rhs: String,
+    rhs: SmartString,
     rhs_num: Option<f64>,
     rhs_level: Option<u8>,
     re: Option<Regex>,
 }
 
 impl Predicate {
-    fn new(key: String, op: Op, rhs: String) -> anyhow::Result<Self> {
+    fn new(key: SmartString, op: Op, rhs: SmartString) -> anyhow::Result<Self> {
         let rhs_num = rhs.parse::<f64>().ok();
         let rhs_level = level_rank(&rhs);
         let re = if matches!(op, Op::ReMatch) {
@@ -121,7 +122,7 @@ impl Predicate {
 #[derive(Debug)]
 enum Expr {
     Pred(Predicate),
-    Exists(String),
+    Exists(SmartString),
     And(Vec<Expr>),
     Or(Vec<Expr>),
     Not(Box<Expr>),
@@ -131,7 +132,7 @@ impl Expr {
     fn matches(&self, pairs: &[(&str, &str)]) -> bool {
         match self {
             Self::Pred(p) => p.matches(pairs),
-            Self::Exists(key) => pairs.iter().any(|(k, _)| *k == key),
+            Self::Exists(key) => pairs.iter().any(|(k, _)| *k == key.as_str()),
             Self::And(xs) => xs.iter().all(|x| x.matches(pairs)),
             Self::Or(xs) => xs.iter().any(|x| x.matches(pairs)),
             Self::Not(x) => !x.matches(pairs),
@@ -397,7 +398,7 @@ impl ParserState {
             Some(Token::Exists) => {
                 self.advance();
                 match self.advance() {
-                    Some(Token::Word(k)) => Ok(Expr::Exists(k)),
+                    Some(Token::Word(k)) => Ok(Expr::Exists(SmartString::from(k))),
                     Some(t) => anyhow::bail!("expected key after `exists`, got {t:?}"),
                     None => anyhow::bail!("expected key after `exists`"),
                 }
@@ -422,7 +423,7 @@ impl ParserState {
             Some(t) => anyhow::bail!("expected value after `{key}` operator, got {t:?}"),
             None => anyhow::bail!("expected value after `{key}` operator"),
         };
-        Predicate::new(key, op, rhs)
+        Predicate::new(SmartString::from(key), op, SmartString::from(rhs))
     }
 }
 

@@ -124,13 +124,13 @@ fn emit_sorted<W: Write>(set: &RapidHashSet<SmartString>, out: &mut W) -> std::i
 /// suppresses line output.
 #[derive(Default)]
 struct ValueGather {
-    keys: Vec<String>,
+    keys: Vec<SmartString>,
     values: Vec<RapidHashSet<SmartString>>,
     scratch: String,
 }
 
 impl ValueGather {
-    fn new(keys: Vec<String>) -> Self {
+    fn new(keys: Vec<SmartString>) -> Self {
         let n = keys.len();
         Self {
             keys,
@@ -174,13 +174,13 @@ impl ValueGather {
 /// produce an empty `SmartString` slot (rendered as `key=` in the report).
 #[derive(Default)]
 struct Counter {
-    keys: Vec<String>,
+    keys: Vec<SmartString>,
     counts: RapidHashMap<Combo, usize>,
     scratch: String,
 }
 
 impl Counter {
-    fn new(keys: Vec<String>) -> Self {
+    fn new(keys: Vec<SmartString>) -> Self {
         Self {
             keys,
             counts: RapidHashMap::default(),
@@ -318,9 +318,9 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
 
     let mut sinks = Sinks {
         stats: Stats::default(),
-        counter: Counter::new(cli.count_by.clone()),
+        counter: Counter::new(cli.count_by.iter().map(SmartString::from).collect()),
         keys: KeyGather::new(cli.list_keys),
-        values: ValueGather::new(cli.list_values_for.clone()),
+        values: ValueGather::new(cli.list_values_for.iter().map(SmartString::from).collect()),
         sampler,
         suppress_lines,
         colorize,
