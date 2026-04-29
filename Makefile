@@ -15,6 +15,9 @@ release-static:
 install:
 	cargo install --path=.
 
+fmt:
+	cargo fmt
+
 test:
 	cargo test
 
