@@ -15,10 +15,11 @@ const COUNT: usize = 200;
 const START_TIME: &str = "2026-04-24T18:00:00Z";
 
 // Distribution of `level=` in the seed=42, count=200 fixture (precomputed).
-const N_DEBUG: usize = 57;
-const N_ERROR: usize = 53;
-const N_INFO: usize = 49;
-const N_WARN: usize = 41;
+const N_DEBUG: usize = 54;
+const N_ERROR: usize = 49;
+const N_INFO: usize = 51;
+const N_WARN: usize = 43;
+const N_CRITICAL: usize = 3;
 
 fn riplog_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_riplog"))
@@ -119,7 +120,7 @@ fn list_values_for_level() {
     let out = run(&["--list-values-for=level", path]);
     let mut levels = lines(&out.stdout);
     levels.sort();
-    assert_eq!(levels, vec!["debug", "error", "info", "warn"]);
+    assert_eq!(levels, vec!["critical", "debug", "error", "info", "warn"]);
 }
 
 #[test]
@@ -183,6 +184,7 @@ fn count_by_level_matches_distribution() {
     assert_eq!(counts.get("error"), Some(&N_ERROR));
     assert_eq!(counts.get("info"), Some(&N_INFO));
     assert_eq!(counts.get("warn"), Some(&N_WARN));
+    assert_eq!(counts.get("critical"), Some(&N_CRITICAL));
 }
 
 #[test]
@@ -303,6 +305,137 @@ fn follow_reopen_handles_rotation() {
         finish_with_sigint(child),
         3,
         "expected 2 appended + 1 post-rotation"
+    );
+}
+
+/// Split the standard fixture in half line-wise. Lines are 0.1s apart
+/// starting at 18:00:00; the split boundary is at line 100 ≈ 18:00:10.
+/// Cached so multiple multi-file tests share the same on-disk pair.
+fn split_fixture() -> (PathBuf, PathBuf) {
+    static PATHS: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
+    PATHS
+        .get_or_init(|| {
+            let src = fs::read_to_string(fixture_path()).unwrap();
+            let lines: Vec<&str> = src.lines().collect();
+            let mid = lines.len() / 2;
+            let dir = std::env::temp_dir().join("riplog-it");
+            let a = dir.join("split-aa.log");
+            let b = dir.join("split-ab.log");
+            fs::write(&a, lines[..mid].join("\n") + "\n").unwrap();
+            fs::write(&b, lines[mid..].join("\n") + "\n").unwrap();
+            (a, b)
+        })
+        .clone()
+}
+
+#[test]
+fn multi_file_count_matches_concatenation() {
+    let (a, b) = split_fixture();
+    let out = run(&["--count", a.to_str().unwrap(), b.to_str().unwrap()]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        COUNT.to_string()
+    );
+}
+
+#[test]
+fn multi_file_count_by_aggregates_across_files() {
+    let (a, b) = split_fixture();
+    let multi = run(&["--count-by=level", a.to_str().unwrap(), b.to_str().unwrap()]);
+    let single = run(&["--count-by=level", fixture_path().to_str().unwrap()]);
+    assert_eq!(
+        multi.stdout, single.stdout,
+        "multi and single --count-by output should be byte-identical"
+    );
+}
+
+#[test]
+fn multi_file_list_keys_unions() {
+    let (a, b) = split_fixture();
+    let out = run(&["--list-keys", a.to_str().unwrap(), b.to_str().unwrap()]);
+    let mut keys = lines(&out.stdout);
+    keys.sort();
+    assert_eq!(keys, vec!["level", "msg", "time"]);
+}
+
+#[test]
+fn multi_file_list_values_for_unions() {
+    let (a, b) = split_fixture();
+    let out = run(&[
+        "--list-values-for=level",
+        a.to_str().unwrap(),
+        b.to_str().unwrap(),
+    ]);
+    let single = run(&["--list-values-for=level", fixture_path().to_str().unwrap()]);
+    assert_eq!(out.stdout, single.stdout);
+}
+
+#[test]
+fn multi_file_limit_caps_globally() {
+    let (a, b) = split_fixture();
+    let (a, b) = (a.to_str().unwrap(), b.to_str().unwrap());
+    // -n 5: stops within the first file.
+    let out = run(&["--count", "--limit=5", a, b]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "5");
+    // -n 150: spans both files.
+    let out = run(&["--count", "--limit=150", a, b]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "150");
+    // Streamed line output also caps globally.
+    let out = run(&["--limit=120", a, b]);
+    let n_lines = out.stdout.iter().filter(|&&c| c == b'\n').count();
+    assert_eq!(n_lines, 120);
+}
+
+#[test]
+fn multi_file_from_to_straddles_rotation() {
+    let (a, b) = split_fixture();
+    // Window 18:00:08..18:00:12 spans both halves (split is at 18:00:10).
+    let args = [
+        "--from=2026-04-24T18:00:08Z",
+        "--to=2026-04-24T18:00:12Z",
+        "--window-secs=1",
+        "--count",
+    ];
+    let multi = run(&[&args[..], &[a.to_str().unwrap(), b.to_str().unwrap()]].concat());
+    let single = run(&[&args[..], &[fixture_path().to_str().unwrap()]].concat());
+    assert_eq!(multi.stdout, single.stdout);
+}
+
+#[test]
+fn multi_file_symbolic_anchors_resolve_globally() {
+    // `start+5s end-5s` resolves once against the global span and applies
+    // the same absolute window to both files. Result must match concatenation.
+    let (a, b) = split_fixture();
+    let args = ["--from=start+5s", "--to=end-5s", "--count"];
+    let multi = run(&[&args[..], &[a.to_str().unwrap(), b.to_str().unwrap()]].concat());
+    let single = run(&[&args[..], &[fixture_path().to_str().unwrap()]].concat());
+    assert_eq!(multi.stdout, single.stdout);
+}
+
+#[test]
+fn multi_file_time_range_unions() {
+    let (a, b) = split_fixture();
+    let multi = run(&["--time-range", a.to_str().unwrap(), b.to_str().unwrap()]);
+    let single = run(&["--time-range", fixture_path().to_str().unwrap()]);
+    assert_eq!(multi.stdout, single.stdout);
+}
+
+#[test]
+fn stdin_rejects_seek_flags() {
+    let mut child = Command::new(riplog_bin())
+        .args(["--from=18:00", "--count"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdin.take());
+    let out = child.wait_with_output().unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("require a file argument"),
+        "stderr was: {stderr}"
     );
 }
 

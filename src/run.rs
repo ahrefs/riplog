@@ -385,16 +385,43 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Phase 1: bisect every file up front. Each file is planned independently,
-    // so a `--from`/`--to` window that straddles a log rotation is honored on
-    // both sides. Output is suppressed during planning — only summaries and
+    // Resolve `--from`/`--to` once against the union of all files' time
+    // windows. Symbolic anchors (`start`, `end`, `start+1h`, etc.) refer to
+    // the *global* span, not each file's local one — so with two log files
+    // around a rotation, `--from start+1h --to start+2h` is one contiguous
+    // absolute window applied across both files, not two disjoint slices.
+    let (global_first, global_last) = if cli.from.is_some() || cli.to.is_some() {
+        peek_global_window(&cli.files)?
+    } else {
+        (None, None)
+    };
+    let mut tf = TimeFilter::default();
+    if let Some(s) = cli.from.as_deref() {
+        tf.from = Some(timestamp::resolve_bound(
+            s,
+            global_first,
+            global_last,
+            global_first,
+        )?);
+    }
+    if let Some(s) = cli.to.as_deref() {
+        tf.to = Some(timestamp::resolve_bound(
+            s,
+            global_first,
+            global_last,
+            global_last,
+        )?);
+    }
+
+    // Phase 1: bisect every file up front against the resolved absolute
+    // window. Output is suppressed during planning — only summaries and
     // matched lines are written, in file order, in phase 2.
     let last_idx = cli.files.len() - 1;
     let plans: Vec<FilePlan<'_>> = cli
         .files
         .iter()
         .enumerate()
-        .map(|(i, path)| plan_file(path, cli, following && i == last_idx))
+        .map(|(i, path)| plan_file(path, cli, tf, following && i == last_idx))
         .collect::<anyhow::Result<_>>()?;
 
     // Phase 2: stream each planned range in order. Only the last file may
@@ -426,13 +453,34 @@ struct FilePlan<'a> {
     follow_this_file: bool,
 }
 
-/// Phase 1: open `path`, resolve `--from`/`--to` against it, bisect, and seek
-/// to the start byte. No streaming happens here — this phase is pure I/O for
-/// bounds resolution and is independent across files (so it parallelizes
-/// cleanly).
+/// Compute the union span across all files (min of per-file first
+/// timestamps, max of per-file lasts) used as the anchor for symbolic
+/// `--from`/`--to` bounds. One head + one tail seek per file.
+fn peek_global_window(
+    files: &[std::path::PathBuf],
+) -> anyhow::Result<(Option<Timestamp>, Option<Timestamp>)> {
+    let mut first: Option<Timestamp> = None;
+    let mut last: Option<Timestamp> = None;
+    for path in files {
+        let mut file = File::open(path)?;
+        if let Some(t) = bisect::peek_first_timestamp(&mut file)? {
+            first = Some(first.map_or(t, |cur| cur.min(t)));
+        }
+        if let Some(t) = bisect::peek_last_timestamp(&mut file)? {
+            last = Some(last.map_or(t, |cur| cur.max(t)));
+        }
+    }
+    Ok((first, last))
+}
+
+/// Phase 1: open `path`, bisect to the absolute byte slice corresponding to
+/// `tf`, and seek to its start. No streaming happens here — this phase is
+/// pure I/O for byte-range resolution and is independent across files (so it
+/// parallelizes cleanly).
 fn plan_file<'a>(
     path: &'a Path,
     cli: &Cli,
+    tf: TimeFilter,
     follow_this_file: bool,
 ) -> anyhow::Result<FilePlan<'a>> {
     let mut file = File::open(path)?;
@@ -440,31 +488,13 @@ fn plan_file<'a>(
     let window = (cli.window_secs as i64).saturating_mul(1_000_000_000);
 
     let t_bisect = Instant::now();
-    let (file_first, file_last) = if cli.from.is_some() || cli.to.is_some() {
-        (
-            bisect::peek_first_timestamp(&mut file)?,
-            bisect::peek_last_timestamp(&mut file)?,
-        )
-    } else {
-        (None, None)
-    };
-
-    let mut tf = TimeFilter::default();
-    let start_byte: u64 = match cli.from.as_deref() {
-        Some(from) => {
-            let t1 = timestamp::resolve_bound(from, file_first, file_last, file_first)?;
-            tf.from = Some(t1);
-            bisect::bisect(&mut file, t1, window, Side::Lower)?
-        }
+    let start_byte: u64 = match tf.from {
+        Some(t1) => bisect::bisect(&mut file, t1, window, Side::Lower)?,
         None if follow_this_file => file_len, // tail-from-EOF when no --from
         None => 0,
     };
-    let end_byte: u64 = match cli.to.as_deref() {
-        Some(to) if !follow_this_file => {
-            let t2 = timestamp::resolve_bound(to, file_first, file_last, file_last)?;
-            tf.to = Some(t2);
-            bisect::bisect(&mut file, t2, window, Side::Upper)?
-        }
+    let end_byte: u64 = match tf.to {
+        Some(t2) if !follow_this_file => bisect::bisect(&mut file, t2, window, Side::Upper)?,
         _ => file_len,
     };
 
