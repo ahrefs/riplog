@@ -308,6 +308,15 @@ fn follow_reopen_handles_rotation() {
     );
 }
 
+/// Run `riplog` with `args` followed by each path stringified. Saves the
+/// `&[args, &[a.to_str().unwrap(), b.to_str().unwrap()]].concat()` dance
+/// across the multi-file tests below.
+fn run_with_files(args: &[&str], files: &[&Path]) -> std::process::Output {
+    let mut all: Vec<&str> = args.to_vec();
+    all.extend(files.iter().map(|p| p.to_str().unwrap()));
+    run(&all)
+}
+
 /// Split the standard fixture in half line-wise. Lines are 0.1s apart
 /// starting at 18:00:00; the split boundary is at line 100 ≈ 18:00:10.
 /// Cached so multiple multi-file tests share the same on-disk pair.
@@ -331,7 +340,7 @@ fn split_fixture() -> (PathBuf, PathBuf) {
 #[test]
 fn multi_file_count_matches_concatenation() {
     let (a, b) = split_fixture();
-    let out = run(&["--count", a.to_str().unwrap(), b.to_str().unwrap()]);
+    let out = run_with_files(&["--count"], &[&a, &b]);
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
         COUNT.to_string()
@@ -341,8 +350,8 @@ fn multi_file_count_matches_concatenation() {
 #[test]
 fn multi_file_count_by_aggregates_across_files() {
     let (a, b) = split_fixture();
-    let multi = run(&["--count-by=level", a.to_str().unwrap(), b.to_str().unwrap()]);
-    let single = run(&["--count-by=level", fixture_path().to_str().unwrap()]);
+    let multi = run_with_files(&["--count-by=level"], &[&a, &b]);
+    let single = run_with_files(&["--count-by=level"], &[fixture_path()]);
     assert_eq!(
         multi.stdout, single.stdout,
         "multi and single --count-by output should be byte-identical"
@@ -352,7 +361,7 @@ fn multi_file_count_by_aggregates_across_files() {
 #[test]
 fn multi_file_list_keys_unions() {
     let (a, b) = split_fixture();
-    let out = run(&["--list-keys", a.to_str().unwrap(), b.to_str().unwrap()]);
+    let out = run_with_files(&["--list-keys"], &[&a, &b]);
     let mut keys = lines(&out.stdout);
     keys.sort();
     assert_eq!(keys, vec!["level", "msg", "time"]);
@@ -361,27 +370,22 @@ fn multi_file_list_keys_unions() {
 #[test]
 fn multi_file_list_values_for_unions() {
     let (a, b) = split_fixture();
-    let out = run(&[
-        "--list-values-for=level",
-        a.to_str().unwrap(),
-        b.to_str().unwrap(),
-    ]);
-    let single = run(&["--list-values-for=level", fixture_path().to_str().unwrap()]);
-    assert_eq!(out.stdout, single.stdout);
+    let multi = run_with_files(&["--list-values-for=level"], &[&a, &b]);
+    let single = run_with_files(&["--list-values-for=level"], &[fixture_path()]);
+    assert_eq!(multi.stdout, single.stdout);
 }
 
 #[test]
 fn multi_file_limit_caps_globally() {
     let (a, b) = split_fixture();
-    let (a, b) = (a.to_str().unwrap(), b.to_str().unwrap());
     // -n 5: stops within the first file.
-    let out = run(&["--count", "--limit=5", a, b]);
+    let out = run_with_files(&["--count", "--limit=5"], &[&a, &b]);
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "5");
     // -n 150: spans both files.
-    let out = run(&["--count", "--limit=150", a, b]);
+    let out = run_with_files(&["--count", "--limit=150"], &[&a, &b]);
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "150");
     // Streamed line output also caps globally.
-    let out = run(&["--limit=120", a, b]);
+    let out = run_with_files(&["--limit=120"], &[&a, &b]);
     let n_lines = out.stdout.iter().filter(|&&c| c == b'\n').count();
     assert_eq!(n_lines, 120);
 }
@@ -396,8 +400,8 @@ fn multi_file_from_to_straddles_rotation() {
         "--window-secs=1",
         "--count",
     ];
-    let multi = run(&[&args[..], &[a.to_str().unwrap(), b.to_str().unwrap()]].concat());
-    let single = run(&[&args[..], &[fixture_path().to_str().unwrap()]].concat());
+    let multi = run_with_files(&args, &[&a, &b]);
+    let single = run_with_files(&args, &[fixture_path()]);
     assert_eq!(multi.stdout, single.stdout);
 }
 
@@ -407,16 +411,16 @@ fn multi_file_symbolic_anchors_resolve_globally() {
     // the same absolute window to both files. Result must match concatenation.
     let (a, b) = split_fixture();
     let args = ["--from=start+5s", "--to=end-5s", "--count"];
-    let multi = run(&[&args[..], &[a.to_str().unwrap(), b.to_str().unwrap()]].concat());
-    let single = run(&[&args[..], &[fixture_path().to_str().unwrap()]].concat());
+    let multi = run_with_files(&args, &[&a, &b]);
+    let single = run_with_files(&args, &[fixture_path()]);
     assert_eq!(multi.stdout, single.stdout);
 }
 
 #[test]
 fn multi_file_time_range_unions() {
     let (a, b) = split_fixture();
-    let multi = run(&["--time-range", a.to_str().unwrap(), b.to_str().unwrap()]);
-    let single = run(&["--time-range", fixture_path().to_str().unwrap()]);
+    let multi = run_with_files(&["--time-range"], &[&a, &b]);
+    let single = run_with_files(&["--time-range"], &[fixture_path()]);
     assert_eq!(multi.stdout, single.stdout);
 }
 

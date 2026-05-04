@@ -439,14 +439,13 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Resolved per-file plan produced by phase 1: an open `File` already seeked
-/// to the bisected start, the size of the byte slice to read, the strict
-/// time-filter to apply on top of it, and whether this file should be
-/// followed after EOF.
+/// Resolved per-file plan produced by phase 1: a byte slice (start, len),
+/// the strict time-filter to apply on top of it, and whether this file
+/// should be followed after EOF. The file is reopened in phase 2 so phase 1
+/// doesn't hold N file descriptors simultaneously.
 struct FilePlan<'a> {
     path: &'a Path,
-    /// Already positioned at the bisected start byte.
-    file: File,
+    start_byte: u64,
     /// `end_byte - start_byte`. Phase 2 reads exactly this many bytes.
     max_bytes: u64,
     tf: TimeFilter,
@@ -474,9 +473,9 @@ fn peek_global_window(
 }
 
 /// Phase 1: open `path`, bisect to the absolute byte slice corresponding to
-/// `tf`, and seek to its start. No streaming happens here — this phase is
-/// pure I/O for byte-range resolution and is independent across files (so it
-/// parallelizes cleanly).
+/// `tf`, and return the resolved range. The file is dropped on return so
+/// phase 1 doesn't pin a file descriptor; phase 2 reopens it. Independent
+/// across files (so it parallelizes cleanly).
 fn plan_file<'a>(
     path: &'a Path,
     cli: &Cli,
@@ -510,19 +509,18 @@ fn plan_file<'a>(
         );
     }
 
-    file.seek(SeekFrom::Start(start_byte))?;
     Ok(FilePlan {
         path,
-        file,
+        start_byte,
         max_bytes: end_byte.saturating_sub(start_byte),
         tf,
         follow_this_file,
     })
 }
 
-/// Phase 2: consume a `FilePlan` — wrap it in a `BufReader`, stream the
-/// bounded byte range through filters and sinks, then optionally attach the
-/// follow loop.
+/// Phase 2: open `plan.path`, seek to the planned start, stream the bounded
+/// byte range through filters and sinks, then optionally attach the follow
+/// loop.
 fn stream_plan(
     plan: FilePlan<'_>,
     cli: &Cli,
@@ -532,12 +530,14 @@ fn stream_plan(
 ) -> anyhow::Result<()> {
     let FilePlan {
         path,
-        file,
+        start_byte,
         max_bytes,
         tf,
         follow_this_file,
     } = plan;
 
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(start_byte))?;
     let file_for_reopen = if follow_this_file {
         Some(file.try_clone().with_context(|| {
             format!(

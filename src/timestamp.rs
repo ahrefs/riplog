@@ -246,8 +246,6 @@ fn apply_offset(base: Timestamp, suffix: &str) -> anyhow::Result<Timestamp> {
         _ => anyhow::bail!("expected `+` or `-` after anchor: `{suffix}`"),
     };
     let inner = suffix[1..].trim();
-    // Split number prefix from unit suffix at the first non-digit; allow
-    // optional whitespace between them (`5 min`, `2 days`).
     let split = inner
         .find(|c: char| !c.is_ascii_digit())
         .unwrap_or(inner.len());
