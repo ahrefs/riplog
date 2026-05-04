@@ -94,6 +94,13 @@ pub struct Cli {
     #[arg(long = "list-values-for", value_delimiter = ',')]
     pub list_values_for: Vec<String>,
 
+    /// Suppress line output; for each matched line, emit only the unquoted,
+    /// unescaped value of `<key>` (one per line). Lines without the key are
+    /// dropped. Useful for piping a single field downstream, e.g.
+    /// `riplog app.log --if 'level=error' --raw-key msg | sort | uniq -c`.
+    #[arg(long = "raw-key", value_name = "KEY")]
+    pub raw_key: Option<String>,
+
     /// Suppress line output; print only the count of matched lines at the
     /// end. Combine with `-F` and Ctrl-C to count live.
     #[arg(long)]

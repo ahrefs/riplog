@@ -170,6 +170,35 @@ impl ValueGather {
     }
 }
 
+/// Per-line value extractor: for each matched line, emit the unquoted,
+/// unescaped value of `key`. Active when `--raw-key=<key>` is given;
+/// suppresses the normal full-line output. Lines lacking the key are
+/// silently skipped.
+struct RawExtractor {
+    key: Option<SmartString>,
+    scratch: String,
+}
+
+impl RawExtractor {
+    fn new(key: Option<&str>) -> Self {
+        Self {
+            key: key.map(SmartString::from),
+            scratch: String::new(),
+        }
+    }
+
+    fn emit<W: Write>(&mut self, pairs: &[(&str, &str)], out: &mut W) -> std::io::Result<()> {
+        let Some(key) = self.key.as_deref() else {
+            return Ok(());
+        };
+        if let Some(v) = unescape_for_key(pairs, key, &mut self.scratch) {
+            out.write_all(v.as_bytes())?;
+            out.write_all(b"\n")?;
+        }
+        Ok(())
+    }
+}
+
 /// Counts matched lines grouped by the value tuple of `keys`. Missing keys
 /// produce an empty `SmartString` slot (rendered as `key=` in the report).
 #[derive(Default)]
@@ -290,8 +319,11 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
 
     let filter = Filter::parse(&cli.keys)?;
     let following = cli.follow || cli.follow_reopen;
-    let suppress_lines =
-        cli.list_keys || cli.count || !cli.list_values_for.is_empty() || !cli.count_by.is_empty();
+    let suppress_lines = cli.list_keys
+        || cli.count
+        || !cli.list_values_for.is_empty()
+        || !cli.count_by.is_empty()
+        || cli.raw_key.is_some();
     let tz = timestamp::resolve_tz(cli.tz.as_deref())?;
 
     let sampler = match (cli.sample_rate, cli.sample_if.as_deref()) {
@@ -322,6 +354,7 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
         counter: Counter::new(cli.count_by.iter().map(SmartString::from).collect()),
         keys: KeyGather::new(cli.list_keys),
         values: ValueGather::new(cli.list_values_for.iter().map(SmartString::from).collect()),
+        raw: RawExtractor::new(cli.raw_key.as_deref()),
         sampler,
         suppress_lines,
         colorize,
@@ -636,6 +669,7 @@ struct Sinks {
     counter: Counter,
     keys: KeyGather,
     values: ValueGather,
+    raw: RawExtractor,
     sampler: Option<Sampler>,
     suppress_lines: bool,
     colorize: bool,
@@ -750,6 +784,7 @@ fn process_line<W: Write>(
         sinks.counter.record(parsed);
         sinks.keys.record(parsed);
         sinks.values.record(parsed);
+        sinks.raw.emit(parsed, output)?;
         if !sinks.suppress_lines {
             if sinks.colorize {
                 write_colored_line(output, parsed)?;

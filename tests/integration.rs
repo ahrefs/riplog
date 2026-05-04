@@ -425,6 +425,68 @@ fn multi_file_time_range_unions() {
 }
 
 #[test]
+fn raw_key_emits_unquoted_values_per_line() {
+    let path = fixture_path().to_str().unwrap();
+    // critical lines only — small, deterministic set.
+    let out = run(&["--if=level=critical", "--raw-key=msg", path]);
+    assert_eq!(
+        out.stdout.iter().filter(|&&b| b == b'\n').count(),
+        N_CRITICAL
+    );
+    // Every emitted line should be plain text (no `key=` prefix, no quotes).
+    for line in lines(&out.stdout) {
+        assert!(!line.contains('='), "raw-key line still has `=`: {line:?}");
+        assert!(
+            !line.starts_with('"'),
+            "raw-key line still quoted: {line:?}"
+        );
+    }
+}
+
+#[test]
+fn raw_key_unescapes_quoted_values() {
+    let mut child = Command::new(riplog_bin())
+        .args(["--raw-key=msg"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"time=2026-04-24T18:00:00Z msg=\"hello \\\"world\\\"\" level=info\n")
+        .unwrap();
+    drop(child.stdin.take());
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "hello \"world\""
+    );
+}
+
+#[test]
+fn raw_key_skips_lines_missing_key() {
+    let mut child = Command::new(riplog_bin())
+        .args(["--raw-key=msg"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"msg=first\nlevel=info\nmsg=second\n")
+        .unwrap();
+    drop(child.stdin.take());
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(lines(&out.stdout), vec!["first", "second"]);
+}
+
+#[test]
 fn stdin_rejects_seek_flags() {
     let mut child = Command::new(riplog_bin())
         .args(["--from=18:00", "--count"])
