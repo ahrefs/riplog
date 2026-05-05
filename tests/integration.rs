@@ -505,6 +505,223 @@ fn stdin_rejects_seek_flags() {
     );
 }
 
+/// ~24 MiB synthetic logfmt fixture, big enough to actually split across 4
+/// workers (`MIN_BYTES_PER_WORKER * 4 = 16 MiB`). Cached for the test process.
+fn big_fixture() -> &'static Path {
+    static PATH: OnceLock<PathBuf> = OnceLock::new();
+    PATH.get_or_init(|| {
+        let dir = std::env::temp_dir().join("riplog-it");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("big-fixture.log");
+        let mut buf: Vec<u8> = Vec::with_capacity(24 * 1024 * 1024);
+        for i in 0..500_000u64 {
+            let level = match i % 5 {
+                0 => "info",
+                1 => "warn",
+                2 => "error",
+                3 => "debug",
+                _ => "critical",
+            };
+            let secs = i / 10;
+            let frac = (i % 10) * 100_000;
+            let line = format!(
+                "time=2026-04-24T18:{:02}:{:02}.{:06}Z level={} msg=\"line {}\"\n",
+                secs / 60 % 60,
+                secs % 60,
+                frac,
+                level,
+                i,
+            );
+            buf.extend_from_slice(line.as_bytes());
+        }
+        fs::write(&path, &buf).unwrap();
+        path
+    })
+    .as_path()
+}
+
+#[test]
+fn parallel_count_matches_sequential() {
+    let path = big_fixture().to_str().unwrap();
+    let seq = run(&["--count", "--if=level=critical", path]);
+    let par = run(&["-j=4", "--count", "--if=level=critical", path]);
+    assert_eq!(seq.stdout, par.stdout);
+    let n: usize = String::from_utf8_lossy(&par.stdout).trim().parse().unwrap();
+    assert_eq!(n, 100_000); // 500k / 5 levels
+}
+
+#[test]
+fn parallel_count_by_matches_sequential() {
+    let path = big_fixture().to_str().unwrap();
+    let seq = run(&["--count-by=level", path]);
+    let par = run(&["-j=4", "--count-by=level", path]);
+    assert_eq!(seq.stdout, par.stdout);
+}
+
+#[test]
+fn parallel_lines_match_sorted_sequential() {
+    let path = big_fixture().to_str().unwrap();
+    let seq = run(&["--if=level=critical", path]);
+    let par = run(&["-j=4", "--if=level=critical", path]);
+    let mut seq_lines: Vec<&[u8]> = seq.stdout.split(|&b| b == b'\n').collect();
+    let mut par_lines: Vec<&[u8]> = par.stdout.split(|&b| b == b'\n').collect();
+    seq_lines.sort_unstable();
+    par_lines.sort_unstable();
+    assert_eq!(seq_lines, par_lines);
+}
+
+#[test]
+fn parallel_with_sort_by_matches_sequential() {
+    let path = big_fixture().to_str().unwrap();
+    let seq = run(&["--if=level=critical", "--sort-by=time", path]);
+    let par = run(&["-j=4", "--if=level=critical", "--sort-by=time", path]);
+    assert_eq!(seq.stdout, par.stdout);
+}
+
+#[test]
+fn parallel_rejects_limit() {
+    let path = big_fixture().to_str().unwrap();
+    let out = Command::new(riplog_bin())
+        .args(["-j=4", "-n=10", path])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("cannot be combined"), "stderr was: {err}");
+}
+
+#[test]
+fn parallel_falls_back_on_small_input() {
+    // Standard fixture is < MIN_BYTES_PER_WORKER, so -j=4 falls back to a
+    // single-chunk pass; output should be identical to sequential.
+    let path = fixture_path().to_str().unwrap();
+    let seq = run(&["--count", path]);
+    let par = run(&["-j=4", "--count", path]);
+    assert_eq!(seq.stdout, par.stdout);
+}
+
+#[test]
+fn sort_by_orders_stdin_lines_lex() {
+    let mut child = Command::new(riplog_bin())
+        .args(["--sort-by=time"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(
+            b"time=2026-04-24T18:00:02Z msg=second\n\
+              time=2026-04-24T18:00:01Z msg=first\n\
+              time=2026-04-24T18:00:03Z msg=third\n",
+        )
+        .unwrap();
+    drop(child.stdin.take());
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let want = "time=2026-04-24T18:00:01Z msg=first\n\
+                time=2026-04-24T18:00:02Z msg=second\n\
+                time=2026-04-24T18:00:03Z msg=third\n";
+    assert_eq!(String::from_utf8_lossy(&out.stdout), want);
+}
+
+#[test]
+fn sort_by_with_raw_key_sorts_extracted_values() {
+    let mut child = Command::new(riplog_bin())
+        .args(["--sort-by=time", "--raw-key=msg"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(
+            b"time=2026-04-24T18:00:02Z msg=B\n\
+              time=2026-04-24T18:00:01Z msg=A\n\
+              time=2026-04-24T18:00:03Z msg=C\n",
+        )
+        .unwrap();
+    drop(child.stdin.take());
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "A\nB\nC\n");
+}
+
+#[test]
+fn sort_by_missing_key_sorts_first() {
+    let mut child = Command::new(riplog_bin())
+        .args(["--sort-by=tag"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(
+            b"msg=middle tag=m\n\
+              msg=last tag=z\n\
+              msg=top\n",
+        )
+        .unwrap();
+    drop(child.stdin.take());
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let want = "msg=top\n\
+                msg=middle tag=m\n\
+                msg=last tag=z\n";
+    assert_eq!(String::from_utf8_lossy(&out.stdout), want);
+}
+
+#[test]
+fn sort_by_on_file_orders_shuffled_input() {
+    let dir = std::env::temp_dir().join("riplog-it");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("sort-by-file.log");
+    fs::write(
+        &path,
+        "time=2026-04-24T18:00:03Z msg=c\n\
+         time=2026-04-24T18:00:01Z msg=a\n\
+         time=2026-04-24T18:00:02Z msg=b\n",
+    )
+    .unwrap();
+    let out = run(&["--sort-by=time", path.to_str().unwrap()]);
+    let want = "time=2026-04-24T18:00:01Z msg=a\n\
+                time=2026-04-24T18:00:02Z msg=b\n\
+                time=2026-04-24T18:00:03Z msg=c\n";
+    assert_eq!(String::from_utf8_lossy(&out.stdout), want);
+}
+
+#[test]
+fn sort_by_composes_with_if_filter() {
+    let path = fixture_path().to_str().unwrap();
+    // critical: deterministic small set. All emitted lines should still be
+    // present, and msg values should be lex-sorted.
+    let out = run(&["--if=level=critical", "--sort-by=msg", path]);
+    let line_count = out.stdout.iter().filter(|&&b| b == b'\n').count();
+    assert_eq!(line_count, N_CRITICAL);
+    // Extract the msg= token from each line and verify ascending order.
+    let msgs: Vec<String> = lines(&out.stdout)
+        .iter()
+        .filter_map(|l| {
+            l.split_whitespace()
+                .find_map(|tok| tok.strip_prefix("msg=").map(str::to_string))
+        })
+        .collect();
+    assert_eq!(msgs.len(), N_CRITICAL);
+    let mut sorted = msgs.clone();
+    sorted.sort();
+    assert_eq!(msgs, sorted);
+}
+
 #[cfg(unix)]
 #[test]
 fn follow_no_reopen_misses_rotation() {
