@@ -19,6 +19,7 @@ use crate::bisect::{self, Side};
 use crate::cli::{Cli, ColorMode};
 use crate::filter::Filter;
 use crate::logfmt;
+use crate::sort::SortBuffer;
 use crate::timestamp::{self, Timestamp};
 
 // ANSI escapes for colorized output.
@@ -85,7 +86,7 @@ impl KeyGather {
 /// Find the first pair with key `key`, unescape its value into `scratch`,
 /// and return a borrow of the unescaped string. Returns `None` if no pair
 /// matches; in that case `scratch` is unspecified.
-fn unescape_for_key<'s>(
+pub(crate) fn unescape_for_key<'s>(
     pairs: &[(&str, &str)],
     key: &str,
     scratch: &'s mut String,
@@ -356,6 +357,7 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
         values: ValueGather::new(cli.list_values_for.iter().map(SmartString::from).collect()),
         raw: RawExtractor::new(cli.raw_key.as_deref()),
         sampler,
+        sort_buf: cli.sort_by.as_deref().map(SortBuffer::new),
         suppress_lines,
         colorize,
         limit: cli.limit,
@@ -373,6 +375,7 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
             &mut sinks,
         )?;
         output.flush()?;
+        flush_sort_buf(&mut sinks, &mut output)?;
         emit_summaries(&sinks, cli.count, &mut output)?;
         return Ok(());
     }
@@ -467,8 +470,17 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
     }
 
     output.flush()?;
+    flush_sort_buf(&mut sinks, &mut output)?;
     emit_summaries(&sinks, cli.count, &mut output)?;
 
+    Ok(())
+}
+
+fn flush_sort_buf<W: Write>(sinks: &mut Sinks, out: &mut W) -> std::io::Result<()> {
+    if let Some(sort_buf) = sinks.sort_buf.take() {
+        sort_buf.emit(out)?;
+        out.flush()?;
+    }
     Ok(())
 }
 
@@ -671,6 +683,7 @@ struct Sinks {
     values: ValueGather,
     raw: RawExtractor,
     sampler: Option<Sampler>,
+    sort_buf: Option<SortBuffer>,
     suppress_lines: bool,
     colorize: bool,
     limit: Option<usize>,
@@ -784,20 +797,62 @@ fn process_line<W: Write>(
         sinks.counter.record(parsed);
         sinks.keys.record(parsed);
         sinks.values.record(parsed);
-        sinks.raw.emit(parsed, output)?;
-        if !sinks.suppress_lines {
-            if sinks.colorize {
-                write_colored_line(output, parsed)?;
-            } else {
-                output.write_all(line_buf)?;
-                if raw_len == parse_end {
-                    // No trailing newline in the source; add one for tidy output.
-                    output.write_all(b"\n")?;
-                }
+        if let Some(sort_buf) = sinks.sort_buf.as_mut() {
+            // Aggregation modes without --raw-key produce no per-line bytes;
+            // skip the capture in that case (counters above already recorded).
+            if !sinks.suppress_lines || sinks.raw.key.is_some() {
+                let raw = &mut sinks.raw;
+                let suppress = sinks.suppress_lines;
+                let color = sinks.colorize;
+                sort_buf.capture(parsed, |w| {
+                    emit_match(
+                        parsed, line_buf, raw_len, parse_end, raw, suppress, color, w,
+                    )
+                })?;
             }
+        } else {
+            emit_match(
+                parsed,
+                line_buf,
+                raw_len,
+                parse_end,
+                &mut sinks.raw,
+                sinks.suppress_lines,
+                sinks.colorize,
+                output,
+            )?;
         }
     }
     line_buf.clear();
+    Ok(())
+}
+
+/// Emit one matched line to `out`: the `--raw-key` extraction (if any),
+/// followed by the full line (colored or raw) unless line output is
+/// suppressed by an aggregation/raw-key mode.
+#[allow(clippy::too_many_arguments)]
+fn emit_match<W: Write>(
+    parsed: &[(&str, &str)],
+    line_buf: &[u8],
+    raw_len: usize,
+    parse_end: usize,
+    raw: &mut RawExtractor,
+    suppress_lines: bool,
+    colorize: bool,
+    out: &mut W,
+) -> std::io::Result<()> {
+    raw.emit(parsed, out)?;
+    if !suppress_lines {
+        if colorize {
+            write_colored_line(out, parsed)?;
+        } else {
+            out.write_all(line_buf)?;
+            if raw_len == parse_end {
+                // No trailing newline in the source; add one for tidy output.
+                out.write_all(b"\n")?;
+            }
+        }
+    }
     Ok(())
 }
 

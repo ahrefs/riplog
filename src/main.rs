@@ -3,6 +3,7 @@ mod cli;
 mod filter;
 mod logfmt;
 mod run;
+mod sort;
 mod timestamp;
 
 use clap::Parser;

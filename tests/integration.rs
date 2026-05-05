@@ -505,6 +505,128 @@ fn stdin_rejects_seek_flags() {
     );
 }
 
+#[test]
+fn sort_by_orders_stdin_lines_lex() {
+    let mut child = Command::new(riplog_bin())
+        .args(["--sort-by=time"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(
+            b"time=2026-04-24T18:00:02Z msg=second\n\
+              time=2026-04-24T18:00:01Z msg=first\n\
+              time=2026-04-24T18:00:03Z msg=third\n",
+        )
+        .unwrap();
+    drop(child.stdin.take());
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let want = "time=2026-04-24T18:00:01Z msg=first\n\
+                time=2026-04-24T18:00:02Z msg=second\n\
+                time=2026-04-24T18:00:03Z msg=third\n";
+    assert_eq!(String::from_utf8_lossy(&out.stdout), want);
+}
+
+#[test]
+fn sort_by_with_raw_key_sorts_extracted_values() {
+    let mut child = Command::new(riplog_bin())
+        .args(["--sort-by=time", "--raw-key=msg"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(
+            b"time=2026-04-24T18:00:02Z msg=B\n\
+              time=2026-04-24T18:00:01Z msg=A\n\
+              time=2026-04-24T18:00:03Z msg=C\n",
+        )
+        .unwrap();
+    drop(child.stdin.take());
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "A\nB\nC\n");
+}
+
+#[test]
+fn sort_by_missing_key_sorts_first() {
+    let mut child = Command::new(riplog_bin())
+        .args(["--sort-by=tag"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(
+            b"msg=middle tag=m\n\
+              msg=last tag=z\n\
+              msg=top\n",
+        )
+        .unwrap();
+    drop(child.stdin.take());
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let want = "msg=top\n\
+                msg=middle tag=m\n\
+                msg=last tag=z\n";
+    assert_eq!(String::from_utf8_lossy(&out.stdout), want);
+}
+
+#[test]
+fn sort_by_on_file_orders_shuffled_input() {
+    let dir = std::env::temp_dir().join("riplog-it");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("sort-by-file.log");
+    fs::write(
+        &path,
+        "time=2026-04-24T18:00:03Z msg=c\n\
+         time=2026-04-24T18:00:01Z msg=a\n\
+         time=2026-04-24T18:00:02Z msg=b\n",
+    )
+    .unwrap();
+    let out = run(&["--sort-by=time", path.to_str().unwrap()]);
+    let want = "time=2026-04-24T18:00:01Z msg=a\n\
+                time=2026-04-24T18:00:02Z msg=b\n\
+                time=2026-04-24T18:00:03Z msg=c\n";
+    assert_eq!(String::from_utf8_lossy(&out.stdout), want);
+}
+
+#[test]
+fn sort_by_composes_with_if_filter() {
+    let path = fixture_path().to_str().unwrap();
+    // critical: deterministic small set. All emitted lines should still be
+    // present, and msg values should be lex-sorted.
+    let out = run(&["--if=level=critical", "--sort-by=msg", path]);
+    let line_count = out.stdout.iter().filter(|&&b| b == b'\n').count();
+    assert_eq!(line_count, N_CRITICAL);
+    // Extract the msg= token from each line and verify ascending order.
+    let msgs: Vec<String> = lines(&out.stdout)
+        .iter()
+        .filter_map(|l| {
+            l.split_whitespace()
+                .find_map(|tok| tok.strip_prefix("msg=").map(str::to_string))
+        })
+        .collect();
+    assert_eq!(msgs.len(), N_CRITICAL);
+    let mut sorted = msgs.clone();
+    sorted.sort();
+    assert_eq!(msgs, sorted);
+}
+
 #[cfg(unix)]
 #[test]
 fn follow_no_reopen_misses_rotation() {

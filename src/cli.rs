@@ -141,4 +141,12 @@ pub struct Cli {
     /// and `-o` is not used.
     #[arg(long, value_enum, default_value_t = ColorMode::Auto, env="COLOR")]
     pub color: ColorMode,
+
+    /// Buffer matched lines and emit them at end sorted by `<KEY>`'s value
+    /// (lexicographic). Lines lacking the key sort first (as if their value
+    /// were the empty string). **Holds every matched line in memory** —
+    /// narrow with `--if` first if the input is large. Composes with
+    /// `--raw-key` (the emitted unescaped values are sorted by `<KEY>`).
+    #[arg(long = "sort-by", value_name = "KEY")]
+    pub sort_by: Option<String>,
 }
