@@ -318,15 +318,15 @@ impl TimeFilter {
         let Some(ts) = timestamp::extract_timestamp(pairs) else {
             return false;
         };
-        if let Some(t1) = self.from
-            && ts < t1
-        {
-            return false;
+        if let Some(t1) = self.from {
+            if ts < t1 {
+                return false;
+            }
         }
-        if let Some(t2) = self.to
-            && ts > t2
-        {
-            return false;
+        if let Some(t2) = self.to {
+            if ts > t2 {
+                return false;
+            }
         }
         true
     }
@@ -627,19 +627,18 @@ fn stream_plan<W: Write>(
     stream_bounded(&mut reader, max_bytes, filter, &tf, output, sinks)?;
     output.flush()?;
 
-    if let Some(handle) = file_for_reopen
-        && !interrupted()
-        && !sinks.done()
-    {
-        follow_loop(
-            path,
-            handle,
-            reader,
-            cli.follow_reopen,
-            filter,
-            output,
-            sinks,
-        )?;
+    if let Some(handle) = file_for_reopen {
+        if !interrupted() && !sinks.done() {
+            follow_loop(
+                path,
+                handle,
+                reader,
+                cli.follow_reopen,
+                filter,
+                output,
+                sinks,
+            )?;
+        }
     }
 
     Ok(())
@@ -1049,16 +1048,18 @@ fn follow_loop<W: Write>(
         let n = reader.read_until(b'\n', &mut line_buf)?;
         if n == 0 {
             output.flush()?;
-            if reopen && let Some((new_handle, new_reader)) = check_rotation(path, &handle, pos)? {
-                log::info!(
-                    "follow: file rotated/truncated; reopening {}",
-                    path.display()
-                );
-                handle = new_handle;
-                reader = new_reader;
-                pos = 0;
-                line_buf.clear();
-                continue;
+            if reopen {
+                if let Some((new_handle, new_reader)) = check_rotation(path, &handle, pos)? {
+                    log::info!(
+                        "follow: file rotated/truncated; reopening {}",
+                        path.display()
+                    );
+                    handle = new_handle;
+                    reader = new_reader;
+                    pos = 0;
+                    line_buf.clear();
+                    continue;
+                }
             }
             std::thread::sleep(FOLLOW_POLL);
             continue;
@@ -1102,11 +1103,12 @@ fn check_rotation(
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if !should_reopen
-            && let Ok(cur_meta) = current.metadata()
-            && (path_meta.ino() != cur_meta.ino() || path_meta.dev() != cur_meta.dev())
-        {
-            should_reopen = true;
+        if !should_reopen {
+            if let Ok(cur_meta) = current.metadata() {
+                if path_meta.ino() != cur_meta.ino() || path_meta.dev() != cur_meta.dev() {
+                    should_reopen = true;
+                }
+            }
         }
     }
     if !should_reopen {

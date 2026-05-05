@@ -1,3 +1,5 @@
+#![deny(unsafe_code)]
+
 mod bisect;
 mod cli;
 mod filter;

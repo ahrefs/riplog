@@ -40,7 +40,12 @@ pub fn parse_rfc3339_nanos(s: &str) -> Option<Timestamp> {
     }
     let second = parse_uint(&b[17..19])?;
 
-    if month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || minute > 59 || second > 60 {
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
         return None;
     }
 
@@ -103,11 +108,9 @@ pub fn parse_rfc3339_nanos(s: &str) -> Option<Timestamp> {
     let secs_of_day = hour as i64 * 3600 + minute as i64 * 60 + second as i64;
     let utc_secs = epoch_days * 86_400 + secs_of_day - tz_offset_secs;
 
-    Some(
-        utc_secs
-            .checked_mul(1_000_000_000)?
-            .checked_add(nanos_frac)?,
-    )
+    utc_secs
+        .checked_mul(1_000_000_000)?
+        .checked_add(nanos_frac)
 }
 
 const NANOS_PER_DAY: i64 = 86_400 * 1_000_000_000;

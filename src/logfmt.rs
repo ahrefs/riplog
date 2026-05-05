@@ -1,5 +1,10 @@
 //! Small zero-copy logfmt parser.
 
+// Whitelisted: the parser uses `MaybeUninit` slot writes + `from_utf8_unchecked`
+// on validated UTF-8 sub-ranges to keep the per-line hot path allocation- and
+// validation-free. Each `unsafe` block carries its own `SAFETY:` comment.
+#![allow(unsafe_code)]
+
 use memchr::{memchr, memchr2};
 use std::mem::MaybeUninit;
 

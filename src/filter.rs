@@ -96,16 +96,12 @@ impl Predicate {
                 // Discriminate on the parse-time-known rhs first so we don't
                 // do per-line value-side work that's guaranteed to be unused
                 // (e.g. lowercase-into-buffer for `dur>=100`).
-                let cmp = if let Some(b) = self.rhs_level
-                    && let Some(a) = level_rank(value)
-                {
-                    a.cmp(&b)
-                } else if let Some(b) = self.rhs_num
-                    && let Ok(a) = value.parse::<f64>()
-                {
-                    a.partial_cmp(&b).unwrap_or(Ordering::Equal)
-                } else {
-                    value.cmp(self.rhs.as_str())
+                let cmp = match (self.rhs_level, level_rank(value)) {
+                    (Some(b), Some(a)) => a.cmp(&b),
+                    _ => match (self.rhs_num, value.parse::<f64>()) {
+                        (Some(b), Ok(a)) => a.partial_cmp(&b).unwrap_or(Ordering::Equal),
+                        _ => value.cmp(self.rhs.as_str()),
+                    },
                 };
                 match self.op {
                     Op::Lt => cmp == Ordering::Less,

@@ -1,8 +1,26 @@
 [package]
 name = "riplog"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 publish = false
+description = "Slice and filter logfmt streams: bisect by timestamp and apply boolean filters per line."
+license = "MIT OR Apache-2.0"
+authors = ["Simon Cruanes <simon.cruanes@ahrefs.com>"]
+readme = "README.md"
+repository = "https://github.com/c-cube/riplog"
+
+[package.metadata.deb]
+section = "utils"
+priority = "optional"
+assets = [
+    ["target/release/riplog", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/riplog/README.md", "644"],
+]
+extended-description = """\
+riplog reads one or more logfmt files (or stdin), bisects on timestamp
+when given a time window, and applies boolean filters per line. Useful
+for slicing large rotated log files by time range and key/value queries
+without having to grep + awk by hand."""
 
 [features]
 default = []
