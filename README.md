@@ -16,6 +16,11 @@ straddles a log rotation works as expected. `-f`/`-F` is attached to
 the *last* file — `riplog foo.log.1 foo.log -F` reads the rotated log,
 then the current log, then keeps tailing it.
 
+## Install
+
+Clone this and `cargo install --path=.` from inside the repo should do it.
+Make sure `~/.cargo/bin` is in your path.
+
 ## Time slicing
 
 - `--from <T>`, `--to <T>`: bounds. Forms: RFC 3339
