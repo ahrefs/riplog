@@ -2,6 +2,7 @@ mod bisect;
 mod cli;
 mod filter;
 mod logfmt;
+mod parallel;
 mod run;
 mod sort;
 mod timestamp;

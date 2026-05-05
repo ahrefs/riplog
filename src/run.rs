@@ -11,6 +11,7 @@ use std::{
     fs::File,
     io::{BufRead, BufReader, BufWriter, IsTerminal, Read, Seek, SeekFrom, Write},
     path::Path,
+    sync::Arc,
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
@@ -80,6 +81,10 @@ impl KeyGather {
             return Ok(());
         }
         emit_sorted(&self.keys, out)
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.keys.extend(other.keys);
     }
 }
 
@@ -169,6 +174,13 @@ impl ValueGather {
         }
         Ok(())
     }
+
+    fn merge(&mut self, other: Self) {
+        debug_assert_eq!(self.values.len(), other.values.len());
+        for (a, b) in self.values.iter_mut().zip(other.values) {
+            a.extend(b);
+        }
+    }
 }
 
 /// Per-line value extractor: for each matched line, emit the unquoted,
@@ -188,7 +200,11 @@ impl RawExtractor {
         }
     }
 
-    fn emit<W: Write>(&mut self, pairs: &[(&str, &str)], out: &mut W) -> std::io::Result<()> {
+    fn emit<W: Write + ?Sized>(
+        &mut self,
+        pairs: &[(&str, &str)],
+        out: &mut W,
+    ) -> std::io::Result<()> {
         let Some(key) = self.key.as_deref() else {
             return Ok(());
         };
@@ -255,13 +271,20 @@ impl Counter {
         }
         Ok(())
     }
+
+    fn merge(&mut self, other: Self) {
+        for (combo, count) in other.counts {
+            *self.counts.entry(combo).or_insert(0) += count;
+        }
+    }
 }
 
 /// Random per-line sampling. When `sample_if` is set, only lines matching it
 /// are subject to the dice roll; all other matched lines pass through.
-struct Sampler {
+#[derive(Clone)]
+pub(crate) struct Sampler {
     rate: f64,
-    sample_if: Option<Filter>,
+    sample_if: Option<Arc<Filter>>,
 }
 
 impl Sampler {
@@ -278,7 +301,7 @@ impl Sampler {
 /// Lines with no parseable timestamp are dropped when either bound is set
 /// (we can't prove they're in range).
 #[derive(Default, Clone, Copy)]
-struct TimeFilter {
+pub(crate) struct TimeFilter {
     from: Option<Timestamp>,
     to: Option<Timestamp>,
 }
@@ -318,6 +341,10 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
         anyhow::bail!("`--time-range` cannot be combined with `-f` or `-F`");
     }
 
+    if resolve_parallelism(cli) > 1 && cli.limit.is_some() {
+        anyhow::bail!("`-j`/`--parallel` cannot be combined with `-n`/`--limit`");
+    }
+
     let filter = Filter::parse(&cli.keys)?;
     let following = cli.follow || cli.follow_reopen;
     let suppress_lines = cli.list_keys
@@ -327,17 +354,7 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
         || cli.raw_key.is_some();
     let tz = timestamp::resolve_tz(cli.tz.as_deref())?;
 
-    let sampler = match (cli.sample_rate, cli.sample_if.as_deref()) {
-        (None, Some(_)) => anyhow::bail!("--sample-if requires --sample-rate"),
-        (None, None) => None,
-        (Some(rate), _) if !(0.0..=1.0).contains(&rate) => {
-            anyhow::bail!("--sample-rate must be in [0, 1], got {rate}")
-        }
-        (Some(rate), sample_if) => Some(Sampler {
-            rate,
-            sample_if: sample_if.map(Filter::parse_one).transpose()?,
-        }),
-    };
+    let sampler = build_sampler(cli)?;
 
     let colorize = match cli.color {
         ColorMode::Always => true,
@@ -345,23 +362,16 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
         ColorMode::Auto => cli.output.is_none() && std::io::stdout().is_terminal(),
     };
 
-    let mut output: Box<dyn Write> = match &cli.output {
+    // `Send` so the parallel path can hand `&mut output` to its workers
+    // through a shared `Mutex`. Using the unlocked `Stdout` (rather than
+    // `stdout().lock()`) makes this cross-thread-safe; the per-call lock
+    // inside `Stdout::write` is amortised by `BufWriter` batching.
+    let mut output: Box<dyn Write + Send> = match &cli.output {
         Some(path) => Box::new(BufWriter::new(File::create(path)?)),
-        None => Box::new(BufWriter::new(std::io::stdout().lock())),
+        None => Box::new(BufWriter::new(std::io::stdout())),
     };
 
-    let mut sinks = Sinks {
-        stats: Stats::default(),
-        counter: Counter::new(cli.count_by.iter().map(SmartString::from).collect()),
-        keys: KeyGather::new(cli.list_keys),
-        values: ValueGather::new(cli.list_values_for.iter().map(SmartString::from).collect()),
-        raw: RawExtractor::new(cli.raw_key.as_deref()),
-        sampler,
-        sort_buf: cli.sort_by.as_deref().map(SortBuffer::new),
-        suppress_lines,
-        colorize,
-        limit: cli.limit,
-    };
+    let mut sinks = make_sinks(cli, sampler.clone(), suppress_lines, colorize);
 
     let need_seek = cli.from.is_some() || cli.to.is_some() || following || cli.time_range;
     if cli.files.is_empty() {
@@ -462,11 +472,30 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
 
     // Phase 2: stream each planned range in order. Only the last file may
     // attach the follow loop (set during planning).
+    let n_workers = resolve_parallelism(cli);
     for plan in plans {
         if interrupted() || sinks.done() {
             break;
         }
-        stream_plan(plan, cli, &filter, &mut output, &mut sinks)?;
+        if n_workers > 1 && !plan.follow_this_file {
+            crate::parallel::run(
+                plan.path,
+                plan.start_byte,
+                plan.max_bytes,
+                plan.tf,
+                n_workers,
+                cli,
+                &filter,
+                sampler.clone(),
+                suppress_lines,
+                colorize,
+                &mut output,
+                &mut sinks,
+            )?;
+            output.flush()?;
+        } else {
+            stream_plan(plan, cli, &filter, &mut output, &mut sinks)?;
+        }
     }
 
     output.flush()?;
@@ -566,11 +595,11 @@ fn plan_file<'a>(
 /// Phase 2: open `plan.path`, seek to the planned start, stream the bounded
 /// byte range through filters and sinks, then optionally attach the follow
 /// loop.
-fn stream_plan(
+fn stream_plan<W: Write>(
     plan: FilePlan<'_>,
     cli: &Cli,
     filter: &Filter,
-    output: &mut Box<dyn Write>,
+    output: &mut W,
     sinks: &mut Sinks,
 ) -> anyhow::Result<()> {
     let FilePlan {
@@ -653,6 +682,16 @@ impl Default for Stats {
 }
 
 impl Stats {
+    fn merge(&mut self, other: Self) {
+        self.bytes += other.bytes;
+        self.matched_lines += other.matched_lines;
+        self.total_lines += other.total_lines;
+        self.invalid_utf += other.invalid_utf;
+        self.pairs += other.pairs;
+        self.overflow += other.overflow;
+        // `started` stays as the master's earliest start time.
+    }
+
     fn report(&self) {
         let elapsed = self.started.elapsed().as_secs_f64();
         let rate = if elapsed > 0.0 {
@@ -676,7 +715,7 @@ impl Stats {
 
 /// Bundles per-line bookkeeping (stats + summarisers) so the streaming
 /// helpers don't drown in arguments.
-struct Sinks {
+pub(crate) struct Sinks {
     stats: Stats,
     counter: Counter,
     keys: KeyGather,
@@ -694,10 +733,77 @@ impl Sinks {
     fn done(&self) -> bool {
         matches!(self.limit, Some(n) if self.stats.matched_lines >= n)
     }
+
+    /// Fold per-worker collected state into `self`. `started` and the
+    /// configuration fields (`suppress_lines`, `colorize`, `limit`, ...)
+    /// are kept from `self`.
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.stats.merge(other.stats);
+        self.counter.merge(other.counter);
+        self.keys.merge(other.keys);
+        self.values.merge(other.values);
+        if let (Some(a), Some(b)) = (self.sort_buf.as_mut(), other.sort_buf) {
+            a.merge(b);
+        }
+    }
+}
+
+/// Resolve `--parallel` to a worker count. `None` → 1 (sequential).
+/// `Some(0)` → all available cores (set by `default_missing_value` when the
+/// flag is given without a value). `Some(n)` → `n` workers.
+pub(crate) fn resolve_parallelism(cli: &Cli) -> usize {
+    match cli.parallel {
+        None => 1,
+        Some(0) => std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1),
+        Some(n) => n,
+    }
+}
+
+/// Parse the sampler config out of `--sample-rate` / `--sample-if`. Done
+/// once up front so workers can clone it cheaply (the inner `Filter` is
+/// shared via `Arc`).
+fn build_sampler(cli: &Cli) -> anyhow::Result<Option<Sampler>> {
+    match (cli.sample_rate, cli.sample_if.as_deref()) {
+        (None, Some(_)) => anyhow::bail!("--sample-if requires --sample-rate"),
+        (None, None) => Ok(None),
+        (Some(rate), _) if !(0.0..=1.0).contains(&rate) => {
+            anyhow::bail!("--sample-rate must be in [0, 1], got {rate}")
+        }
+        (Some(rate), sample_if) => Ok(Some(Sampler {
+            rate,
+            sample_if: sample_if.map(Filter::parse_one).transpose()?.map(Arc::new),
+        })),
+    }
+}
+
+/// Construct a fresh `Sinks` for the master or a worker. Configuration
+/// fields are derived from `cli`; the `sampler` template is cloned in (its
+/// inner `Arc<Filter>` is shared, so cloning is cheap). All collected
+/// state (counts, gathers, sort buffer) starts empty.
+pub(crate) fn make_sinks(
+    cli: &Cli,
+    sampler: Option<Sampler>,
+    suppress_lines: bool,
+    colorize: bool,
+) -> Sinks {
+    Sinks {
+        stats: Stats::default(),
+        counter: Counter::new(cli.count_by.iter().map(SmartString::from).collect()),
+        keys: KeyGather::new(cli.list_keys),
+        values: ValueGather::new(cli.list_values_for.iter().map(SmartString::from).collect()),
+        raw: RawExtractor::new(cli.raw_key.as_deref()),
+        sampler,
+        sort_buf: cli.sort_by.as_deref().map(SortBuffer::new),
+        suppress_lines,
+        colorize,
+        limit: cli.limit,
+    }
 }
 
 /// Read a fixed byte budget from `reader`, write matching lines to `output`.
-fn stream_bounded<R: BufRead, W: Write>(
+pub(crate) fn stream_bounded<R: BufRead, W: Write + ?Sized>(
     reader: &mut R,
     max_bytes: u64,
     filter: &Filter,
@@ -755,7 +861,7 @@ fn stream_unbounded<R: Read, W: Write>(
     Ok(())
 }
 
-fn process_line<W: Write>(
+fn process_line<W: Write + ?Sized>(
     line_buf: &mut Vec<u8>,
     filter: &Filter,
     tf: &TimeFilter,
@@ -831,7 +937,7 @@ fn process_line<W: Write>(
 /// followed by the full line (colored or raw) unless line output is
 /// suppressed by an aggregation/raw-key mode.
 #[allow(clippy::too_many_arguments)]
-fn emit_match<W: Write>(
+fn emit_match<W: Write + ?Sized>(
     parsed: &[(&str, &str)],
     line_buf: &[u8],
     raw_len: usize,
@@ -868,7 +974,10 @@ fn level_color(value: &str) -> &'static str {
     }
 }
 
-fn write_colored_line<W: Write>(out: &mut W, pairs: &[(&str, &str)]) -> std::io::Result<()> {
+fn write_colored_line<W: Write + ?Sized>(
+    out: &mut W,
+    pairs: &[(&str, &str)],
+) -> std::io::Result<()> {
     let lvl_sgr = pairs
         .iter()
         .find_map(|(k, v)| (*k == "level").then(|| level_color(v)))
@@ -893,7 +1002,12 @@ fn write_colored_line<W: Write>(out: &mut W, pairs: &[(&str, &str)]) -> std::io:
 /// Emit a value with optional color and bold. If the value is wrapped in
 /// double quotes, the quote characters are highlighted so the content
 /// boundary is easy to spot.
-fn write_value<W: Write>(out: &mut W, v: &str, color: &str, bold: bool) -> std::io::Result<()> {
+fn write_value<W: Write + ?Sized>(
+    out: &mut W,
+    v: &str,
+    color: &str,
+    bold: bool,
+) -> std::io::Result<()> {
     let b = v.as_bytes();
     let quoted = b.len() >= 2 && b[0] == b'"' && b[b.len() - 1] == b'"';
     let inner = if quoted { &v[1..v.len() - 1] } else { v };

@@ -46,6 +46,10 @@ impl SortBuffer {
         Ok(())
     }
 
+    pub fn merge(&mut self, other: Self) {
+        self.rows.extend(other.rows);
+    }
+
     pub fn emit<W: Write>(mut self, out: &mut W) -> std::io::Result<()> {
         self.rows.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         for (_, bytes) in &self.rows {

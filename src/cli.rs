@@ -149,4 +149,15 @@ pub struct Cli {
     /// `--raw-key` (the emitted unescaped values are sorted by `<KEY>`).
     #[arg(long = "sort-by", value_name = "KEY")]
     pub sort_by: Option<String>,
+
+    /// Search a single file in parallel. `-j` (no value) uses every available
+    /// core; `-j=4` uses 4 worker threads. Output is **unordered** — workers
+    /// emit matched lines as they go. Pipe through `--sort-by` or external
+    /// `sort` if you need a deterministic order. Falls back to sequential for
+    /// stdin, follow mode (`-f`/`-F`), and small inputs. Cannot be combined
+    /// with `-n`/`--limit`.
+    #[arg(short = 'j', long = "parallel", value_name = "N",
+          num_args = 0..=1, default_missing_value = "0",
+          require_equals = true)]
+    pub parallel: Option<usize>,
 }
