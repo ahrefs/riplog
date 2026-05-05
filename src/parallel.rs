@@ -24,7 +24,7 @@ const FLUSH_BYTES: usize = 64 * 1024;
 /// Inputs for one parallel search invocation. All references share a single
 /// lifetime since the call site (the file-plan loop in `run::run`) borrows
 /// each from the same scope.
-pub(crate) struct Job<'a, W: Write + Send + ?Sized> {
+pub(crate) struct Job<'a> {
     pub path: &'a Path,
     pub start_byte: u64,
     pub max_bytes: u64,
@@ -35,14 +35,14 @@ pub(crate) struct Job<'a, W: Write + Send + ?Sized> {
     pub sampler: Option<Sampler>,
     pub suppress_lines: bool,
     pub colorize: bool,
-    pub output: &'a mut W,
+    pub output: &'a mut (dyn Write + Send),
     pub master: &'a mut Sinks,
 }
 
 /// Spawn `job.n_workers` threads searching disjoint chunks of `job.path`
 /// over `[start_byte, start_byte + max_bytes)`. Falls back to a single
 /// sequential pass on `job.master` if the range is too small to split.
-pub(crate) fn run<W: Write + Send + ?Sized>(job: Job<'_, W>) -> anyhow::Result<()> {
+pub(crate) fn run(job: Job<'_>) -> anyhow::Result<()> {
     let Job {
         path,
         start_byte,
@@ -80,7 +80,7 @@ pub(crate) fn run<W: Write + Send + ?Sized>(job: Job<'_, W>) -> anyhow::Result<(
         end_byte - start_byte
     );
 
-    let shared_out: Mutex<&mut W> = Mutex::new(output);
+    let shared_out: Mutex<&mut (dyn Write + Send)> = Mutex::new(output);
     let worker_sinks: Vec<Sinks> = std::thread::scope(|s| -> anyhow::Result<Vec<Sinks>> {
         let handles: Vec<_> = chunks
             .iter()
@@ -174,13 +174,13 @@ fn snap_forward_to_newline(file: &mut File, from: u64, cap: u64) -> std::io::Res
 /// shared writer behind a `Mutex` once the local buffer crosses
 /// `FLUSH_BYTES`. Output across workers is unordered, but a single flush is
 /// contiguous so individual lines are never split mid-byte.
-struct UnorderedSink<'a, W: Write + ?Sized> {
+struct UnorderedSink<'a> {
     local: Vec<u8>,
-    shared: &'a Mutex<&'a mut W>,
+    shared: &'a Mutex<&'a mut (dyn Write + Send)>,
 }
 
-impl<'a, W: Write + ?Sized> UnorderedSink<'a, W> {
-    fn new(shared: &'a Mutex<&'a mut W>) -> Self {
+impl<'a> UnorderedSink<'a> {
+    fn new(shared: &'a Mutex<&'a mut (dyn Write + Send)>) -> Self {
         Self {
             local: Vec::with_capacity(FLUSH_BYTES),
             shared,
@@ -198,7 +198,7 @@ impl<'a, W: Write + ?Sized> UnorderedSink<'a, W> {
     }
 }
 
-impl<W: Write + ?Sized> Write for UnorderedSink<'_, W> {
+impl Write for UnorderedSink<'_> {
     fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
         self.local.extend_from_slice(data);
         if self.local.len() >= FLUSH_BYTES {

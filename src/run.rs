@@ -489,7 +489,7 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
                 sampler: sampler.clone(),
                 suppress_lines,
                 colorize,
-                output: &mut output,
+                output: &mut *output,
                 master: &mut sinks,
             })?;
             output.flush()?;
