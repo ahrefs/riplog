@@ -21,24 +21,43 @@ pub(crate) const MIN_BYTES_PER_WORKER: u64 = 4 * 1024 * 1024;
 /// Per-worker batch size before a flush to the shared writer.
 const FLUSH_BYTES: usize = 64 * 1024;
 
-/// Spawn `n_workers` threads searching disjoint chunks of `path` over
-/// `[start_byte, start_byte + max_bytes)`. Falls back to a single
-/// sequential pass on `master` if the range is too small to split.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn run<W: Write + Send + ?Sized>(
-    path: &Path,
-    start_byte: u64,
-    max_bytes: u64,
-    tf: TimeFilter,
-    n_workers: usize,
-    cli: &Cli,
-    filter: &Filter,
-    sampler: Option<Sampler>,
-    suppress_lines: bool,
-    colorize: bool,
-    output: &mut W,
-    master: &mut Sinks,
-) -> anyhow::Result<()> {
+/// Inputs for one parallel search invocation. All references share a single
+/// lifetime since the call site (the file-plan loop in `run::run`) borrows
+/// each from the same scope.
+pub(crate) struct Job<'a, W: Write + Send + ?Sized> {
+    pub path: &'a Path,
+    pub start_byte: u64,
+    pub max_bytes: u64,
+    pub tf: TimeFilter,
+    pub n_workers: usize,
+    pub cli: &'a Cli,
+    pub filter: &'a Filter,
+    pub sampler: Option<Sampler>,
+    pub suppress_lines: bool,
+    pub colorize: bool,
+    pub output: &'a mut W,
+    pub master: &'a mut Sinks,
+}
+
+/// Spawn `job.n_workers` threads searching disjoint chunks of `job.path`
+/// over `[start_byte, start_byte + max_bytes)`. Falls back to a single
+/// sequential pass on `job.master` if the range is too small to split.
+pub(crate) fn run<W: Write + Send + ?Sized>(job: Job<'_, W>) -> anyhow::Result<()> {
+    let Job {
+        path,
+        start_byte,
+        max_bytes,
+        tf,
+        n_workers,
+        cli,
+        filter,
+        sampler,
+        suppress_lines,
+        colorize,
+        output,
+        master,
+    } = job;
+
     let end_byte = start_byte.saturating_add(max_bytes);
     let chunks = {
         let mut probe = File::open(path)?;

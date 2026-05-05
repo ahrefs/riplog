@@ -478,20 +478,20 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
             break;
         }
         if n_workers > 1 && !plan.follow_this_file {
-            crate::parallel::run(
-                plan.path,
-                plan.start_byte,
-                plan.max_bytes,
-                plan.tf,
+            crate::parallel::run(crate::parallel::Job {
+                path: plan.path,
+                start_byte: plan.start_byte,
+                max_bytes: plan.max_bytes,
+                tf: plan.tf,
                 n_workers,
                 cli,
-                &filter,
-                sampler.clone(),
+                filter: &filter,
+                sampler: sampler.clone(),
                 suppress_lines,
                 colorize,
-                &mut output,
-                &mut sinks,
-            )?;
+                output: &mut output,
+                master: &mut sinks,
+            })?;
             output.flush()?;
         } else {
             stream_plan(plan, cli, &filter, &mut output, &mut sinks)?;
