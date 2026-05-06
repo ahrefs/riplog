@@ -12,7 +12,7 @@ use std::sync::Mutex;
 
 use crate::cli::Cli;
 use crate::filter::Filter;
-use crate::run::{Sampler, Sinks, TimeFilter, make_sinks, stream_bounded};
+use crate::run::{make_sinks, stream_bounded, BucketSpec, Sampler, Sinks, TimeFilter};
 
 /// Below this many bytes per worker, parallel mode falls back to sequential —
 /// the fixed per-thread overhead would dominate the per-byte work.
@@ -35,6 +35,7 @@ pub(crate) struct Job<'a> {
     pub sampler: Option<Sampler>,
     pub suppress_lines: bool,
     pub colorize: bool,
+    pub bucket: Option<BucketSpec>,
     pub output: &'a mut (dyn Write + Send),
     pub master: &'a mut Sinks,
 }
@@ -54,6 +55,7 @@ pub(crate) fn run(job: Job<'_>) -> anyhow::Result<()> {
         sampler,
         suppress_lines,
         colorize,
+        bucket,
         output,
         master,
     } = job;
@@ -88,7 +90,7 @@ pub(crate) fn run(job: Job<'_>) -> anyhow::Result<()> {
                 let sampler = sampler.clone();
                 let shared = &shared_out;
                 s.spawn(move || -> anyhow::Result<Sinks> {
-                    let mut sinks = make_sinks(cli, sampler, suppress_lines, colorize);
+                    let mut sinks = make_sinks(cli, sampler, suppress_lines, colorize, bucket);
                     let mut file = File::open(path)?;
                     file.seek(SeekFrom::Start(cs))?;
                     let mut reader = BufReader::new(file);

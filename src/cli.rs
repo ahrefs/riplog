@@ -14,7 +14,7 @@ pub enum ColorMode {
 #[command(about = "Slice and filter logfmt streams.", term_width = 80)]
 pub struct Cli {
     /// Input file(s). If omitted, reads from stdin. Multiple files are
-    /// processed in order; aggregated output (`--count`, `--count-by`,
+    /// processed in order; aggregated output (`--count`, `--group-by`,
     /// `--list-keys`, `--list-values-for`) is emitted once at the end and
     /// reflects the union of all files.
     /// Note: `--from`/`--to` are applied per file (each file is bisected
@@ -74,13 +74,34 @@ pub struct Cli {
     #[arg(short = 'o', long)]
     pub output: Option<PathBuf>,
 
-    /// Suppress line output; group matched lines by the value of one or more
-    /// keys and print a count table at the end. Repeatable, and a single
-    /// flag may carry a comma-separated list — `--count-by level,facil` and
-    /// `--count-by level --count-by facil` both produce one row per
-    /// (level, facil) combination.
-    #[arg(long = "count-by", value_delimiter = ',')]
-    pub count_by: Vec<String>,
+    /// Group matched lines by the value of one or more keys (requires
+    /// `--count`). Emits one logfmt row per combination at the end:
+    /// `count=N <group keys> [bucket=...] ts_start=... ts_end=...`.
+    /// Repeatable, and a single flag may carry a comma-separated list —
+    /// `--group-by level,facil` and `--group-by level --group-by facil`
+    /// both produce one row per (level, facil) combination. `ts_start` and
+    /// `ts_end` are the min/max timestamps observed in the group; they are
+    /// omitted for groups with no parseable timestamp.
+    #[arg(long = "group-by", value_delimiter = ',', requires = "count")]
+    pub group_by: Vec<String>,
+
+    /// Add a fixed-width, epoch-aligned time bucket dimension to the
+    /// grouping. Same duration syntax as `--from start+<dur>` (`5m`, `30s`,
+    /// `2 hours`). Requires `--count`. Conflicts with `--n-buckets`.
+    #[arg(
+        long,
+        value_name = "DURATION",
+        requires = "count",
+        conflicts_with = "n_buckets"
+    )]
+    pub bucket: Option<String>,
+
+    /// Divide the active time range into `N` equal-width buckets aligned to
+    /// the window start. Window comes from `--from`/`--to` when set, else
+    /// from the file's first/last timestamps. Requires `--count` and a file
+    /// argument. Conflicts with `--bucket`.
+    #[arg(long = "n-buckets", value_name = "N", requires = "count")]
+    pub n_buckets: Option<usize>,
 
     /// Suppress line output; instead, gather every distinct key seen on
     /// matched lines and print the sorted list at the end.

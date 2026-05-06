@@ -11,8 +11,8 @@ use std::{
     fs::File,
     io::{BufRead, BufReader, BufWriter, IsTerminal, Read, Seek, SeekFrom, Write},
     path::Path,
-    sync::Arc,
     sync::atomic::{AtomicBool, Ordering},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -216,19 +216,97 @@ impl RawExtractor {
     }
 }
 
-/// Counts matched lines grouped by the value tuple of `keys`. Missing keys
-/// produce an empty `SmartString` slot (rendered as `key=` in the report).
+/// Aggregated stats for a single (group-keys [, bucket]) combination.
+#[derive(Default)]
+struct GroupStats {
+    count: usize,
+    min_ts: Option<Timestamp>,
+    max_ts: Option<Timestamp>,
+}
+
+#[inline]
+fn fold_min(slot: &mut Option<Timestamp>, t: Timestamp) {
+    *slot = Some(slot.map_or(t, |cur| cur.min(t)));
+}
+
+#[inline]
+fn fold_max(slot: &mut Option<Timestamp>, t: Timestamp) {
+    *slot = Some(slot.map_or(t, |cur| cur.max(t)));
+}
+
+impl GroupStats {
+    fn record(&mut self, ts: Option<Timestamp>) {
+        self.count += 1;
+        if let Some(t) = ts {
+            fold_min(&mut self.min_ts, t);
+            fold_max(&mut self.max_ts, t);
+        }
+    }
+
+    fn merge(&mut self, other: GroupStats) {
+        self.count += other.count;
+        if let Some(t) = other.min_ts {
+            fold_min(&mut self.min_ts, t);
+        }
+        if let Some(t) = other.max_ts {
+            fold_max(&mut self.max_ts, t);
+        }
+    }
+}
+
+/// Time bucketing config: width in nanoseconds, plus the origin the bucket
+/// grid is aligned to. `--bucket=DURATION` uses origin=0 (epoch-aligned, so
+/// 5-minute buckets fall on `:00`, `:05`, ...). `--n-buckets=N` uses
+/// origin=window-start *and* `n_buckets=Some(N)`, which clamps the bucket
+/// index to `[0, N-1]` so a line at the inclusive `end` boundary lands in
+/// the last bucket instead of overflowing into an N+1-th one.
+#[derive(Clone, Copy)]
+pub(crate) struct BucketSpec {
+    nanos: i64,
+    origin: i64,
+    /// When set, clamps the bucket index to `[0, n_buckets-1]`.
+    n_buckets: Option<usize>,
+}
+
+impl BucketSpec {
+    #[inline]
+    fn floor(&self, ts: Timestamp) -> i64 {
+        let mut idx = (ts - self.origin).div_euclid(self.nanos);
+        if let Some(n) = self.n_buckets {
+            let max = (n as i64) - 1;
+            if idx < 0 {
+                idx = 0;
+            } else if idx > max {
+                idx = max;
+            }
+        }
+        self.origin + idx * self.nanos
+    }
+}
+
+/// Map key for one group. The user-keys combo and the bucket boundary are
+/// kept as separate typed fields rather than smushed into a single
+/// `SmallVec<SmartString>`, which avoids a per-line `format!` + reverse
+/// `parse::<i64>()` round-trip on the hot path.
+type GroupKey = (Combo, Option<Timestamp>);
+
+/// Groups matched lines by the value tuple of `keys` (and optionally a time
+/// bucket) and records per-group count + observed timestamp range. Missing
+/// user keys produce an empty value slot (rendered as `key.<k>=""` in the
+/// logfmt report).
 #[derive(Default)]
 struct Counter {
     keys: Vec<SmartString>,
-    counts: RapidHashMap<Combo, usize>,
+    bucket: Option<BucketSpec>,
+    counts: RapidHashMap<GroupKey, GroupStats>,
     scratch: String,
 }
 
 impl Counter {
-    fn new(keys: Vec<SmartString>) -> Self {
+    fn new(keys: Vec<SmartString>, bucket: Option<BucketSpec>) -> Self {
         Self {
             keys,
+            bucket,
             counts: RapidHashMap::default(),
             scratch: String::new(),
         }
@@ -236,13 +314,20 @@ impl Counter {
 
     #[inline]
     fn is_active(&self) -> bool {
-        !self.keys.is_empty()
+        !self.keys.is_empty() || self.bucket.is_some()
     }
 
-    fn record(&mut self, pairs: &[(&str, &str)]) {
+    fn record(&mut self, pairs: &[(&str, &str)], ts: Option<Timestamp>) {
         if !self.is_active() {
             return;
         }
+        let bucket_ts = match (self.bucket, ts) {
+            (Some(b), Some(t)) => Some(b.floor(t)),
+            // Bucketing on but the line has no timestamp — can't place it.
+            (Some(_), None) => return,
+            (None, _) => None,
+        };
+
         let mut combo: Combo = SmallVec::with_capacity(self.keys.len());
         for k in &self.keys {
             let mut value = SmartString::new_const();
@@ -251,21 +336,38 @@ impl Counter {
             }
             combo.push(value);
         }
-        *self.counts.entry(combo).or_insert(0) += 1;
+        self.counts
+            .entry((combo, bucket_ts))
+            .or_default()
+            .record(ts);
     }
 
-    fn report<W: Write>(&self, out: &mut W) -> std::io::Result<()> {
+    fn report<W: Write>(&self, out: &mut W, tz: &jiff::tz::TimeZone) -> std::io::Result<()> {
         if !self.is_active() || self.counts.is_empty() {
             return Ok(());
         }
-        let mut entries: Vec<(&Combo, &usize)> = self.counts.iter().collect();
-        // Descending by count, ties broken by combo for deterministic output.
-        entries.sort_unstable_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
-        let count_w = entries[0].1.to_string().len();
-        for (combo, count) in entries {
-            write!(out, "{count:>count_w$}")?;
+        let mut entries: Vec<(&GroupKey, &GroupStats)> = self.counts.iter().collect();
+        // Descending by count, ties broken by key for deterministic output.
+        entries.sort_unstable_by(|a, b| b.1.count.cmp(&a.1.count).then_with(|| a.0.cmp(b.0)));
+
+        for ((combo, bucket_ts), stats) in entries {
+            write!(out, "count={}", stats.count)?;
             for (k, v) in self.keys.iter().zip(combo.iter()) {
-                write!(out, " {k}={}", v.as_str())?;
+                write!(out, " key.{k}=")?;
+                logfmt::write_logfmt_value(out, v.as_str())?;
+            }
+            if let (Some(bspec), Some(start)) = (self.bucket, *bucket_ts) {
+                let end = start + bspec.nanos;
+                write!(
+                    out,
+                    " bucket.start={}",
+                    timestamp::format_rfc3339(start, tz)
+                )?;
+                write!(out, " bucket.end={}", timestamp::format_rfc3339(end, tz))?;
+            }
+            if let (Some(a), Some(b)) = (stats.min_ts, stats.max_ts) {
+                write!(out, " time.start={}", timestamp::format_rfc3339(a, tz))?;
+                write!(out, " time.end={}", timestamp::format_rfc3339(b, tz))?;
             }
             writeln!(out)?;
         }
@@ -273,8 +375,8 @@ impl Counter {
     }
 
     fn merge(&mut self, other: Self) {
-        for (combo, count) in other.counts {
-            *self.counts.entry(combo).or_insert(0) += count;
+        for (key, stats) in other.counts {
+            self.counts.entry(key).or_default().merge(stats);
         }
     }
 }
@@ -311,11 +413,13 @@ impl TimeFilter {
         self.from.is_none() && self.to.is_none()
     }
 
-    fn matches(&self, pairs: &[(&str, &str)]) -> bool {
+    /// Test the (already-parsed) timestamp against the bounds. `None` means
+    /// the line had no parseable timestamp; with bounds set, that's a drop.
+    fn check(&self, ts: Option<Timestamp>) -> bool {
         if self.is_empty() {
             return true;
         }
-        let Some(ts) = timestamp::extract_timestamp(pairs) else {
+        let Some(ts) = ts else {
             return false;
         };
         if let Some(t1) = self.from {
@@ -350,9 +454,15 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
     let suppress_lines = cli.list_keys
         || cli.count
         || !cli.list_values_for.is_empty()
-        || !cli.count_by.is_empty()
+        || !cli.group_by.is_empty()
+        || cli.bucket.is_some()
+        || cli.n_buckets.is_some()
         || cli.raw_key.is_some();
     let tz = timestamp::resolve_tz(cli.tz.as_deref())?;
+    // The bare-number `--count` line is redundant when grouping/bucketing is
+    // active (each row already carries its `count=`), so suppress it then.
+    let bare_count =
+        cli.count && cli.group_by.is_empty() && cli.bucket.is_none() && cli.n_buckets.is_none();
 
     let sampler = build_sampler(cli)?;
 
@@ -371,13 +481,29 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
         None => Box::new(BufWriter::new(std::io::stdout())),
     };
 
-    let mut sinks = make_sinks(cli, sampler.clone(), suppress_lines, colorize);
-
     let need_seek = cli.from.is_some() || cli.to.is_some() || following || cli.time_range;
     if cli.files.is_empty() {
         if need_seek {
             anyhow::bail!("`-f`, `-F`, `--from`, `--to`, `--time-range` require a file argument");
         }
+        if cli.n_buckets.is_some() {
+            anyhow::bail!(
+                "`--n-buckets` requires a file argument: the bucket width is derived \
+                 from the file's time range"
+            );
+        }
+        // Epoch-aligned grid for `--bucket=DURATION` on stdin.
+        let bucket = cli
+            .bucket
+            .as_deref()
+            .map(timestamp::parse_duration_nanos)
+            .transpose()?
+            .map(|nanos| BucketSpec {
+                nanos,
+                origin: 0,
+                n_buckets: None,
+            });
+        let mut sinks = make_sinks(cli, sampler.clone(), suppress_lines, colorize, bucket);
         stream_unbounded(
             &mut std::io::stdin().lock(),
             &filter,
@@ -386,7 +512,7 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
         )?;
         output.flush()?;
         flush_sort_buf(&mut sinks, &mut output)?;
-        emit_summaries(&sinks, cli.count, &mut output)?;
+        emit_summaries(&sinks, bare_count, &tz, &mut output)?;
         return Ok(());
     }
 
@@ -436,7 +562,8 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
     // the *global* span, not each file's local one — so with two log files
     // around a rotation, `--from start+1h --to start+2h` is one contiguous
     // absolute window applied across both files, not two disjoint slices.
-    let (global_first, global_last) = if cli.from.is_some() || cli.to.is_some() {
+    let need_global = cli.from.is_some() || cli.to.is_some() || cli.n_buckets.is_some();
+    let (global_first, global_last) = if need_global {
         peek_global_window(&cli.files)?
     } else {
         (None, None)
@@ -458,6 +585,15 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
             global_last,
         )?);
     }
+
+    // Resolve the bucket spec now that the time window is known. Two forms:
+    // - `--bucket=DURATION`: epoch-aligned grid (origin = 0).
+    // - `--n-buckets=N`: divide the *active* window into N equal-width slices
+    //   aligned to the window start, so the output has exactly N rows per
+    //   group (no edge-alignment off-by-one).
+    let bucket = resolve_bucket_spec(cli, &tf, global_first, global_last)?;
+
+    let mut sinks = make_sinks(cli, sampler.clone(), suppress_lines, colorize, bucket);
 
     // Phase 1: bisect every file up front against the resolved absolute
     // window. Output is suppressed during planning — only summaries and
@@ -489,6 +625,7 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
                 sampler: sampler.clone(),
                 suppress_lines,
                 colorize,
+                bucket,
                 output: &mut *output,
                 master: &mut sinks,
             })?;
@@ -500,7 +637,7 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
 
     output.flush()?;
     flush_sort_buf(&mut sinks, &mut output)?;
-    emit_summaries(&sinks, cli.count, &mut output)?;
+    emit_summaries(&sinks, bare_count, &tz, &mut output)?;
 
     Ok(())
 }
@@ -644,9 +781,14 @@ fn stream_plan<W: Write>(
     Ok(())
 }
 
-fn emit_summaries<W: Write>(sinks: &Sinks, count_only: bool, output: &mut W) -> anyhow::Result<()> {
+fn emit_summaries<W: Write>(
+    sinks: &Sinks,
+    count_only: bool,
+    tz: &jiff::tz::TimeZone,
+    output: &mut W,
+) -> anyhow::Result<()> {
     sinks.stats.report();
-    sinks.counter.report(output)?;
+    sinks.counter.report(output, tz)?;
     sinks.keys.report(output)?;
     sinks.values.report(output)?;
     if count_only {
@@ -777,6 +919,56 @@ fn build_sampler(cli: &Cli) -> anyhow::Result<Option<Sampler>> {
     }
 }
 
+/// Compute the bucket spec from `--bucket` / `--n-buckets`. Caller has
+/// already resolved `tf`; `global_first`/`global_last` are the file-side
+/// bounds returned by `peek_global_window` (or `None` if it wasn't run).
+/// Returns `None` when neither flag is set. Errors when `--n-buckets`
+/// cannot be sized (no resolvable window) or the resulting width is zero.
+fn resolve_bucket_spec(
+    cli: &Cli,
+    tf: &TimeFilter,
+    global_first: Option<Timestamp>,
+    global_last: Option<Timestamp>,
+) -> anyhow::Result<Option<BucketSpec>> {
+    if let Some(s) = cli.bucket.as_deref() {
+        let nanos = timestamp::parse_duration_nanos(s)?;
+        return Ok(Some(BucketSpec {
+            nanos,
+            origin: 0,
+            n_buckets: None,
+        }));
+    }
+    if let Some(n) = cli.n_buckets {
+        if n == 0 {
+            anyhow::bail!("--n-buckets must be > 0");
+        }
+        let start = tf.from.or(global_first).ok_or_else(|| {
+            anyhow::anyhow!(
+                "--n-buckets needs a window start: pass --from, or use a file with parseable timestamps"
+            )
+        })?;
+        let end = tf.to.or(global_last).ok_or_else(|| {
+            anyhow::anyhow!(
+                "--n-buckets needs a window end: pass --to, or use a file with parseable timestamps"
+            )
+        })?;
+        let span = end - start;
+        if span <= 0 {
+            anyhow::bail!("--n-buckets: time range is empty (end <= start)");
+        }
+        let nanos = span / n as i64;
+        if nanos == 0 {
+            anyhow::bail!("--n-buckets={n}: span {span}ns is too small to split into {n} buckets");
+        }
+        return Ok(Some(BucketSpec {
+            nanos,
+            origin: start,
+            n_buckets: Some(n),
+        }));
+    }
+    Ok(None)
+}
+
 /// Construct a fresh `Sinks` for the master or a worker. Configuration
 /// fields are derived from `cli`; the `sampler` template is cloned in (its
 /// inner `Arc<Filter>` is shared, so cloning is cheap). All collected
@@ -786,10 +978,11 @@ pub(crate) fn make_sinks(
     sampler: Option<Sampler>,
     suppress_lines: bool,
     colorize: bool,
+    bucket: Option<BucketSpec>,
 ) -> Sinks {
     Sinks {
         stats: Stats::default(),
-        counter: Counter::new(cli.count_by.iter().map(SmartString::from).collect()),
+        counter: Counter::new(cli.group_by.iter().map(SmartString::from).collect(), bucket),
         keys: KeyGather::new(cli.list_keys),
         values: ValueGather::new(cli.list_values_for.iter().map(SmartString::from).collect()),
         raw: RawExtractor::new(cli.raw_key.as_deref()),
@@ -891,7 +1084,15 @@ fn process_line<W: Write + ?Sized>(
     let mut pairs = logfmt::PairsBuffer::<256>::new();
     let (parsed, overflow) = pairs.parse(line_str);
 
-    let matched = tf.matches(parsed)
+    // Extract the timestamp at most once per line, only when something
+    // downstream actually needs it (time-window filter or grouping counter).
+    let ts = if !tf.is_empty() || sinks.counter.is_active() {
+        timestamp::extract_timestamp(parsed)
+    } else {
+        None
+    };
+
+    let matched = tf.check(ts)
         && (filter.is_empty() || filter.matches(parsed))
         && sinks.sampler.as_ref().is_none_or(|s| s.keep(parsed));
 
@@ -899,7 +1100,7 @@ fn process_line<W: Write + ?Sized>(
     sinks.stats.overflow += overflow as usize;
     if matched {
         sinks.stats.matched_lines += 1;
-        sinks.counter.record(parsed);
+        sinks.counter.record(parsed, ts);
         sinks.keys.record(parsed);
         sinks.values.record(parsed);
         if let Some(sort_buf) = sinks.sort_buf.as_mut() {
