@@ -230,6 +230,49 @@ fn push_bytes_lossy(out: &mut String, bytes: &[u8]) {
     out.push_str(&String::from_utf8_lossy(bytes));
 }
 
+/// Write `value` as a logfmt value to `out`. If `value` is empty, contains
+/// any of space, `=`, `"`, or a control character, it is wrapped in double
+/// quotes with `"`, `\`, `\n`, `\r`, `\t` escaped. Otherwise the bytes are
+/// written verbatim.
+///
+/// Counterpart to [`unescape_value`]: parsing a key=value pair where the
+/// value was emitted by this function and then calling `unescape_value`
+/// recovers the original string.
+pub fn write_logfmt_value<W: std::io::Write + ?Sized>(
+    out: &mut W,
+    value: &str,
+) -> std::io::Result<()> {
+    let bytes = value.as_bytes();
+    let needs_quote = bytes.is_empty()
+        || bytes
+            .iter()
+            .any(|&b| matches!(b, b' ' | b'=' | b'"' | b'\\') || b < 0x20);
+    if !needs_quote {
+        return out.write_all(bytes);
+    }
+    out.write_all(b"\"")?;
+    let mut last = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        let esc: &[u8] = match b {
+            b'"' => b"\\\"",
+            b'\\' => b"\\\\",
+            b'\n' => b"\\n",
+            b'\r' => b"\\r",
+            b'\t' => b"\\t",
+            _ => continue,
+        };
+        if last < i {
+            out.write_all(&bytes[last..i])?;
+        }
+        out.write_all(esc)?;
+        last = i + 1;
+    }
+    if last < bytes.len() {
+        out.write_all(&bytes[last..])?;
+    }
+    out.write_all(b"\"")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -461,6 +504,46 @@ mod tests {
                 proptest::prop_assert_eq!(got.len(), 256);
             }
             proptest::prop_assert_eq!(&got[..take], &expected[..take]);
+        }
+    }
+
+    fn write_value(s: &str) -> String {
+        let mut out = Vec::new();
+        write_logfmt_value(&mut out, s).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn write_logfmt_value_unquoted_when_safe() {
+        assert_eq!(write_value("info"), "info");
+        assert_eq!(write_value("level=error"), "\"level=error\"");
+        assert_eq!(write_value("hello world"), "\"hello world\"");
+        assert_eq!(write_value(""), "\"\"");
+        assert_eq!(write_value("a\"b"), "\"a\\\"b\"");
+        assert_eq!(write_value("a\\b"), "\"a\\\\b\"");
+        assert_eq!(write_value("a\nb"), "\"a\\nb\"");
+    }
+
+    #[test]
+    fn write_logfmt_value_round_trips() {
+        // Emit, parse back, unescape — must yield the original string.
+        for original in [
+            "info",
+            "hello world",
+            "level=error",
+            "msg with \"quotes\"",
+            "back\\slash",
+            "tab\there",
+            "",
+        ] {
+            let mut emitted = Vec::new();
+            write_logfmt_value(&mut emitted, original).unwrap();
+            let line = format!("k={}", String::from_utf8(emitted).unwrap());
+            let pairs = parse(&line);
+            assert_eq!(pairs.len(), 1);
+            let mut decoded = String::new();
+            unescape_value(pairs[0].1.as_bytes(), &mut decoded);
+            assert_eq!(decoded, original, "round-trip failed for {original:?}");
         }
     }
 
