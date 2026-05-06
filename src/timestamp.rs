@@ -108,9 +108,7 @@ pub fn parse_rfc3339_nanos(s: &str) -> Option<Timestamp> {
     let secs_of_day = hour as i64 * 3600 + minute as i64 * 60 + second as i64;
     let utc_secs = epoch_days * 86_400 + secs_of_day - tz_offset_secs;
 
-    utc_secs
-        .checked_mul(1_000_000_000)?
-        .checked_add(nanos_frac)
+    utc_secs.checked_mul(1_000_000_000)?.checked_add(nanos_frac)
 }
 
 const NANOS_PER_DAY: i64 = 86_400 * 1_000_000_000;
@@ -237,6 +235,45 @@ fn parse_frac_nanos(b: &[u8]) -> Option<i64> {
     Some(acc)
 }
 
+/// Parse a positive duration string like `5m`, `30 secs`, `2 hours` into
+/// nanoseconds. Accepts the same units as `--from start+<dur>`:
+/// `s/sec/seconds`, `m/min/minutes`, `h/hour/hours`, `d/day/days`
+/// (case-insensitive, plurals accepted, optional whitespace before the unit).
+/// Rejects empty/whitespace input, missing unit, and non-positive numbers.
+pub fn parse_duration_nanos(s: &str) -> anyhow::Result<i64> {
+    let inner = s.trim();
+    if inner.is_empty() {
+        anyhow::bail!("empty duration");
+    }
+    let split = inner
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(inner.len());
+    if split == 0 || split == inner.len() {
+        anyhow::bail!("invalid duration `{s}`: expected `<int><unit>`");
+    }
+    let num_str = &inner[..split];
+    let unit_raw = inner[split..].trim();
+    let n: i64 = num_str
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid duration number in `{s}`"))?;
+    if n <= 0 {
+        anyhow::bail!("duration must be positive, got `{s}`");
+    }
+    let unit_lc = unit_raw.to_ascii_lowercase();
+    let unit_nanos: i64 = match unit_lc.as_str() {
+        "s" | "sec" | "secs" | "second" | "seconds" => 1_000_000_000,
+        "m" | "min" | "mins" | "minute" | "minutes" => 60 * 1_000_000_000,
+        "h" | "hr" | "hrs" | "hour" | "hours" => 3600 * 1_000_000_000,
+        "d" | "day" | "days" => 86_400 * 1_000_000_000,
+        _ => anyhow::bail!(
+            "unknown duration unit `{unit_raw}` in `{s}`; expected one of \
+             s/sec/seconds, m/min/minutes, h/hour/hours, d/day/days"
+        ),
+    };
+    n.checked_mul(unit_nanos)
+        .ok_or_else(|| anyhow::anyhow!("duration overflow in `{s}`"))
+}
+
 fn apply_offset(base: Timestamp, suffix: &str) -> anyhow::Result<Timestamp> {
     let suffix = suffix.trim();
     if suffix.is_empty() {
@@ -248,32 +285,7 @@ fn apply_offset(base: Timestamp, suffix: &str) -> anyhow::Result<Timestamp> {
         b'-' => -1,
         _ => anyhow::bail!("expected `+` or `-` after anchor: `{suffix}`"),
     };
-    let inner = suffix[1..].trim();
-    let split = inner
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(inner.len());
-    if split == 0 || split == inner.len() {
-        anyhow::bail!("invalid duration `{suffix}`: expected `<int><unit>`");
-    }
-    let num_str = &inner[..split];
-    let unit_raw = inner[split..].trim();
-    let n: i64 = num_str
-        .parse()
-        .map_err(|_| anyhow::anyhow!("invalid duration number in `{suffix}`"))?;
-    let unit_lc = unit_raw.to_ascii_lowercase();
-    let unit_nanos: i64 = match unit_lc.as_str() {
-        "s" | "sec" | "secs" | "second" | "seconds" => 1_000_000_000,
-        "m" | "min" | "mins" | "minute" | "minutes" => 60 * 1_000_000_000,
-        "h" | "hr" | "hrs" | "hour" | "hours" => 3600 * 1_000_000_000,
-        "d" | "day" | "days" => 86_400 * 1_000_000_000,
-        _ => anyhow::bail!(
-            "unknown duration unit `{unit_raw}` in `{suffix}`; expected one of \
-             s/sec/seconds, m/min/minutes, h/hour/hours, d/day/days"
-        ),
-    };
-    let delta = n
-        .checked_mul(unit_nanos)
-        .ok_or_else(|| anyhow::anyhow!("duration overflow in `{suffix}`"))?;
+    let delta = parse_duration_nanos(&suffix[1..])?;
     base.checked_add(sign * delta)
         .ok_or_else(|| anyhow::anyhow!("timestamp overflow applying `{suffix}`"))
 }
