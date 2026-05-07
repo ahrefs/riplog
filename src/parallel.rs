@@ -36,6 +36,7 @@ pub(crate) struct Job<'a> {
     pub suppress_lines: bool,
     pub colorize: bool,
     pub bucket: Option<BucketSpec>,
+    pub tz: jiff::tz::TimeZone,
     pub output: &'a mut (dyn Write + Send),
     pub master: &'a mut Sinks,
 }
@@ -56,6 +57,7 @@ pub(crate) fn run(job: Job<'_>) -> anyhow::Result<()> {
         suppress_lines,
         colorize,
         bucket,
+        tz,
         output,
         master,
     } = job;
@@ -89,8 +91,13 @@ pub(crate) fn run(job: Job<'_>) -> anyhow::Result<()> {
             .map(|&(cs, ce)| {
                 let sampler = sampler.clone();
                 let shared = &shared_out;
+                let tz = tz.clone();
                 s.spawn(move || -> anyhow::Result<Sinks> {
-                    let mut sinks = make_sinks(cli, sampler, suppress_lines, colorize, bucket);
+                    // Workers don't call `enable_streaming`: rows must batch
+                    // into per-worker `Sinks` and merge into the master, or
+                    // multi-writer output interleaves on the shared sink.
+                    let mut sinks =
+                        make_sinks(cli, sampler, suppress_lines, colorize, bucket, tz);
                     let mut file = File::open(path)?;
                     file.seek(SeekFrom::Start(cs))?;
                     let mut reader = BufReader::new(file);

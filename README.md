@@ -9,12 +9,12 @@ riplog [OPTIONS] [FILE]...
 ```
 
 Multiple files are processed in order; aggregated output (`--count`,
-`--count-by`, `--list-keys`, `--list-values-for`) is emitted once at the
-end and reflects the union of all files. `--from`/`--to` are applied
-per file (each file is bisected independently), so a time range that
-straddles a log rotation works as expected. `-f`/`-F` is attached to
-the *last* file — `riplog foo.log.1 foo.log -F` reads the rotated log,
-then the current log, then keeps tailing it.
+`--group-by`, `--list-keys`, `--list-values-for`) is emitted once at
+the end and reflects the union of all files. `--from`/`--to` are
+applied per file (each file is bisected independently), so a time
+range that straddles a log rotation works as expected. `-f`/`-F` is
+attached to the *last* file — `riplog foo.log.1 foo.log -F` reads the
+rotated log, then the current log, then keeps tailing it.
 
 ## Install
 
@@ -66,19 +66,74 @@ Make sure `~/.cargo/bin` is in your path.
 
 ## Aggregation (suppresses line output)
 
-- `--count`: print the matched-line count.
-- `--count-by <KEY[,KEY…]>`: group matched lines by key value, print a
-  count table. Repeatable, and a single flag may carry a
-  comma-separated list — `--count-by level,facil` and
-  `--count-by level --count-by facil` are equivalent. One row per tuple
-  of values.
+- `--count`: print the matched-line count. Alone, emits a bare number.
+  Combined with `--group-by`, `--bucket`, and/or `--n-buckets`, emits
+  one logfmt row per group instead.
+- `--group-by <KEY[,KEY…]>`: group matched lines by key value (requires
+  `--count`). One logfmt row per tuple of values:
+  `count=N key.<k1>=… key.<k2>=… time.start=… time.end=…`. User keys
+  are prefixed with `key.` to disambiguate from synthetic columns;
+  `time.start`/`time.end` are the min/max observed timestamps in the
+  group. Repeatable, and a single flag may carry a comma-separated
+  list — `--group-by level,facil` and
+  `--group-by level --group-by facil` are equivalent.
+- `--bucket <DURATION>`: with `--count`, partition the time range into
+  fixed-size, epoch-aligned buckets; each row carries
+  `bucket.start=<RFC 3339>` and `bucket.end=<RFC 3339>` boundaries.
+  Same duration syntax as `--from start+<dur>`: `5m`, `30s`, `2 hours`.
+  Lines without a parseable timestamp are dropped (they can't be
+  bucketed). Composes with `--group-by` to bucket per
+  (group keys, time slice). Mutually exclusive with `--n-buckets`.
+- `--n-buckets <N>`: with `--count`, divide the active time window into
+  `N` equal-width buckets aligned to the window start. Width is
+  `(end − start) / N`, taking `start`/`end` from `--from`/`--to`
+  when set, otherwise from the file's first/last timestamps. Useful
+  for graphing — gives a fixed number of points across the time range.
+  Requires a file argument. Mutually exclusive with `--bucket`.
 - `--list-keys`: print every distinct key seen on matched lines.
 - `--list-values-for <KEY[,KEY…]>`: print every distinct value seen for
-  `KEY`. Repeatable / comma-separated like `--count-by`.
+  `KEY`. Repeatable / comma-separated like `--group-by`.
 - `--raw-key <KEY>`: emit only the unquoted, unescaped value of `KEY`
   for each matched line (one per line; lines without the key are
   skipped). Handy for piping a single field downstream, e.g.
   `riplog app.log --if 'level=error' --raw-key msg | sort | uniq -c`.
+
+Example — error rate per service in 5-minute slices:
+
+```
+riplog --count --group-by=facil --bucket=5m --if 'level>=error' \
+       --from start --to end app.log
+```
+
+emits rows like:
+
+```
+count=42 key.facil=db bucket.start=2026-05-06T12:00:00Z bucket.end=2026-05-06T12:05:00Z time.start=2026-05-06T12:00:01Z time.end=2026-05-06T12:04:58Z
+count=17 key.facil=net bucket.start=2026-05-06T12:05:00Z bucket.end=2026-05-06T12:10:00Z time.start=2026-05-06T12:05:03Z time.end=2026-05-06T12:09:51Z
+```
+
+For graphing, `--n-buckets` is often more convenient than `--bucket`:
+
+```
+riplog --count --n-buckets=60 --if 'level>=error' --from start --to end app.log
+```
+
+always emits 60 rows — one per equal-width slice across the range.
+
+### Streaming under `-f` / `-F`
+
+When `--bucket=DURATION` is combined with `-f` or `-F`, output switches to
+streaming mode: each bucket's row is emitted as soon as the bucket closes,
+in time-ascending order. A bucket B closes once
+`max_ts_seen > B.end + window_secs` (the existing reorder-tolerance flag
+doubles as the close grace). On `Ctrl-C` / EOF, any still-open buckets are
+flushed in time order. This makes
+`riplog -F app.log --count --group-by=svc --bucket=1m` a live histogram
+pipe suitable for graph tooling.
+
+`-f` / `-F` rejects two combinations: `--n-buckets` (the upper bound is
+unknown in follow mode) and `--group-by` without `--bucket` (no completion
+signal — nothing would print until you `Ctrl-C`).
 
 ## Follow
 

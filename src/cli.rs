@@ -87,7 +87,9 @@ pub struct Cli {
 
     /// Add a fixed-width, epoch-aligned time bucket dimension to the
     /// grouping. Same duration syntax as `--from start+<dur>` (`5m`, `30s`,
-    /// `2 hours`). Requires `--count`. Conflicts with `--n-buckets`.
+    /// `2 hours`). Under `-f`/`-F` switches to streaming output: rows
+    /// emit as buckets close (when `max_ts_seen > bucket.end +
+    /// window_secs`). Requires `--count`. Conflicts with `--n-buckets`.
     #[arg(
         long,
         value_name = "DURATION",

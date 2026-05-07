@@ -234,6 +234,21 @@ fn fold_max(slot: &mut Option<Timestamp>, t: Timestamp) {
     *slot = Some(slot.map_or(t, |cur| cur.max(t)));
 }
 
+/// Comparator for streaming output: bucket time ascending, then count
+/// descending, then combo ascending. Shared by `flush_closed` and
+/// `flush_remaining` so both paths agree on ordering. (`report` uses a
+/// different order — count desc — for batch-mode summaries.)
+fn stream_order(
+    ka: &GroupKey,
+    sa: &GroupStats,
+    kb: &GroupKey,
+    sb: &GroupStats,
+) -> std::cmp::Ordering {
+    ka.1.cmp(&kb.1)
+        .then_with(|| sb.count.cmp(&sa.count))
+        .then_with(|| ka.0.cmp(&kb.0))
+}
+
 impl GroupStats {
     fn record(&mut self, ts: Option<Timestamp>) {
         self.count += 1;
@@ -300,6 +315,17 @@ struct Counter {
     bucket: Option<BucketSpec>,
     counts: RapidHashMap<GroupKey, GroupStats>,
     scratch: String,
+    /// In streaming mode, track the highest timestamp observed across all
+    /// matched lines. Used to decide which buckets are past the close
+    /// threshold (`bucket.end + close_grace_nanos`).
+    max_ts_seen: Option<Timestamp>,
+    /// Reorder grace; mirrors `--window-secs`. Bucket B is closed (and
+    /// streamed out) once `max_ts_seen > B.end + close_grace_nanos`.
+    close_grace_nanos: i64,
+    /// Set in follow mode when `--bucket` is active. When `false`, the
+    /// streaming flush methods are no-ops and end-of-process output goes
+    /// through `report` (today's count-desc, single-emission behaviour).
+    streaming: bool,
 }
 
 impl Counter {
@@ -309,6 +335,20 @@ impl Counter {
             bucket,
             counts: RapidHashMap::default(),
             scratch: String::new(),
+            max_ts_seen: None,
+            close_grace_nanos: 0,
+            streaming: false,
+        }
+    }
+
+    /// Enable streaming output: per-bucket rows emit as soon as
+    /// `max_ts_seen > bucket.end + close_grace_nanos`. No-op unless
+    /// `bucket` is also set (streaming an unbucketed group has no
+    /// completion signal).
+    fn enable_streaming(&mut self, close_grace_nanos: i64) {
+        if self.bucket.is_some() {
+            self.streaming = true;
+            self.close_grace_nanos = close_grace_nanos;
         }
     }
 
@@ -328,6 +368,12 @@ impl Counter {
             (None, _) => None,
         };
 
+        if self.streaming {
+            if let Some(t) = ts {
+                fold_max(&mut self.max_ts_seen, t);
+            }
+        }
+
         let mut combo: Combo = SmallVec::with_capacity(self.keys.len());
         for k in &self.keys {
             let mut value = SmartString::new_const();
@@ -342,34 +388,107 @@ impl Counter {
             .record(ts);
     }
 
+    fn write_row<W: Write + ?Sized>(
+        &self,
+        out: &mut W,
+        combo: &Combo,
+        bucket_ts: Option<Timestamp>,
+        stats: &GroupStats,
+        tz: &jiff::tz::TimeZone,
+    ) -> std::io::Result<()> {
+        write!(out, "count={}", stats.count)?;
+        for (k, v) in self.keys.iter().zip(combo.iter()) {
+            write!(out, " key.{k}=")?;
+            logfmt::write_logfmt_value(out, v.as_str())?;
+        }
+        if let (Some(bspec), Some(start)) = (self.bucket, bucket_ts) {
+            let end = start + bspec.nanos;
+            write!(
+                out,
+                " bucket.start={}",
+                timestamp::format_rfc3339(start, tz)
+            )?;
+            write!(out, " bucket.end={}", timestamp::format_rfc3339(end, tz))?;
+        }
+        if let (Some(a), Some(b)) = (stats.min_ts, stats.max_ts) {
+            write!(out, " time.start={}", timestamp::format_rfc3339(a, tz))?;
+            write!(out, " time.end={}", timestamp::format_rfc3339(b, tz))?;
+        }
+        writeln!(out)
+    }
+
+    /// Batch-mode end-of-run report: count desc, ties broken by key.
     fn report<W: Write>(&self, out: &mut W, tz: &jiff::tz::TimeZone) -> std::io::Result<()> {
         if !self.is_active() || self.counts.is_empty() {
             return Ok(());
         }
         let mut entries: Vec<(&GroupKey, &GroupStats)> = self.counts.iter().collect();
-        // Descending by count, ties broken by key for deterministic output.
         entries.sort_unstable_by(|a, b| b.1.count.cmp(&a.1.count).then_with(|| a.0.cmp(b.0)));
-
         for ((combo, bucket_ts), stats) in entries {
-            write!(out, "count={}", stats.count)?;
-            for (k, v) in self.keys.iter().zip(combo.iter()) {
-                write!(out, " key.{k}=")?;
-                logfmt::write_logfmt_value(out, v.as_str())?;
-            }
-            if let (Some(bspec), Some(start)) = (self.bucket, *bucket_ts) {
-                let end = start + bspec.nanos;
-                write!(
-                    out,
-                    " bucket.start={}",
-                    timestamp::format_rfc3339(start, tz)
-                )?;
-                write!(out, " bucket.end={}", timestamp::format_rfc3339(end, tz))?;
-            }
-            if let (Some(a), Some(b)) = (stats.min_ts, stats.max_ts) {
-                write!(out, " time.start={}", timestamp::format_rfc3339(a, tz))?;
-                write!(out, " time.end={}", timestamp::format_rfc3339(b, tz))?;
-            }
-            writeln!(out)?;
+            self.write_row(out, combo, *bucket_ts, stats, tz)?;
+        }
+        Ok(())
+    }
+
+    /// Streaming flush: emit and remove every group whose bucket has
+    /// passed the close threshold (`bucket.end + close_grace_nanos <
+    /// max_ts_seen`). Rows go out in (bucket.start asc, count desc, combo
+    /// asc) order. No-op when `streaming` is false.
+    fn flush_closed<W: Write + ?Sized>(
+        &mut self,
+        out: &mut W,
+        tz: &jiff::tz::TimeZone,
+    ) -> std::io::Result<()> {
+        if !self.streaming {
+            return Ok(());
+        }
+        let Some(bspec) = self.bucket else {
+            return Ok(());
+        };
+        let Some(seen) = self.max_ts_seen else {
+            return Ok(());
+        };
+        let close_threshold = seen - bspec.nanos - self.close_grace_nanos;
+
+        let to_close: Vec<GroupKey> = self
+            .counts
+            .keys()
+            .filter(|key| matches!(key.1, Some(bts) if bts < close_threshold))
+            .cloned()
+            .collect();
+        if to_close.is_empty() {
+            return Ok(());
+        }
+        // Move ownership of stats out of the map in one pass — no extra
+        // lookups during the sort comparator.
+        let mut closed: Vec<(GroupKey, GroupStats)> = to_close
+            .into_iter()
+            .map(|key| {
+                let stats = self.counts.remove(&key).expect("just enumerated");
+                (key, stats)
+            })
+            .collect();
+        closed.sort_unstable_by(|a, b| stream_order(&a.0, &a.1, &b.0, &b.1));
+        for (key, stats) in &closed {
+            self.write_row(out, &key.0, key.1, stats, tz)?;
+        }
+        out.flush()
+    }
+
+    /// End-of-stream flush: emit any still-open buckets in time order.
+    /// Used in place of `report` when streaming.
+    fn flush_remaining<W: Write>(
+        &self,
+        out: &mut W,
+        tz: &jiff::tz::TimeZone,
+    ) -> std::io::Result<()> {
+        if self.counts.is_empty() {
+            return Ok(());
+        }
+        let mut entries: Vec<(&GroupKey, &GroupStats)> = self.counts.iter().collect();
+        entries.sort_unstable_by(|a, b| stream_order(a.0, a.1, b.0, b.1));
+        for ((combo, bucket_ts), stats) in entries {
+            self.write_row(out, combo, *bucket_ts, stats, tz)?;
         }
         Ok(())
     }
@@ -451,6 +570,20 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
 
     let filter = Filter::parse(&cli.keys)?;
     let following = cli.follow || cli.follow_reopen;
+
+    if following && cli.n_buckets.is_some() {
+        anyhow::bail!(
+            "`--n-buckets` cannot be combined with `-f`/`-F`: bucket width \
+             requires a bounded time range. Use `--bucket=DURATION` instead."
+        );
+    }
+    if following && !cli.group_by.is_empty() && cli.bucket.is_none() {
+        anyhow::bail!(
+            "`--group-by` under `-f`/`-F` requires `--bucket=DURATION`: \
+             without a time dimension, no group is ever 'complete' so \
+             nothing would print until you Ctrl-C."
+        );
+    }
     let suppress_lines = cli.list_keys
         || cli.count
         || !cli.list_values_for.is_empty()
@@ -503,7 +636,15 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
                 origin: 0,
                 n_buckets: None,
             });
-        let mut sinks = make_sinks(cli, sampler.clone(), suppress_lines, colorize, bucket);
+        // stdin can't follow (rejected earlier); no streaming activation.
+        let mut sinks = make_sinks(
+            cli,
+            sampler.clone(),
+            suppress_lines,
+            colorize,
+            bucket,
+            tz.clone(),
+        );
         stream_unbounded(
             &mut std::io::stdin().lock(),
             &filter,
@@ -593,7 +734,20 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
     //   group (no edge-alignment off-by-one).
     let bucket = resolve_bucket_spec(cli, &tf, global_first, global_last)?;
 
-    let mut sinks = make_sinks(cli, sampler.clone(), suppress_lines, colorize, bucket);
+    let mut sinks = make_sinks(
+        cli,
+        sampler.clone(),
+        suppress_lines,
+        colorize,
+        bucket,
+        tz.clone(),
+    );
+    // Master streams under follow; workers always batch (their output would
+    // interleave on the shared writer otherwise) and merge into the master.
+    if following {
+        let grace = (cli.window_secs as i64).saturating_mul(1_000_000_000);
+        sinks.enable_streaming(grace);
+    }
 
     // Phase 1: bisect every file up front against the resolved absolute
     // window. Output is suppressed during planning — only summaries and
@@ -626,6 +780,7 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
                 suppress_lines,
                 colorize,
                 bucket,
+                tz: tz.clone(),
                 output: &mut *output,
                 master: &mut sinks,
             })?;
@@ -788,7 +943,11 @@ fn emit_summaries<W: Write>(
     output: &mut W,
 ) -> anyhow::Result<()> {
     sinks.stats.report();
-    sinks.counter.report(output, tz)?;
+    if sinks.counter.streaming {
+        sinks.counter.flush_remaining(output, tz)?;
+    } else {
+        sinks.counter.report(output, tz)?;
+    }
     sinks.keys.report(output)?;
     sinks.values.report(output)?;
     if count_only {
@@ -867,12 +1026,22 @@ pub(crate) struct Sinks {
     suppress_lines: bool,
     colorize: bool,
     limit: Option<usize>,
+    /// Display timezone, used by the streaming bucket flush to format
+    /// `bucket.start` / `bucket.end` / `time.start` / `time.end` on the fly.
+    tz: jiff::tz::TimeZone,
 }
 
 impl Sinks {
     #[inline]
     fn done(&self) -> bool {
         matches!(self.limit, Some(n) if self.stats.matched_lines >= n)
+    }
+
+    /// Activate streaming bucket emission on the underlying counter. Should
+    /// only be called on the *master* `Sinks` in follow mode — workers must
+    /// stay batched so their output can't interleave on the shared writer.
+    pub(crate) fn enable_streaming(&mut self, close_grace_nanos: i64) {
+        self.counter.enable_streaming(close_grace_nanos);
     }
 
     /// Fold per-worker collected state into `self`. `started` and the
@@ -979,10 +1148,12 @@ pub(crate) fn make_sinks(
     suppress_lines: bool,
     colorize: bool,
     bucket: Option<BucketSpec>,
+    tz: jiff::tz::TimeZone,
 ) -> Sinks {
+    let counter = Counter::new(cli.group_by.iter().map(SmartString::from).collect(), bucket);
     Sinks {
         stats: Stats::default(),
-        counter: Counter::new(cli.group_by.iter().map(SmartString::from).collect(), bucket),
+        counter,
         keys: KeyGather::new(cli.list_keys),
         values: ValueGather::new(cli.list_values_for.iter().map(SmartString::from).collect()),
         raw: RawExtractor::new(cli.raw_key.as_deref()),
@@ -991,6 +1162,7 @@ pub(crate) fn make_sinks(
         suppress_lines,
         colorize,
         limit: cli.limit,
+        tz,
     }
 }
 
@@ -1101,6 +1273,10 @@ fn process_line<W: Write + ?Sized>(
     if matched {
         sinks.stats.matched_lines += 1;
         sinks.counter.record(parsed, ts);
+        // Streaming mode (`-f`/`-F` + `--bucket`): emit any buckets that
+        // have passed the close threshold. Cheap when nothing is closeable;
+        // a no-op when streaming is off.
+        sinks.counter.flush_closed(output, &sinks.tz)?;
         sinks.keys.record(parsed);
         sinks.values.record(parsed);
         if let Some(sort_buf) = sinks.sort_buf.as_mut() {

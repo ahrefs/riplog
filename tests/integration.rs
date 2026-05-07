@@ -413,6 +413,188 @@ fn finish_with_sigint(child: std::process::Child) -> usize {
 
 const FOLLOW_TICK: Duration = Duration::from_millis(400);
 
+/// Big fixture with strictly monotone timestamps spanning 1+ hour, just
+/// large enough to trigger parallel chunk splitting (≥ `MIN_BYTES_PER_WORKER`
+/// * 4 = 16 MiB). Used for streaming tests where the close-on-`max_ts >
+/// end+grace` invariant requires that timestamps don't wrap.
+fn big_monotone_fixture() -> &'static Path {
+    static PATH: OnceLock<PathBuf> = OnceLock::new();
+    PATH.get_or_init(|| {
+        let dir = std::env::temp_dir().join("riplog-it");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("big-monotone-fixture.log");
+        // 300_000 lines @ 100/sec → 3000s = 50 minutes. ~18 MiB on disk.
+        let mut buf: Vec<u8> = Vec::with_capacity(20 * 1024 * 1024);
+        for i in 0..300_000u64 {
+            let level = match i % 5 {
+                0 => "info",
+                1 => "warn",
+                2 => "error",
+                3 => "debug",
+                _ => "critical",
+            };
+            let total_ms = i * 10;
+            let secs = total_ms / 1000;
+            let ms = total_ms % 1000;
+            let h = 18 + secs / 3600;
+            let m = (secs / 60) % 60;
+            let s = secs % 60;
+            let line = format!(
+                "time=2026-04-24T{h:02}:{m:02}:{s:02}.{ms:03}Z level={level} msg=\"line {i}\"\n"
+            );
+            buf.extend_from_slice(line.as_bytes());
+        }
+        fs::write(&path, &buf).unwrap();
+        path
+    })
+    .as_path()
+}
+
+#[cfg(unix)]
+#[test]
+fn follow_with_parallel_does_not_interleave() {
+    // Multi-file follow with -j: pre-rotation file is parallel-scanned,
+    // last file is followed. Workers must batch (not stream) — otherwise
+    // their bucket rows would interleave on the shared writer. Compare
+    // parallel vs sequential output: must be byte-identical at SIGINT.
+    let prerot = big_monotone_fixture();
+    let last_path = std::env::temp_dir().join("riplog-it-follow-par-last.log");
+    fs::write(&last_path, b"").unwrap();
+
+    fn run_once(j: Option<&str>, prerot: &Path, last: &Path) -> Vec<u8> {
+        let mut cmd = Command::new(riplog_bin());
+        if let Some(j) = j {
+            cmd.arg(format!("-j={j}"));
+        }
+        cmd.args([
+            "-F",
+            "--count",
+            "--group-by=level",
+            "--bucket=10m",
+            prerot.to_str().unwrap(),
+            last.to_str().unwrap(),
+        ]);
+        let child = cmd
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        // Sequential scan of an 18-MiB fixture in debug builds takes
+        // ~1.5–2s. Wait long enough for both runs to finish the initial
+        // scan and reach the follow-poll loop before SIGINT'ing — otherwise
+        // sequential's mid-scan stream buffer differs from parallel's
+        // post-merge flush_remaining.
+        thread::sleep(Duration::from_secs(3));
+        let pid = child.id() as libc::pid_t;
+        unsafe {
+            libc::kill(pid, libc::SIGINT);
+        }
+        child.wait_with_output().unwrap().stdout
+    }
+
+    let seq = run_once(None, prerot, &last_path);
+    let par = run_once(Some("4"), prerot, &last_path);
+    assert_eq!(
+        seq, par,
+        "parallel follow output must match sequential — workers should not stream"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn follow_bucket_emits_on_close() {
+    // Stream bucketed counts as buckets close. With --bucket=2s
+    // --window-secs=1, bucket A=[18:00:00, 18:00:02) closes once a line
+    // arrives whose ts > 18:00:03 (A.end + window). Append 3 lines in A,
+    // then 2 lines in B=[18:00:04, 18:00:06) — that triggers A's flush.
+    // SIGINT then flushes B in flush_remaining.
+    let path = std::env::temp_dir().join("riplog-it-follow-bucket.log");
+    fs::write(&path, b"").unwrap();
+    let child = Command::new(riplog_bin())
+        .args([
+            "-F",
+            "--count",
+            "--bucket=2s",
+            "--window-secs=1",
+            path.to_str().unwrap(),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    thread::sleep(FOLLOW_TICK);
+
+    append_lines(
+        &path,
+        &[
+            "time=2026-04-24T18:00:00.1Z level=info msg=a1",
+            "time=2026-04-24T18:00:00.5Z level=info msg=a2",
+            "time=2026-04-24T18:00:01.5Z level=info msg=a3",
+        ],
+    );
+    thread::sleep(FOLLOW_TICK);
+
+    append_lines(
+        &path,
+        &[
+            "time=2026-04-24T18:00:04.1Z level=info msg=b1",
+            "time=2026-04-24T18:00:04.5Z level=info msg=b2",
+        ],
+    );
+    thread::sleep(FOLLOW_TICK);
+
+    let pid = child.id() as libc::pid_t;
+    unsafe {
+        libc::kill(pid, libc::SIGINT);
+    }
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let rows: Vec<&str> = stdout.lines().filter(|l| l.starts_with("count=")).collect();
+    assert_eq!(rows.len(), 2, "expected 2 bucket rows, got: {stdout:?}");
+    assert!(
+        rows[0].contains("count=3") && rows[0].contains("bucket.start=2026-04-24T18:00:00Z"),
+        "first row should be bucket A with count 3: {:?}",
+        rows[0]
+    );
+    assert!(
+        rows[1].contains("count=2") && rows[1].contains("bucket.start=2026-04-24T18:00:04Z"),
+        "second row should be bucket B with count 2: {:?}",
+        rows[1]
+    );
+}
+
+#[test]
+fn follow_rejects_group_by_without_bucket() {
+    let path = std::env::temp_dir().join("riplog-it-follow-rej-gb.log");
+    fs::write(&path, b"").unwrap();
+    let out = Command::new(riplog_bin())
+        .args(["-f", "--count", "--group-by=level", path.to_str().unwrap()])
+        .output()
+        .expect("spawn riplog");
+    assert!(!out.status.success(), "expected non-zero exit");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("--bucket"),
+        "stderr should mention --bucket: {err}"
+    );
+}
+
+#[test]
+fn follow_rejects_n_buckets() {
+    let path = std::env::temp_dir().join("riplog-it-follow-rej-nb.log");
+    fs::write(&path, b"").unwrap();
+    let out = Command::new(riplog_bin())
+        .args(["-f", "--count", "--n-buckets=10", path.to_str().unwrap()])
+        .output()
+        .expect("spawn riplog");
+    assert!(!out.status.success(), "expected non-zero exit");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("-f") || err.contains("-F"),
+        "stderr should mention -f/-F: {err}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn follow_reopen_handles_rotation() {
@@ -691,6 +873,35 @@ fn parallel_group_by_matches_sequential() {
     let path = big_fixture().to_str().unwrap();
     let seq = run(&["--count", "--group-by=level", path]);
     let par = run(&["-j=4", "--count", "--group-by=level", path]);
+    assert_eq!(seq.stdout, par.stdout);
+}
+
+#[test]
+fn parallel_bucket_matches_sequential() {
+    // big_fixture spans ~50_000 seconds; 10-minute buckets give ~83 buckets,
+    // comfortably more than -j=4 workers, so the bucket-aligned parallel path
+    // fires (rather than falling back to byte-midpoint chunking). Output must
+    // be byte-identical to the sequential run.
+    let path = big_fixture().to_str().unwrap();
+    let seq = run(&["--count", "--group-by=level", "--bucket=10m", path]);
+    let par = run(&["-j=4", "--count", "--group-by=level", "--bucket=10m", path]);
+    assert_eq!(seq.stdout, par.stdout);
+}
+
+#[test]
+fn parallel_n_buckets_matches_sequential() {
+    // --n-buckets path: window comes from the file's first/last timestamps,
+    // 60 buckets / 4 workers = 15 buckets per worker. Sequential and parallel
+    // outputs must match.
+    let path = big_fixture().to_str().unwrap();
+    let seq = run(&["--count", "--group-by=level", "--n-buckets=60", path]);
+    let par = run(&[
+        "-j=4",
+        "--count",
+        "--group-by=level",
+        "--n-buckets=60",
+        path,
+    ]);
     assert_eq!(seq.stdout, par.stdout);
 }
 
