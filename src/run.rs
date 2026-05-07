@@ -196,43 +196,16 @@ impl RawExtractor {
     fn emit<W: Write + ?Sized>(
         &mut self,
         pairs: &[(&str, &str)],
-        transform: Option<&LineTransform>,
         out: &mut W,
     ) -> std::io::Result<()> {
         let Some(key) = self.raw_key.as_deref() else {
             return Ok(());
         };
-        match transform {
-            None => {
-                if let Some(v) = unescape_for_key(pairs, key, &mut self.scratch) {
-                    out.write_all(v.as_bytes())?;
-                    out.write_all(b"\n")?;
-                }
-                Ok(())
-            }
-            Some(tf) => {
-                for (k, v) in pairs {
-                    if tf.key_removed(k) {
-                        continue;
-                    }
-                    if *k == key {
-                        self.scratch.clear();
-                        logfmt::unescape_value(v.as_bytes(), &mut self.scratch);
-                        out.write_all(self.scratch.as_bytes())?;
-                        out.write_all(b"\n")?;
-                        return Ok(());
-                    }
-                }
-                for (k, v) in &tf.add {
-                    if k.as_str() == key {
-                        out.write_all(v.as_bytes())?;
-                        out.write_all(b"\n")?;
-                        return Ok(());
-                    }
-                }
-                Ok(())
-            }
+        if let Some(v) = unescape_for_key(pairs, key, &mut self.scratch) {
+            out.write_all(v.as_bytes())?;
+            out.write_all(b"\n")?;
         }
+        Ok(())
     }
 }
 
@@ -252,21 +225,6 @@ fn fold_min(slot: &mut Option<Timestamp>, t: Timestamp) {
 #[inline]
 fn fold_max(slot: &mut Option<Timestamp>, t: Timestamp) {
     *slot = Some(slot.map_or(t, |cur| cur.max(t)));
-}
-
-/// Comparator for streaming output: bucket time ascending, then count
-/// descending, then combo ascending. Shared by `flush_closed` and
-/// `flush_remaining` so both paths agree on ordering. (`report` uses a
-/// different order — count desc — for batch-mode summaries.)
-fn stream_order(
-    ka: &GroupKey,
-    sa: &GroupStats,
-    kb: &GroupKey,
-    sb: &GroupStats,
-) -> std::cmp::Ordering {
-    ka.1.cmp(&kb.1)
-        .then_with(|| sb.count.cmp(&sa.count))
-        .then_with(|| ka.0.cmp(&kb.0))
 }
 
 impl GroupStats {
@@ -323,7 +281,7 @@ impl BucketSpec {
 /// kept as separate typed fields rather than smushed into a single
 /// `SmallVec<SmartString>`, which avoids a per-line `format!` + reverse
 /// `parse::<i64>()` round-trip on the hot path.
-type GroupKey = (Combo, Option<Timestamp>);
+use std::collections::BTreeMap;
 
 /// Groups matched lines by the value tuple of `keys` (and optionally a time
 /// bucket) and records per-group count + observed timestamp range. Missing
@@ -333,7 +291,7 @@ type GroupKey = (Combo, Option<Timestamp>);
 struct Counter {
     keys: Vec<SmartString>,
     bucket: Option<BucketSpec>,
-    counts: RapidHashMap<GroupKey, GroupStats>,
+    counts: BTreeMap<Option<Timestamp>, RapidHashMap<Combo, GroupStats>>,
     scratch: String,
     /// In streaming mode, track the highest timestamp observed across all
     /// matched lines. Used to decide which buckets are past the close
@@ -353,7 +311,7 @@ impl Counter {
         Self {
             keys,
             bucket,
-            counts: RapidHashMap::default(),
+            counts: BTreeMap::default(),
             scratch: String::new(),
             max_ts_seen: None,
             close_grace_nanos: 0,
@@ -403,7 +361,9 @@ impl Counter {
             combo.push(value);
         }
         self.counts
-            .entry((combo, bucket_ts))
+            .entry(bucket_ts)
+            .or_default()
+            .entry(combo)
             .or_default()
             .record(ts);
     }
@@ -442,10 +402,20 @@ impl Counter {
         if !self.is_active() || self.counts.is_empty() {
             return Ok(());
         }
-        let mut entries: Vec<(&GroupKey, &GroupStats)> = self.counts.iter().collect();
-        entries.sort_unstable_by(|a, b| b.1.count.cmp(&a.1.count).then_with(|| a.0.cmp(b.0)));
-        for ((combo, bucket_ts), stats) in entries {
-            self.write_row(out, combo, *bucket_ts, stats, tz)?;
+        let mut entries = Vec::new();
+        for (bucket_ts, groups) in &self.counts {
+            for (combo, stats) in groups {
+                entries.push((combo, *bucket_ts, stats));
+            }
+        }
+        entries.sort_unstable_by(|a, b| {
+            b.2.count
+                .cmp(&a.2.count)
+                .then_with(|| a.0.cmp(b.0))
+                .then_with(|| a.1.cmp(&b.1))
+        });
+        for (combo, bucket_ts, stats) in entries {
+            self.write_row(out, combo, bucket_ts, stats, tz)?;
         }
         Ok(())
     }
@@ -468,29 +438,37 @@ impl Counter {
         let Some(seen) = self.max_ts_seen else {
             return Ok(());
         };
+
         let close_threshold = seen - bspec.nanos - self.close_grace_nanos;
 
-        let to_close: Vec<GroupKey> = self
-            .counts
-            .keys()
-            .filter(|key| matches!(key.1, Some(bts) if bts < close_threshold))
-            .cloned()
-            .collect();
-        if to_close.is_empty() {
+        let mut open_buckets = self.counts.split_off(&Some(close_threshold));
+        if let Some(none_groups) = self.counts.remove(&None) {
+            open_buckets.insert(None, none_groups);
+        }
+
+        if self.counts.is_empty() {
+            self.counts = open_buckets;
             return Ok(());
         }
-        // Move ownership of stats out of the map in one pass — no extra
-        // lookups during the sort comparator.
-        let mut closed: Vec<(GroupKey, GroupStats)> = to_close
-            .into_iter()
-            .map(|key| {
-                let stats = self.counts.remove(&key).expect("just enumerated");
-                (key, stats)
-            })
-            .collect();
-        closed.sort_unstable_by(|a, b| stream_order(&a.0, &a.1, &b.0, &b.1));
-        for (key, stats) in &closed {
-            self.write_row(out, &key.0, key.1, stats, tz)?;
+
+        let mut to_close = Vec::new();
+        let closing_counts = std::mem::replace(&mut self.counts, open_buckets);
+        for (bucket_ts, groups) in closing_counts.into_iter() {
+            for (combo, stats) in groups {
+                to_close.push((combo, bucket_ts, stats));
+            }
+        }
+
+        // Since we extracted them in bucket order, and split_off splits at bucket level,
+        // we can just sort to_close as needed.
+        // stream_order is: bucket_ts asc, count desc, combo asc.
+        to_close.sort_unstable_by(|a, b| {
+            a.1.cmp(&b.1)
+                .then_with(|| b.2.count.cmp(&a.2.count))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        for (combo, bucket_ts, stats) in &to_close {
+            self.write_row(out, combo, *bucket_ts, stats, tz)?;
         }
         out.flush()
     }
@@ -505,17 +483,39 @@ impl Counter {
         if self.counts.is_empty() {
             return Ok(());
         }
-        let mut entries: Vec<(&GroupKey, &GroupStats)> = self.counts.iter().collect();
-        entries.sort_unstable_by(|a, b| stream_order(a.0, a.1, b.0, b.1));
-        for ((combo, bucket_ts), stats) in entries {
-            self.write_row(out, combo, *bucket_ts, stats, tz)?;
+        let mut entries = Vec::new();
+        for (bucket_ts, groups) in &self.counts {
+            for (combo, stats) in groups {
+                entries.push((combo, *bucket_ts, stats));
+            }
+        }
+        entries.sort_unstable_by(|a, b| {
+            a.1.cmp(&b.1)
+                .then_with(|| b.2.count.cmp(&a.2.count))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        for (combo, bucket_ts, stats) in entries {
+            self.write_row(out, combo, bucket_ts, stats, tz)?;
         }
         Ok(())
     }
 
     fn merge(&mut self, other: Self) {
-        for (key, stats) in other.counts {
-            self.counts.entry(key).or_default().merge(stats);
+        if let Some(t) = other.max_ts_seen {
+            fold_max(&mut self.max_ts_seen, t);
+        }
+        for (bucket_ts, groups) in other.counts {
+            match self.counts.entry(bucket_ts) {
+                std::collections::btree_map::Entry::Vacant(e) => {
+                    e.insert(groups);
+                }
+                std::collections::btree_map::Entry::Occupied(mut e) => {
+                    let self_groups = e.get_mut();
+                    for (combo, stats) in groups {
+                        self_groups.entry(combo).or_default().merge(stats);
+                    }
+                }
+            }
         }
     }
 }
@@ -1407,7 +1407,7 @@ fn emit_match<W: Write + ?Sized>(
     passthrough_emit: bool,
     out: &mut W,
 ) -> std::io::Result<()> {
-    raw.emit(parsed, transform, out)?;
+    raw.emit(parsed, out)?;
 
     if suppress_lines {
         return Ok(());

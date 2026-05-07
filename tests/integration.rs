@@ -1148,6 +1148,25 @@ fn add_comma_separates_pairs() {
 }
 
 #[test]
+fn add_conflicts_with_raw_key() {
+    let path = fixture_path().to_str().unwrap();
+    let out = Command::new(riplog_bin())
+        .args(["--raw-key", "msg", "--add", "msg=hello", path])
+        .output()
+        .expect("spawn riplog");
+    assert!(
+        !out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("conflicts with `--raw-key`"),
+        "stderr should mention conflict: {err}"
+    );
+}
+
+#[test]
 fn rm_drops_field() {
     let path = fixture_path().to_str().unwrap();
     let out = run(&["--limit", "1", "--rm", "msg", path]);

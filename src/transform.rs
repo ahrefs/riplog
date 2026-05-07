@@ -80,6 +80,9 @@ pub(crate) fn parse_line_transform(cli: &Cli) -> anyhow::Result<Option<LineTrans
         if key.is_empty() {
             anyhow::bail!("--add: empty key in `{s}`");
         }
+        if cli.raw_key.as_deref() == Some(key) {
+            anyhow::bail!("`--add` key `{key}` conflicts with `--raw-key`");
+        }
         add.push((SmartString::from(key), SmartString::from(val)));
     }
     Ok(Some(LineTransform { remove, add }))
