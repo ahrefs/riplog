@@ -22,17 +22,10 @@ use crate::filter::Filter;
 use crate::logfmt;
 use crate::sort::SortBuffer;
 use crate::timestamp::{self, Timestamp};
-
-// ANSI escapes for colorized output.
-const RESET: &str = "\x1b[0m";
-const BOLD: &str = "\x1b[1m";
-const COL_BLUE: &str = "\x1b[34m";
-const COL_RED: &str = "\x1b[31m";
-const COL_YELLOW: &str = "\x1b[33m";
-const COL_GRAY: &str = "\x1b[90m";
-const COL_QUOTE: &str = "\x1b[1;34m";
-// Bright white on red background — used for `critical`/`crit` so it really pops.
-const COL_CRIT: &str = "\x1b[97;41m";
+use crate::transform::{
+    parse_line_transform, validate_rm_vs_features, write_colored_line, write_plain_reconstructed,
+    EmitScratch, LineTransform,
+};
 
 /// Set by the SIGINT handler; checked in tight loops so we can exit cleanly
 /// and still emit `--count` / `--list-keys` / `--count-by` summaries.
@@ -188,14 +181,14 @@ impl ValueGather {
 /// suppresses the normal full-line output. Lines lacking the key are
 /// silently skipped.
 struct RawExtractor {
-    key: Option<SmartString>,
+    raw_key: Option<SmartString>,
     scratch: String,
 }
 
 impl RawExtractor {
-    fn new(key: Option<&str>) -> Self {
+    fn new(raw_key: Option<&str>) -> Self {
         Self {
-            key: key.map(SmartString::from),
+            raw_key: raw_key.map(SmartString::from),
             scratch: String::new(),
         }
     }
@@ -203,16 +196,43 @@ impl RawExtractor {
     fn emit<W: Write + ?Sized>(
         &mut self,
         pairs: &[(&str, &str)],
+        transform: Option<&LineTransform>,
         out: &mut W,
     ) -> std::io::Result<()> {
-        let Some(key) = self.key.as_deref() else {
+        let Some(key) = self.raw_key.as_deref() else {
             return Ok(());
         };
-        if let Some(v) = unescape_for_key(pairs, key, &mut self.scratch) {
-            out.write_all(v.as_bytes())?;
-            out.write_all(b"\n")?;
+        match transform {
+            None => {
+                if let Some(v) = unescape_for_key(pairs, key, &mut self.scratch) {
+                    out.write_all(v.as_bytes())?;
+                    out.write_all(b"\n")?;
+                }
+                Ok(())
+            }
+            Some(tf) => {
+                for (k, v) in pairs {
+                    if tf.key_removed(k) {
+                        continue;
+                    }
+                    if *k == key {
+                        self.scratch.clear();
+                        logfmt::unescape_value(v.as_bytes(), &mut self.scratch);
+                        out.write_all(self.scratch.as_bytes())?;
+                        out.write_all(b"\n")?;
+                        return Ok(());
+                    }
+                }
+                for (k, v) in &tf.add {
+                    if k.as_str() == key {
+                        out.write_all(v.as_bytes())?;
+                        out.write_all(b"\n")?;
+                        return Ok(());
+                    }
+                }
+                Ok(())
+            }
         }
-        Ok(())
     }
 }
 
@@ -569,6 +589,10 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
     }
 
     let filter = Filter::parse(&cli.keys)?;
+    let line_transform = parse_line_transform(cli)?;
+    if let Some(ref t) = line_transform {
+        validate_rm_vs_features(cli, &t.remove)?;
+    }
     let following = cli.follow || cli.follow_reopen;
 
     if following && cli.n_buckets.is_some() {
@@ -605,6 +629,9 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
         ColorMode::Auto => cli.output.is_none() && std::io::stdout().is_terminal(),
     };
 
+    // Memcpy fast path: unchanged for entire run (`filter` / CLI transforms / color).
+    let passthrough_emit = !colorize && line_transform.is_none() && filter.is_empty();
+
     // `Send` so the parallel path can hand `&mut output` to its workers
     // through a shared `Mutex`. Using the unlocked `Stdout` (rather than
     // `stdout().lock()`) makes this cross-thread-safe; the per-call lock
@@ -636,7 +663,11 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
                 origin: 0,
                 n_buckets: None,
             });
-        // stdin can't follow (rejected earlier); no streaming activation.
+        // stdin can't follow (rejected earlier), but `--bucket` still
+        // enables streaming output: the per-line `flush_closed` hook in
+        // `process_line` emits closed buckets in time order as we go,
+        // without any seek (pipes can't seek). At EOF, `emit_summaries`
+        // calls `flush_remaining` for the still-open buckets.
         let mut sinks = make_sinks(
             cli,
             sampler.clone(),
@@ -644,7 +675,13 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
             colorize,
             bucket,
             tz.clone(),
+            line_transform.clone(),
+            passthrough_emit,
         );
+        if bucket.is_some() {
+            let grace = (cli.window_secs as i64).saturating_mul(1_000_000_000);
+            sinks.enable_streaming(grace);
+        }
         stream_unbounded(
             &mut std::io::stdin().lock(),
             &filter,
@@ -741,6 +778,8 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
         colorize,
         bucket,
         tz.clone(),
+        line_transform.clone(),
+        passthrough_emit,
     );
     // Master streams under follow; workers always batch (their output would
     // interleave on the shared writer otherwise) and merge into the master.
@@ -783,6 +822,8 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
                 tz: tz.clone(),
                 output: &mut *output,
                 master: &mut sinks,
+                line_transform: line_transform.clone(),
+                passthrough_emit,
             })?;
             output.flush()?;
         } else {
@@ -1029,6 +1070,11 @@ pub(crate) struct Sinks {
     /// Display timezone, used by the streaming bucket flush to format
     /// `bucket.start` / `bucket.end` / `time.start` / `time.end` on the fly.
     tz: jiff::tz::TimeZone,
+    /// When set, `--rm` / `--add` mutate emitted lines (not used for `--if`).
+    transform: Option<LineTransform>,
+    emit_scratch: EmitScratch,
+    /// When true, emit matched lines by copying input bytes (no parse-roundtrip).
+    passthrough_emit: bool,
 }
 
 impl Sinks {
@@ -1142,6 +1188,7 @@ fn resolve_bucket_spec(
 /// fields are derived from `cli`; the `sampler` template is cloned in (its
 /// inner `Arc<Filter>` is shared, so cloning is cheap). All collected
 /// state (counts, gathers, sort buffer) starts empty.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn make_sinks(
     cli: &Cli,
     sampler: Option<Sampler>,
@@ -1149,6 +1196,8 @@ pub(crate) fn make_sinks(
     colorize: bool,
     bucket: Option<BucketSpec>,
     tz: jiff::tz::TimeZone,
+    transform: Option<LineTransform>,
+    passthrough_emit: bool,
 ) -> Sinks {
     let counter = Counter::new(cli.group_by.iter().map(SmartString::from).collect(), bucket);
     Sinks {
@@ -1163,6 +1212,9 @@ pub(crate) fn make_sinks(
         colorize,
         limit: cli.limit,
         tz,
+        transform,
+        emit_scratch: EmitScratch::default(),
+        passthrough_emit,
     }
 }
 
@@ -1279,16 +1331,28 @@ fn process_line<W: Write + ?Sized>(
         sinks.counter.flush_closed(output, &sinks.tz)?;
         sinks.keys.record(parsed);
         sinks.values.record(parsed);
+        let line_tf = sinks.transform.as_ref();
         if let Some(sort_buf) = sinks.sort_buf.as_mut() {
             // Aggregation modes without --raw-key produce no per-line bytes;
             // skip the capture in that case (counters above already recorded).
-            if !sinks.suppress_lines || sinks.raw.key.is_some() {
+            if !sinks.suppress_lines || sinks.raw.raw_key.is_some() {
                 let raw = &mut sinks.raw;
+                let scratch = &mut sinks.emit_scratch;
                 let suppress = sinks.suppress_lines;
                 let color = sinks.colorize;
                 sort_buf.capture(parsed, |w| {
                     emit_match(
-                        parsed, line_buf, raw_len, parse_end, raw, suppress, color, w,
+                        parsed,
+                        line_buf,
+                        raw_len,
+                        parse_end,
+                        raw,
+                        suppress,
+                        color,
+                        line_tf,
+                        scratch,
+                        sinks.passthrough_emit,
+                        w,
                     )
                 })?;
             }
@@ -1301,12 +1365,29 @@ fn process_line<W: Write + ?Sized>(
                 &mut sinks.raw,
                 sinks.suppress_lines,
                 sinks.colorize,
+                line_tf,
+                &mut sinks.emit_scratch,
+                sinks.passthrough_emit,
                 output,
             )?;
         }
     }
     line_buf.clear();
     Ok(())
+}
+
+#[inline]
+fn append_reconstructed_plain_tail(
+    buf: &mut Vec<u8>,
+    line_buf: &[u8],
+    raw_len: usize,
+    parse_end: usize,
+) {
+    if raw_len == parse_end {
+        buf.push(b'\n');
+    } else {
+        buf.extend_from_slice(&line_buf[parse_end..raw_len]);
+    }
 }
 
 /// Emit one matched line to `out`: the `--raw-key` extraction (if any),
@@ -1321,89 +1402,32 @@ fn emit_match<W: Write + ?Sized>(
     raw: &mut RawExtractor,
     suppress_lines: bool,
     colorize: bool,
+    transform: Option<&LineTransform>,
+    scratch: &mut EmitScratch,
+    passthrough_emit: bool,
     out: &mut W,
 ) -> std::io::Result<()> {
-    raw.emit(parsed, out)?;
-    if !suppress_lines {
-        if colorize {
-            write_colored_line(out, parsed)?;
-        } else {
-            out.write_all(line_buf)?;
-            if raw_len == parse_end {
-                // No trailing newline in the source; add one for tidy output.
-                out.write_all(b"\n")?;
+    raw.emit(parsed, transform, out)?;
+
+    if suppress_lines {
+        return Ok(());
+    }
+
+    if passthrough_emit {
+        out.write_all(line_buf)?;
+        if raw_len == parse_end {
+            out.write_all(b"\n")?;
+        }
+    } else {
+        scratch.write_slow(out, |buf| {
+            if colorize {
+                write_colored_line(buf, parsed, transform)
+            } else {
+                write_plain_reconstructed(buf, parsed, transform)?;
+                append_reconstructed_plain_tail(buf, line_buf, raw_len, parse_end);
+                Ok(())
             }
-        }
-    }
-    Ok(())
-}
-
-fn level_color(value: &str) -> &'static str {
-    let v = value.trim_matches('"');
-    match v {
-        "critical" | "CRITICAL" | "crit" | "CRIT" => COL_CRIT,
-        "error" | "fatal" | "ERROR" | "FATAL" => COL_RED,
-        "warn" | "warning" | "WARN" | "WARNING" => COL_YELLOW,
-        "info" | "INFO" => COL_BLUE,
-        "debug" | "trace" | "DEBUG" | "TRACE" => COL_GRAY,
-        _ => "",
-    }
-}
-
-fn write_colored_line<W: Write + ?Sized>(
-    out: &mut W,
-    pairs: &[(&str, &str)],
-) -> std::io::Result<()> {
-    let lvl_sgr = pairs
-        .iter()
-        .find_map(|(k, v)| (*k == "level").then(|| level_color(v)))
-        .unwrap_or("");
-
-    for (i, (k, v)) in pairs.iter().enumerate() {
-        if i > 0 {
-            out.write_all(b" ")?;
-        }
-        write!(out, "{BOLD}{k}{RESET}=")?;
-        let color: &str = match *k {
-            "time" | "ts" => COL_BLUE,
-            "level" => lvl_sgr,
-            _ => "",
-        };
-        write_value(out, v, color, *k == "level")?;
-    }
-    out.write_all(b"\n")?;
-    Ok(())
-}
-
-/// Emit a value with optional color and bold. If the value is wrapped in
-/// double quotes, the quote characters are highlighted so the content
-/// boundary is easy to spot.
-fn write_value<W: Write + ?Sized>(
-    out: &mut W,
-    v: &str,
-    color: &str,
-    bold: bool,
-) -> std::io::Result<()> {
-    let b = v.as_bytes();
-    let quoted = b.len() >= 2 && b[0] == b'"' && b[b.len() - 1] == b'"';
-    let inner = if quoted { &v[1..v.len() - 1] } else { v };
-    let styled = bold || !color.is_empty();
-
-    if quoted {
-        write!(out, "{COL_QUOTE}\"{RESET}")?;
-    }
-    if bold {
-        out.write_all(BOLD.as_bytes())?;
-    }
-    if !color.is_empty() {
-        out.write_all(color.as_bytes())?;
-    }
-    out.write_all(inner.as_bytes())?;
-    if styled {
-        out.write_all(RESET.as_bytes())?;
-    }
-    if quoted {
-        write!(out, "{COL_QUOTE}\"{RESET}")?;
+        })?;
     }
     Ok(())
 }

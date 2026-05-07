@@ -87,9 +87,10 @@ pub struct Cli {
 
     /// Add a fixed-width, epoch-aligned time bucket dimension to the
     /// grouping. Same duration syntax as `--from start+<dur>` (`5m`, `30s`,
-    /// `2 hours`). Under `-f`/`-F` switches to streaming output: rows
-    /// emit as buckets close (when `max_ts_seen > bucket.end +
-    /// window_secs`). Requires `--count`. Conflicts with `--n-buckets`.
+    /// `2 hours`). Under `-f`/`-F`, or when reading from stdin, switches to
+    /// streaming output: rows emit as buckets close (when `max_ts_seen >
+    /// bucket.end + window_secs`). Requires `--count`. Conflicts with
+    /// `--n-buckets`.
     #[arg(
         long,
         value_name = "DURATION",
@@ -172,6 +173,19 @@ pub struct Cli {
     /// `--raw-key` (the emitted unescaped values are sorted by `<KEY>`).
     #[arg(long = "sort-by", value_name = "KEY")]
     pub sort_by: Option<String>,
+
+    /// Append `key=value` pairs at the end of each emitted line (after any
+    /// `--rm`). Repeatable; each occurrence may be comma-separated (same
+    /// rule as `--group-by`). Values cannot contain commas; use multiple
+    /// `--add` flags instead.
+    #[arg(long = "add", value_name = "KEY=VALUE", value_delimiter = ',')]
+    pub add: Vec<String>,
+
+    /// Drop every pair with this key before output. Repeatable;
+    /// comma-separated lists are split like `--group-by`. Must not name a key
+    /// used by `--group-by`, `--sort-by`, `--list-values-for`, or `--raw-key`.
+    #[arg(long = "rm", value_name = "KEY", value_delimiter = ',')]
+    pub rm: Vec<String>,
 
     /// Search a single file in parallel. `-j` (no value) uses every available
     /// core; `-j=4` uses 4 worker threads. Output is **unordered** — workers

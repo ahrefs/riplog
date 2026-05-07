@@ -8,6 +8,7 @@ mod parallel;
 mod run;
 mod sort;
 mod timestamp;
+mod transform;
 
 use clap::Parser;
 

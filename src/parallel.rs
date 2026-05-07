@@ -13,6 +13,7 @@ use std::sync::Mutex;
 use crate::cli::Cli;
 use crate::filter::Filter;
 use crate::run::{make_sinks, stream_bounded, BucketSpec, Sampler, Sinks, TimeFilter};
+use crate::transform::LineTransform;
 
 /// Below this many bytes per worker, parallel mode falls back to sequential —
 /// the fixed per-thread overhead would dominate the per-byte work.
@@ -39,6 +40,8 @@ pub(crate) struct Job<'a> {
     pub tz: jiff::tz::TimeZone,
     pub output: &'a mut (dyn Write + Send),
     pub master: &'a mut Sinks,
+    pub line_transform: Option<LineTransform>,
+    pub passthrough_emit: bool,
 }
 
 /// Spawn `job.n_workers` threads searching disjoint chunks of `job.path`
@@ -60,6 +63,8 @@ pub(crate) fn run(job: Job<'_>) -> anyhow::Result<()> {
         tz,
         output,
         master,
+        line_transform,
+        passthrough_emit,
     } = job;
 
     let end_byte = start_byte.saturating_add(max_bytes);
@@ -92,12 +97,21 @@ pub(crate) fn run(job: Job<'_>) -> anyhow::Result<()> {
                 let sampler = sampler.clone();
                 let shared = &shared_out;
                 let tz = tz.clone();
+                let worker_tf = line_transform.clone();
                 s.spawn(move || -> anyhow::Result<Sinks> {
                     // Workers don't call `enable_streaming`: rows must batch
                     // into per-worker `Sinks` and merge into the master, or
                     // multi-writer output interleaves on the shared sink.
-                    let mut sinks =
-                        make_sinks(cli, sampler, suppress_lines, colorize, bucket, tz);
+                    let mut sinks = make_sinks(
+                        cli,
+                        sampler,
+                        suppress_lines,
+                        colorize,
+                        bucket,
+                        tz,
+                        worker_tf,
+                        passthrough_emit,
+                    );
                     let mut file = File::open(path)?;
                     file.seek(SeekFrom::Start(cs))?;
                     let mut reader = BufReader::new(file);

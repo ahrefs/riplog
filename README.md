@@ -120,16 +120,17 @@ riplog --count --n-buckets=60 --if 'level>=error' --from start --to end app.log
 
 always emits 60 rows — one per equal-width slice across the range.
 
-### Streaming under `-f` / `-F`
+### Streaming under `-f` / `-F` (and stdin)
 
-When `--bucket=DURATION` is combined with `-f` or `-F`, output switches to
-streaming mode: each bucket's row is emitted as soon as the bucket closes,
-in time-ascending order. A bucket B closes once
+When `--bucket=DURATION` is combined with `-f`, `-F`, or stdin input,
+output switches to streaming mode: each bucket's row is emitted as soon as
+the bucket closes, in time-ascending order. A bucket B closes once
 `max_ts_seen > B.end + window_secs` (the existing reorder-tolerance flag
 doubles as the close grace). On `Ctrl-C` / EOF, any still-open buckets are
 flushed in time order. This makes
 `riplog -F app.log --count --group-by=svc --bucket=1m` a live histogram
-pipe suitable for graph tooling.
+pipe suitable for graph tooling, and lets stdin act as a one-shot pipe:
+`gen | riplog --count --group-by=svc --bucket=10s | dashboard`.
 
 `-f` / `-F` rejects two combinations: `--n-buckets` (the upper bound is
 unknown in follow mode) and `--group-by` without `--bucket` (no completion

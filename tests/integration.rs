@@ -976,6 +976,60 @@ fn sort_by_orders_stdin_lines_lex() {
 }
 
 #[test]
+fn stdin_bucket_streams_in_time_order() {
+    // Stdin + --bucket activates streaming aggregation: rows come out in
+    // bucket-asc, count-desc-within-bucket order. Today's batch path
+    // (Counter::report) would sort globally by count desc, which would
+    // produce a clearly different sequence — so this test is sensitive to
+    // the streaming code path being wired up for stdin.
+    //
+    // Three buckets, intentionally lopsided per bucket so count-desc within
+    // a bucket flips the order across buckets:
+    //   A (18:00:00..01): 3×info + 2×error  -> info first
+    //   B (18:00:01..02): 4×error + 1×info  -> error first
+    //   C (18:00:02..03): 5×info             -> info only
+    let mut child = Command::new(riplog_bin())
+        .args([
+            "--count",
+            "--group-by=level",
+            "--bucket=1s",
+            "--window-secs=1",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let input = b"\
+time=2026-04-24T18:00:00Z level=info msg=a\n\
+time=2026-04-24T18:00:00Z level=error msg=b\n\
+time=2026-04-24T18:00:00Z level=info msg=a\n\
+time=2026-04-24T18:00:00Z level=error msg=b\n\
+time=2026-04-24T18:00:00Z level=info msg=a\n\
+time=2026-04-24T18:00:01Z level=error msg=b\n\
+time=2026-04-24T18:00:01Z level=info msg=a\n\
+time=2026-04-24T18:00:01Z level=error msg=b\n\
+time=2026-04-24T18:00:01Z level=error msg=b\n\
+time=2026-04-24T18:00:01Z level=error msg=b\n\
+time=2026-04-24T18:00:02Z level=info msg=a\n\
+time=2026-04-24T18:00:02Z level=info msg=a\n\
+time=2026-04-24T18:00:02Z level=info msg=a\n\
+time=2026-04-24T18:00:02Z level=info msg=a\n\
+time=2026-04-24T18:00:02Z level=info msg=a\n";
+    child.stdin.as_mut().unwrap().write_all(input).unwrap();
+    drop(child.stdin.take());
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "stderr: {:?}", out.stderr);
+    let want = "\
+count=3 key.level=info bucket.start=2026-04-24T18:00:00Z bucket.end=2026-04-24T18:00:01Z time.start=2026-04-24T18:00:00Z time.end=2026-04-24T18:00:00Z\n\
+count=2 key.level=error bucket.start=2026-04-24T18:00:00Z bucket.end=2026-04-24T18:00:01Z time.start=2026-04-24T18:00:00Z time.end=2026-04-24T18:00:00Z\n\
+count=4 key.level=error bucket.start=2026-04-24T18:00:01Z bucket.end=2026-04-24T18:00:02Z time.start=2026-04-24T18:00:01Z time.end=2026-04-24T18:00:01Z\n\
+count=1 key.level=info bucket.start=2026-04-24T18:00:01Z bucket.end=2026-04-24T18:00:02Z time.start=2026-04-24T18:00:01Z time.end=2026-04-24T18:00:01Z\n\
+count=5 key.level=info bucket.start=2026-04-24T18:00:02Z bucket.end=2026-04-24T18:00:03Z time.start=2026-04-24T18:00:02Z time.end=2026-04-24T18:00:02Z\n";
+    assert_eq!(String::from_utf8_lossy(&out.stdout), want);
+}
+
+#[test]
 fn sort_by_with_raw_key_sorts_extracted_values() {
     let mut child = Command::new(riplog_bin())
         .args(["--sort-by=time", "--raw-key=msg"])
@@ -1067,6 +1121,52 @@ fn sort_by_composes_with_if_filter() {
     let mut sorted = msgs.clone();
     sorted.sort();
     assert_eq!(msgs, sorted);
+}
+
+#[test]
+fn add_appends_pairs_at_end() {
+    let path = fixture_path().to_str().unwrap();
+    let out = run(&["--limit", "1", "--add", "tag=ok", path]);
+    let line = lines(&out.stdout).into_iter().next().unwrap();
+    assert!(
+        line.contains(" tag=ok"),
+        "expected appended pair, got {:?}",
+        line
+    );
+}
+
+#[test]
+fn add_comma_separates_pairs() {
+    let path = fixture_path().to_str().unwrap();
+    let out = run(&["--limit", "1", "--add=tag=ok,extra=2", path]);
+    let line = lines(&out.stdout).into_iter().next().unwrap();
+    assert!(
+        line.contains(" tag=ok") && line.contains(" extra=2"),
+        "got {:?}",
+        line
+    );
+}
+
+#[test]
+fn rm_drops_field() {
+    let path = fixture_path().to_str().unwrap();
+    let out = run(&["--limit", "1", "--rm", "msg", path]);
+    let line = lines(&out.stdout).into_iter().next().unwrap();
+    assert!(!line.contains("msg="), "got {:?}", line);
+}
+
+#[test]
+fn rm_conflicts_with_group_by() {
+    let path = fixture_path().to_str().unwrap();
+    let out = Command::new(riplog_bin())
+        .args(["--count", "--group-by", "level", "--rm", "level", path])
+        .output()
+        .expect("spawn riplog");
+    assert!(
+        !out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[cfg(unix)]
