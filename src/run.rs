@@ -11,8 +11,8 @@ use std::{
     fs::File,
     io::{BufRead, BufReader, BufWriter, IsTerminal, Read, Seek, SeekFrom, Write},
     path::Path,
-    sync::Arc,
     sync::atomic::{AtomicBool, Ordering},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -22,17 +22,10 @@ use crate::filter::Filter;
 use crate::logfmt;
 use crate::sort::SortBuffer;
 use crate::timestamp::{self, Timestamp};
-
-// ANSI escapes for colorized output.
-const RESET: &str = "\x1b[0m";
-const BOLD: &str = "\x1b[1m";
-const COL_BLUE: &str = "\x1b[34m";
-const COL_RED: &str = "\x1b[31m";
-const COL_YELLOW: &str = "\x1b[33m";
-const COL_GRAY: &str = "\x1b[90m";
-const COL_QUOTE: &str = "\x1b[1;34m";
-// Bright white on red background — used for `critical`/`crit` so it really pops.
-const COL_CRIT: &str = "\x1b[97;41m";
+use crate::transform::{
+    parse_line_transform, validate_rm_vs_features, write_colored_line, write_plain_reconstructed,
+    EmitScratch, LineTransform,
+};
 
 /// Set by the SIGINT handler; checked in tight loops so we can exit cleanly
 /// and still emit `--count` / `--list-keys` / `--count-by` summaries.
@@ -188,14 +181,14 @@ impl ValueGather {
 /// suppresses the normal full-line output. Lines lacking the key are
 /// silently skipped.
 struct RawExtractor {
-    key: Option<SmartString>,
+    raw_key: Option<SmartString>,
     scratch: String,
 }
 
 impl RawExtractor {
-    fn new(key: Option<&str>) -> Self {
+    fn new(raw_key: Option<&str>) -> Self {
         Self {
-            key: key.map(SmartString::from),
+            raw_key: raw_key.map(SmartString::from),
             scratch: String::new(),
         }
     }
@@ -205,7 +198,7 @@ impl RawExtractor {
         pairs: &[(&str, &str)],
         out: &mut W,
     ) -> std::io::Result<()> {
-        let Some(key) = self.key.as_deref() else {
+        let Some(key) = self.raw_key.as_deref() else {
             return Ok(());
         };
         if let Some(v) = unescape_for_key(pairs, key, &mut self.scratch) {
@@ -216,33 +209,149 @@ impl RawExtractor {
     }
 }
 
-/// Counts matched lines grouped by the value tuple of `keys`. Missing keys
-/// produce an empty `SmartString` slot (rendered as `key=` in the report).
+/// Aggregated stats for a single (group-keys [, bucket]) combination.
+#[derive(Default)]
+struct GroupStats {
+    count: usize,
+    min_ts: Option<Timestamp>,
+    max_ts: Option<Timestamp>,
+}
+
+#[inline]
+fn fold_min(slot: &mut Option<Timestamp>, t: Timestamp) {
+    *slot = Some(slot.map_or(t, |cur| cur.min(t)));
+}
+
+#[inline]
+fn fold_max(slot: &mut Option<Timestamp>, t: Timestamp) {
+    *slot = Some(slot.map_or(t, |cur| cur.max(t)));
+}
+
+impl GroupStats {
+    fn record(&mut self, ts: Option<Timestamp>) {
+        self.count += 1;
+        if let Some(t) = ts {
+            fold_min(&mut self.min_ts, t);
+            fold_max(&mut self.max_ts, t);
+        }
+    }
+
+    fn merge(&mut self, other: GroupStats) {
+        self.count += other.count;
+        if let Some(t) = other.min_ts {
+            fold_min(&mut self.min_ts, t);
+        }
+        if let Some(t) = other.max_ts {
+            fold_max(&mut self.max_ts, t);
+        }
+    }
+}
+
+/// Time bucketing config: width in nanoseconds, plus the origin the bucket
+/// grid is aligned to. `--bucket=DURATION` uses origin=0 (epoch-aligned, so
+/// 5-minute buckets fall on `:00`, `:05`, ...). `--n-buckets=N` uses
+/// origin=window-start *and* `n_buckets=Some(N)`, which clamps the bucket
+/// index to `[0, N-1]` so a line at the inclusive `end` boundary lands in
+/// the last bucket instead of overflowing into an N+1-th one.
+#[derive(Clone, Copy)]
+pub(crate) struct BucketSpec {
+    nanos: i64,
+    origin: i64,
+    /// When set, clamps the bucket index to `[0, n_buckets-1]`.
+    n_buckets: Option<usize>,
+}
+
+impl BucketSpec {
+    #[inline]
+    fn floor(&self, ts: Timestamp) -> i64 {
+        let mut idx = (ts - self.origin).div_euclid(self.nanos);
+        if let Some(n) = self.n_buckets {
+            let max = (n as i64) - 1;
+            if idx < 0 {
+                idx = 0;
+            } else if idx > max {
+                idx = max;
+            }
+        }
+        self.origin + idx * self.nanos
+    }
+}
+
+/// Map key for one group. The user-keys combo and the bucket boundary are
+/// kept as separate typed fields rather than smushed into a single
+/// `SmallVec<SmartString>`, which avoids a per-line `format!` + reverse
+/// `parse::<i64>()` round-trip on the hot path.
+use std::collections::BTreeMap;
+
+/// Groups matched lines by the value tuple of `keys` (and optionally a time
+/// bucket) and records per-group count + observed timestamp range. Missing
+/// user keys produce an empty value slot (rendered as `key.<k>=""` in the
+/// logfmt report).
 #[derive(Default)]
 struct Counter {
     keys: Vec<SmartString>,
-    counts: RapidHashMap<Combo, usize>,
+    bucket: Option<BucketSpec>,
+    counts: BTreeMap<Option<Timestamp>, RapidHashMap<Combo, GroupStats>>,
     scratch: String,
+    /// In streaming mode, track the highest timestamp observed across all
+    /// matched lines. Used to decide which buckets are past the close
+    /// threshold (`bucket.end + close_grace_nanos`).
+    max_ts_seen: Option<Timestamp>,
+    /// Reorder grace; mirrors `--window-secs`. Bucket B is closed (and
+    /// streamed out) once `max_ts_seen > B.end + close_grace_nanos`.
+    close_grace_nanos: i64,
+    /// Set in follow mode when `--bucket` is active. When `false`, the
+    /// streaming flush methods are no-ops and end-of-process output goes
+    /// through `report` (today's count-desc, single-emission behaviour).
+    streaming: bool,
 }
 
 impl Counter {
-    fn new(keys: Vec<SmartString>) -> Self {
+    fn new(keys: Vec<SmartString>, bucket: Option<BucketSpec>) -> Self {
         Self {
             keys,
-            counts: RapidHashMap::default(),
+            bucket,
+            counts: BTreeMap::default(),
             scratch: String::new(),
+            max_ts_seen: None,
+            close_grace_nanos: 0,
+            streaming: false,
+        }
+    }
+
+    /// Enable streaming output: per-bucket rows emit as soon as
+    /// `max_ts_seen > bucket.end + close_grace_nanos`. No-op unless
+    /// `bucket` is also set (streaming an unbucketed group has no
+    /// completion signal).
+    fn enable_streaming(&mut self, close_grace_nanos: i64) {
+        if self.bucket.is_some() {
+            self.streaming = true;
+            self.close_grace_nanos = close_grace_nanos;
         }
     }
 
     #[inline]
     fn is_active(&self) -> bool {
-        !self.keys.is_empty()
+        !self.keys.is_empty() || self.bucket.is_some()
     }
 
-    fn record(&mut self, pairs: &[(&str, &str)]) {
+    fn record(&mut self, pairs: &[(&str, &str)], ts: Option<Timestamp>) {
         if !self.is_active() {
             return;
         }
+        let bucket_ts = match (self.bucket, ts) {
+            (Some(b), Some(t)) => Some(b.floor(t)),
+            // Bucketing on but the line has no timestamp — can't place it.
+            (Some(_), None) => return,
+            (None, _) => None,
+        };
+
+        if self.streaming {
+            if let Some(t) = ts {
+                fold_max(&mut self.max_ts_seen, t);
+            }
+        }
+
         let mut combo: Combo = SmallVec::with_capacity(self.keys.len());
         for k in &self.keys {
             let mut value = SmartString::new_const();
@@ -251,30 +360,162 @@ impl Counter {
             }
             combo.push(value);
         }
-        *self.counts.entry(combo).or_insert(0) += 1;
+        self.counts
+            .entry(bucket_ts)
+            .or_default()
+            .entry(combo)
+            .or_default()
+            .record(ts);
     }
 
-    fn report<W: Write>(&self, out: &mut W) -> std::io::Result<()> {
+    fn write_row<W: Write + ?Sized>(
+        &self,
+        out: &mut W,
+        combo: &Combo,
+        bucket_ts: Option<Timestamp>,
+        stats: &GroupStats,
+        tz: &jiff::tz::TimeZone,
+    ) -> std::io::Result<()> {
+        write!(out, "count={}", stats.count)?;
+        for (k, v) in self.keys.iter().zip(combo.iter()) {
+            write!(out, " key.{k}=")?;
+            logfmt::write_logfmt_value(out, v.as_str())?;
+        }
+        if let (Some(bspec), Some(start)) = (self.bucket, bucket_ts) {
+            let end = start + bspec.nanos;
+            write!(
+                out,
+                " bucket.start={}",
+                timestamp::format_rfc3339(start, tz)
+            )?;
+            write!(out, " bucket.end={}", timestamp::format_rfc3339(end, tz))?;
+        }
+        if let (Some(a), Some(b)) = (stats.min_ts, stats.max_ts) {
+            write!(out, " time.start={}", timestamp::format_rfc3339(a, tz))?;
+            write!(out, " time.end={}", timestamp::format_rfc3339(b, tz))?;
+        }
+        writeln!(out)
+    }
+
+    /// Batch-mode end-of-run report: count desc, ties broken by key.
+    fn report<W: Write>(&self, out: &mut W, tz: &jiff::tz::TimeZone) -> std::io::Result<()> {
         if !self.is_active() || self.counts.is_empty() {
             return Ok(());
         }
-        let mut entries: Vec<(&Combo, &usize)> = self.counts.iter().collect();
-        // Descending by count, ties broken by combo for deterministic output.
-        entries.sort_unstable_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
-        let count_w = entries[0].1.to_string().len();
-        for (combo, count) in entries {
-            write!(out, "{count:>count_w$}")?;
-            for (k, v) in self.keys.iter().zip(combo.iter()) {
-                write!(out, " {k}={}", v.as_str())?;
+        let mut entries = Vec::new();
+        for (bucket_ts, groups) in &self.counts {
+            for (combo, stats) in groups {
+                entries.push((combo, *bucket_ts, stats));
             }
-            writeln!(out)?;
+        }
+        entries.sort_unstable_by(|a, b| {
+            b.2.count
+                .cmp(&a.2.count)
+                .then_with(|| a.0.cmp(b.0))
+                .then_with(|| a.1.cmp(&b.1))
+        });
+        for (combo, bucket_ts, stats) in entries {
+            self.write_row(out, combo, bucket_ts, stats, tz)?;
+        }
+        Ok(())
+    }
+
+    /// Streaming flush: emit and remove every group whose bucket has
+    /// passed the close threshold (`bucket.end + close_grace_nanos <
+    /// max_ts_seen`). Rows go out in (bucket.start asc, count desc, combo
+    /// asc) order. No-op when `streaming` is false.
+    fn flush_closed<W: Write + ?Sized>(
+        &mut self,
+        out: &mut W,
+        tz: &jiff::tz::TimeZone,
+    ) -> std::io::Result<()> {
+        if !self.streaming {
+            return Ok(());
+        }
+        let Some(bspec) = self.bucket else {
+            return Ok(());
+        };
+        let Some(seen) = self.max_ts_seen else {
+            return Ok(());
+        };
+
+        let close_threshold = seen - bspec.nanos - self.close_grace_nanos;
+
+        let mut open_buckets = self.counts.split_off(&Some(close_threshold));
+        if let Some(none_groups) = self.counts.remove(&None) {
+            open_buckets.insert(None, none_groups);
+        }
+
+        if self.counts.is_empty() {
+            self.counts = open_buckets;
+            return Ok(());
+        }
+
+        let mut to_close = Vec::new();
+        let closing_counts = std::mem::replace(&mut self.counts, open_buckets);
+        for (bucket_ts, groups) in closing_counts.into_iter() {
+            for (combo, stats) in groups {
+                to_close.push((combo, bucket_ts, stats));
+            }
+        }
+
+        // Since we extracted them in bucket order, and split_off splits at bucket level,
+        // we can just sort to_close as needed.
+        // stream_order is: bucket_ts asc, count desc, combo asc.
+        to_close.sort_unstable_by(|a, b| {
+            a.1.cmp(&b.1)
+                .then_with(|| b.2.count.cmp(&a.2.count))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        for (combo, bucket_ts, stats) in &to_close {
+            self.write_row(out, combo, *bucket_ts, stats, tz)?;
+        }
+        out.flush()
+    }
+
+    /// End-of-stream flush: emit any still-open buckets in time order.
+    /// Used in place of `report` when streaming.
+    fn flush_remaining<W: Write>(
+        &self,
+        out: &mut W,
+        tz: &jiff::tz::TimeZone,
+    ) -> std::io::Result<()> {
+        if self.counts.is_empty() {
+            return Ok(());
+        }
+        let mut entries = Vec::new();
+        for (bucket_ts, groups) in &self.counts {
+            for (combo, stats) in groups {
+                entries.push((combo, *bucket_ts, stats));
+            }
+        }
+        entries.sort_unstable_by(|a, b| {
+            a.1.cmp(&b.1)
+                .then_with(|| b.2.count.cmp(&a.2.count))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        for (combo, bucket_ts, stats) in entries {
+            self.write_row(out, combo, bucket_ts, stats, tz)?;
         }
         Ok(())
     }
 
     fn merge(&mut self, other: Self) {
-        for (combo, count) in other.counts {
-            *self.counts.entry(combo).or_insert(0) += count;
+        if let Some(t) = other.max_ts_seen {
+            fold_max(&mut self.max_ts_seen, t);
+        }
+        for (bucket_ts, groups) in other.counts {
+            match self.counts.entry(bucket_ts) {
+                std::collections::btree_map::Entry::Vacant(e) => {
+                    e.insert(groups);
+                }
+                std::collections::btree_map::Entry::Occupied(mut e) => {
+                    let self_groups = e.get_mut();
+                    for (combo, stats) in groups {
+                        self_groups.entry(combo).or_default().merge(stats);
+                    }
+                }
+            }
         }
     }
 }
@@ -311,11 +552,13 @@ impl TimeFilter {
         self.from.is_none() && self.to.is_none()
     }
 
-    fn matches(&self, pairs: &[(&str, &str)]) -> bool {
+    /// Test the (already-parsed) timestamp against the bounds. `None` means
+    /// the line had no parseable timestamp; with bounds set, that's a drop.
+    fn check(&self, ts: Option<Timestamp>) -> bool {
         if self.is_empty() {
             return true;
         }
-        let Some(ts) = timestamp::extract_timestamp(pairs) else {
+        let Some(ts) = ts else {
             return false;
         };
         if let Some(t1) = self.from {
@@ -346,13 +589,37 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
     }
 
     let filter = Filter::parse(&cli.keys)?;
+    let line_transform = parse_line_transform(cli)?;
+    if let Some(ref t) = line_transform {
+        validate_rm_vs_features(cli, &t.remove)?;
+    }
     let following = cli.follow || cli.follow_reopen;
+
+    if following && cli.n_buckets.is_some() {
+        anyhow::bail!(
+            "`--n-buckets` cannot be combined with `-f`/`-F`: bucket width \
+             requires a bounded time range. Use `--bucket=DURATION` instead."
+        );
+    }
+    if following && !cli.group_by.is_empty() && cli.bucket.is_none() {
+        anyhow::bail!(
+            "`--group-by` under `-f`/`-F` requires `--bucket=DURATION`: \
+             without a time dimension, no group is ever 'complete' so \
+             nothing would print until you Ctrl-C."
+        );
+    }
     let suppress_lines = cli.list_keys
         || cli.count
         || !cli.list_values_for.is_empty()
-        || !cli.count_by.is_empty()
+        || !cli.group_by.is_empty()
+        || cli.bucket.is_some()
+        || cli.n_buckets.is_some()
         || cli.raw_key.is_some();
     let tz = timestamp::resolve_tz(cli.tz.as_deref())?;
+    // The bare-number `--count` line is redundant when grouping/bucketing is
+    // active (each row already carries its `count=`), so suppress it then.
+    let bare_count =
+        cli.count && cli.group_by.is_empty() && cli.bucket.is_none() && cli.n_buckets.is_none();
 
     let sampler = build_sampler(cli)?;
 
@@ -361,6 +628,9 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
         ColorMode::Never => false,
         ColorMode::Auto => cli.output.is_none() && std::io::stdout().is_terminal(),
     };
+
+    // Memcpy fast path: unchanged for entire run (`filter` / CLI transforms / color).
+    let passthrough_emit = !colorize && line_transform.is_none() && filter.is_empty();
 
     // `Send` so the parallel path can hand `&mut output` to its workers
     // through a shared `Mutex`. Using the unlocked `Stdout` (rather than
@@ -371,12 +641,46 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
         None => Box::new(BufWriter::new(std::io::stdout())),
     };
 
-    let mut sinks = make_sinks(cli, sampler.clone(), suppress_lines, colorize);
-
     let need_seek = cli.from.is_some() || cli.to.is_some() || following || cli.time_range;
     if cli.files.is_empty() {
         if need_seek {
             anyhow::bail!("`-f`, `-F`, `--from`, `--to`, `--time-range` require a file argument");
+        }
+        if cli.n_buckets.is_some() {
+            anyhow::bail!(
+                "`--n-buckets` requires a file argument: the bucket width is derived \
+                 from the file's time range"
+            );
+        }
+        // Epoch-aligned grid for `--bucket=DURATION` on stdin.
+        let bucket = cli
+            .bucket
+            .as_deref()
+            .map(timestamp::parse_duration_nanos)
+            .transpose()?
+            .map(|nanos| BucketSpec {
+                nanos,
+                origin: 0,
+                n_buckets: None,
+            });
+        // stdin can't follow (rejected earlier), but `--bucket` still
+        // enables streaming output: the per-line `flush_closed` hook in
+        // `process_line` emits closed buckets in time order as we go,
+        // without any seek (pipes can't seek). At EOF, `emit_summaries`
+        // calls `flush_remaining` for the still-open buckets.
+        let mut sinks = make_sinks(
+            cli,
+            sampler.clone(),
+            suppress_lines,
+            colorize,
+            bucket,
+            tz.clone(),
+            line_transform.clone(),
+            passthrough_emit,
+        );
+        if bucket.is_some() {
+            let grace = (cli.window_secs as i64).saturating_mul(1_000_000_000);
+            sinks.enable_streaming(grace);
         }
         stream_unbounded(
             &mut std::io::stdin().lock(),
@@ -386,7 +690,7 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
         )?;
         output.flush()?;
         flush_sort_buf(&mut sinks, &mut output)?;
-        emit_summaries(&sinks, cli.count, &mut output)?;
+        emit_summaries(&sinks, bare_count, &tz, &mut output)?;
         return Ok(());
     }
 
@@ -436,7 +740,8 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
     // the *global* span, not each file's local one — so with two log files
     // around a rotation, `--from start+1h --to start+2h` is one contiguous
     // absolute window applied across both files, not two disjoint slices.
-    let (global_first, global_last) = if cli.from.is_some() || cli.to.is_some() {
+    let need_global = cli.from.is_some() || cli.to.is_some() || cli.n_buckets.is_some();
+    let (global_first, global_last) = if need_global {
         peek_global_window(&cli.files)?
     } else {
         (None, None)
@@ -457,6 +762,30 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
             global_last,
             global_last,
         )?);
+    }
+
+    // Resolve the bucket spec now that the time window is known. Two forms:
+    // - `--bucket=DURATION`: epoch-aligned grid (origin = 0).
+    // - `--n-buckets=N`: divide the *active* window into N equal-width slices
+    //   aligned to the window start, so the output has exactly N rows per
+    //   group (no edge-alignment off-by-one).
+    let bucket = resolve_bucket_spec(cli, &tf, global_first, global_last)?;
+
+    let mut sinks = make_sinks(
+        cli,
+        sampler.clone(),
+        suppress_lines,
+        colorize,
+        bucket,
+        tz.clone(),
+        line_transform.clone(),
+        passthrough_emit,
+    );
+    // Master streams under follow; workers always batch (their output would
+    // interleave on the shared writer otherwise) and merge into the master.
+    if following {
+        let grace = (cli.window_secs as i64).saturating_mul(1_000_000_000);
+        sinks.enable_streaming(grace);
     }
 
     // Phase 1: bisect every file up front against the resolved absolute
@@ -489,8 +818,12 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
                 sampler: sampler.clone(),
                 suppress_lines,
                 colorize,
+                bucket,
+                tz: tz.clone(),
                 output: &mut *output,
                 master: &mut sinks,
+                line_transform: line_transform.clone(),
+                passthrough_emit,
             })?;
             output.flush()?;
         } else {
@@ -500,7 +833,7 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
 
     output.flush()?;
     flush_sort_buf(&mut sinks, &mut output)?;
-    emit_summaries(&sinks, cli.count, &mut output)?;
+    emit_summaries(&sinks, bare_count, &tz, &mut output)?;
 
     Ok(())
 }
@@ -644,9 +977,18 @@ fn stream_plan<W: Write>(
     Ok(())
 }
 
-fn emit_summaries<W: Write>(sinks: &Sinks, count_only: bool, output: &mut W) -> anyhow::Result<()> {
+fn emit_summaries<W: Write>(
+    sinks: &Sinks,
+    count_only: bool,
+    tz: &jiff::tz::TimeZone,
+    output: &mut W,
+) -> anyhow::Result<()> {
     sinks.stats.report();
-    sinks.counter.report(output)?;
+    if sinks.counter.streaming {
+        sinks.counter.flush_remaining(output, tz)?;
+    } else {
+        sinks.counter.report(output, tz)?;
+    }
     sinks.keys.report(output)?;
     sinks.values.report(output)?;
     if count_only {
@@ -725,12 +1067,27 @@ pub(crate) struct Sinks {
     suppress_lines: bool,
     colorize: bool,
     limit: Option<usize>,
+    /// Display timezone, used by the streaming bucket flush to format
+    /// `bucket.start` / `bucket.end` / `time.start` / `time.end` on the fly.
+    tz: jiff::tz::TimeZone,
+    /// When set, `--rm` / `--add` mutate emitted lines (not used for `--if`).
+    transform: Option<LineTransform>,
+    emit_scratch: EmitScratch,
+    /// When true, emit matched lines by copying input bytes (no parse-roundtrip).
+    passthrough_emit: bool,
 }
 
 impl Sinks {
     #[inline]
     fn done(&self) -> bool {
         matches!(self.limit, Some(n) if self.stats.matched_lines >= n)
+    }
+
+    /// Activate streaming bucket emission on the underlying counter. Should
+    /// only be called on the *master* `Sinks` in follow mode — workers must
+    /// stay batched so their output can't interleave on the shared writer.
+    pub(crate) fn enable_streaming(&mut self, close_grace_nanos: i64) {
+        self.counter.enable_streaming(close_grace_nanos);
     }
 
     /// Fold per-worker collected state into `self`. `started` and the
@@ -777,19 +1134,75 @@ fn build_sampler(cli: &Cli) -> anyhow::Result<Option<Sampler>> {
     }
 }
 
+/// Compute the bucket spec from `--bucket` / `--n-buckets`. Caller has
+/// already resolved `tf`; `global_first`/`global_last` are the file-side
+/// bounds returned by `peek_global_window` (or `None` if it wasn't run).
+/// Returns `None` when neither flag is set. Errors when `--n-buckets`
+/// cannot be sized (no resolvable window) or the resulting width is zero.
+fn resolve_bucket_spec(
+    cli: &Cli,
+    tf: &TimeFilter,
+    global_first: Option<Timestamp>,
+    global_last: Option<Timestamp>,
+) -> anyhow::Result<Option<BucketSpec>> {
+    if let Some(s) = cli.bucket.as_deref() {
+        let nanos = timestamp::parse_duration_nanos(s)?;
+        return Ok(Some(BucketSpec {
+            nanos,
+            origin: 0,
+            n_buckets: None,
+        }));
+    }
+    if let Some(n) = cli.n_buckets {
+        if n == 0 {
+            anyhow::bail!("--n-buckets must be > 0");
+        }
+        let start = tf.from.or(global_first).ok_or_else(|| {
+            anyhow::anyhow!(
+                "--n-buckets needs a window start: pass --from, or use a file with parseable timestamps"
+            )
+        })?;
+        let end = tf.to.or(global_last).ok_or_else(|| {
+            anyhow::anyhow!(
+                "--n-buckets needs a window end: pass --to, or use a file with parseable timestamps"
+            )
+        })?;
+        let span = end - start;
+        if span <= 0 {
+            anyhow::bail!("--n-buckets: time range is empty (end <= start)");
+        }
+        let nanos = span / n as i64;
+        if nanos == 0 {
+            anyhow::bail!("--n-buckets={n}: span {span}ns is too small to split into {n} buckets");
+        }
+        return Ok(Some(BucketSpec {
+            nanos,
+            origin: start,
+            n_buckets: Some(n),
+        }));
+    }
+    Ok(None)
+}
+
 /// Construct a fresh `Sinks` for the master or a worker. Configuration
 /// fields are derived from `cli`; the `sampler` template is cloned in (its
 /// inner `Arc<Filter>` is shared, so cloning is cheap). All collected
 /// state (counts, gathers, sort buffer) starts empty.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn make_sinks(
     cli: &Cli,
     sampler: Option<Sampler>,
     suppress_lines: bool,
     colorize: bool,
+    bucket: Option<BucketSpec>,
+    tz: jiff::tz::TimeZone,
+    transform: Option<LineTransform>,
+    passthrough_emit: bool,
 ) -> Sinks {
+    let counter = Counter::new(cli.group_by.iter().map(SmartString::from).collect(), bucket);
     Sinks {
         stats: Stats::default(),
-        counter: Counter::new(cli.count_by.iter().map(SmartString::from).collect()),
+        counter,
         keys: KeyGather::new(cli.list_keys),
         values: ValueGather::new(cli.list_values_for.iter().map(SmartString::from).collect()),
         raw: RawExtractor::new(cli.raw_key.as_deref()),
@@ -798,6 +1211,10 @@ pub(crate) fn make_sinks(
         suppress_lines,
         colorize,
         limit: cli.limit,
+        tz,
+        transform,
+        emit_scratch: EmitScratch::default(),
+        passthrough_emit,
     }
 }
 
@@ -891,7 +1308,15 @@ fn process_line<W: Write + ?Sized>(
     let mut pairs = logfmt::PairsBuffer::<256>::new();
     let (parsed, overflow) = pairs.parse(line_str);
 
-    let matched = tf.matches(parsed)
+    // Extract the timestamp at most once per line, only when something
+    // downstream actually needs it (time-window filter or grouping counter).
+    let ts = if !tf.is_empty() || sinks.counter.is_active() {
+        timestamp::extract_timestamp(parsed)
+    } else {
+        None
+    };
+
+    let matched = tf.check(ts)
         && (filter.is_empty() || filter.matches(parsed))
         && sinks.sampler.as_ref().is_none_or(|s| s.keep(parsed));
 
@@ -899,19 +1324,35 @@ fn process_line<W: Write + ?Sized>(
     sinks.stats.overflow += overflow as usize;
     if matched {
         sinks.stats.matched_lines += 1;
-        sinks.counter.record(parsed);
+        sinks.counter.record(parsed, ts);
+        // Streaming mode (`-f`/`-F` + `--bucket`): emit any buckets that
+        // have passed the close threshold. Cheap when nothing is closeable;
+        // a no-op when streaming is off.
+        sinks.counter.flush_closed(output, &sinks.tz)?;
         sinks.keys.record(parsed);
         sinks.values.record(parsed);
+        let line_tf = sinks.transform.as_ref();
         if let Some(sort_buf) = sinks.sort_buf.as_mut() {
             // Aggregation modes without --raw-key produce no per-line bytes;
             // skip the capture in that case (counters above already recorded).
-            if !sinks.suppress_lines || sinks.raw.key.is_some() {
+            if !sinks.suppress_lines || sinks.raw.raw_key.is_some() {
                 let raw = &mut sinks.raw;
+                let scratch = &mut sinks.emit_scratch;
                 let suppress = sinks.suppress_lines;
                 let color = sinks.colorize;
                 sort_buf.capture(parsed, |w| {
                     emit_match(
-                        parsed, line_buf, raw_len, parse_end, raw, suppress, color, w,
+                        parsed,
+                        line_buf,
+                        raw_len,
+                        parse_end,
+                        raw,
+                        suppress,
+                        color,
+                        line_tf,
+                        scratch,
+                        sinks.passthrough_emit,
+                        w,
                     )
                 })?;
             }
@@ -924,12 +1365,29 @@ fn process_line<W: Write + ?Sized>(
                 &mut sinks.raw,
                 sinks.suppress_lines,
                 sinks.colorize,
+                line_tf,
+                &mut sinks.emit_scratch,
+                sinks.passthrough_emit,
                 output,
             )?;
         }
     }
     line_buf.clear();
     Ok(())
+}
+
+#[inline]
+fn append_reconstructed_plain_tail(
+    buf: &mut Vec<u8>,
+    line_buf: &[u8],
+    raw_len: usize,
+    parse_end: usize,
+) {
+    if raw_len == parse_end {
+        buf.push(b'\n');
+    } else {
+        buf.extend_from_slice(&line_buf[parse_end..raw_len]);
+    }
 }
 
 /// Emit one matched line to `out`: the `--raw-key` extraction (if any),
@@ -944,89 +1402,32 @@ fn emit_match<W: Write + ?Sized>(
     raw: &mut RawExtractor,
     suppress_lines: bool,
     colorize: bool,
+    transform: Option<&LineTransform>,
+    scratch: &mut EmitScratch,
+    passthrough_emit: bool,
     out: &mut W,
 ) -> std::io::Result<()> {
     raw.emit(parsed, out)?;
-    if !suppress_lines {
-        if colorize {
-            write_colored_line(out, parsed)?;
-        } else {
-            out.write_all(line_buf)?;
-            if raw_len == parse_end {
-                // No trailing newline in the source; add one for tidy output.
-                out.write_all(b"\n")?;
+
+    if suppress_lines {
+        return Ok(());
+    }
+
+    if passthrough_emit {
+        out.write_all(line_buf)?;
+        if raw_len == parse_end {
+            out.write_all(b"\n")?;
+        }
+    } else {
+        scratch.write_slow(out, |buf| {
+            if colorize {
+                write_colored_line(buf, parsed, transform)
+            } else {
+                write_plain_reconstructed(buf, parsed, transform)?;
+                append_reconstructed_plain_tail(buf, line_buf, raw_len, parse_end);
+                Ok(())
             }
-        }
-    }
-    Ok(())
-}
-
-fn level_color(value: &str) -> &'static str {
-    let v = value.trim_matches('"');
-    match v {
-        "critical" | "CRITICAL" | "crit" | "CRIT" => COL_CRIT,
-        "error" | "fatal" | "ERROR" | "FATAL" => COL_RED,
-        "warn" | "warning" | "WARN" | "WARNING" => COL_YELLOW,
-        "info" | "INFO" => COL_BLUE,
-        "debug" | "trace" | "DEBUG" | "TRACE" => COL_GRAY,
-        _ => "",
-    }
-}
-
-fn write_colored_line<W: Write + ?Sized>(
-    out: &mut W,
-    pairs: &[(&str, &str)],
-) -> std::io::Result<()> {
-    let lvl_sgr = pairs
-        .iter()
-        .find_map(|(k, v)| (*k == "level").then(|| level_color(v)))
-        .unwrap_or("");
-
-    for (i, (k, v)) in pairs.iter().enumerate() {
-        if i > 0 {
-            out.write_all(b" ")?;
-        }
-        write!(out, "{BOLD}{k}{RESET}=")?;
-        let color: &str = match *k {
-            "time" | "ts" => COL_BLUE,
-            "level" => lvl_sgr,
-            _ => "",
-        };
-        write_value(out, v, color, *k == "level")?;
-    }
-    out.write_all(b"\n")?;
-    Ok(())
-}
-
-/// Emit a value with optional color and bold. If the value is wrapped in
-/// double quotes, the quote characters are highlighted so the content
-/// boundary is easy to spot.
-fn write_value<W: Write + ?Sized>(
-    out: &mut W,
-    v: &str,
-    color: &str,
-    bold: bool,
-) -> std::io::Result<()> {
-    let b = v.as_bytes();
-    let quoted = b.len() >= 2 && b[0] == b'"' && b[b.len() - 1] == b'"';
-    let inner = if quoted { &v[1..v.len() - 1] } else { v };
-    let styled = bold || !color.is_empty();
-
-    if quoted {
-        write!(out, "{COL_QUOTE}\"{RESET}")?;
-    }
-    if bold {
-        out.write_all(BOLD.as_bytes())?;
-    }
-    if !color.is_empty() {
-        out.write_all(color.as_bytes())?;
-    }
-    out.write_all(inner.as_bytes())?;
-    if styled {
-        out.write_all(RESET.as_bytes())?;
-    }
-    if quoted {
-        write!(out, "{COL_QUOTE}\"{RESET}")?;
+        })?;
     }
     Ok(())
 }

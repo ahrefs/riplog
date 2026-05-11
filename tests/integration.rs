@@ -156,35 +156,171 @@ fn sample_rate_out_of_range_errors() {
     assert!(!out.status.success());
 }
 
-#[test]
-fn count_by_level_matches_distribution() {
-    let path = fixture_path().to_str().unwrap();
-    let out = run(&["--count-by=level", path]);
-    // Output mixes streamed log lines and the trailing count-by table. Pick
-    // out only the table rows (`<count> level=<value>` after stripping
-    // leading whitespace).
-    let mut counts = std::collections::HashMap::new();
-    for line in lines(&out.stdout) {
-        let trimmed = line.trim_start();
-        let mut it = trimmed.split_whitespace();
-        let Some(n_token) = it.next() else { continue };
-        let Ok(n) = n_token.parse::<usize>() else {
+/// Parse logfmt rows of the form `count=N key.<k>=<value> ...` from `output`,
+/// pulling out the `count=` field and the value of `key.<k>=`. Skip lines
+/// that don't start with `count=` (full log lines that aren't part of the
+/// report).
+fn parse_count_rows(output: &[u8], key: &str) -> std::collections::HashMap<String, usize> {
+    let mut out = std::collections::HashMap::new();
+    for line in lines(output) {
+        let mut it = line.split_whitespace();
+        let Some(c_tok) = it.next() else { continue };
+        let Some(c_str) = c_tok.strip_prefix("count=") else {
             continue;
         };
-        let Some(kv) = it.next() else { continue };
-        let Some(value) = kv.strip_prefix("level=") else {
+        let Ok(n) = c_str.parse::<usize>() else {
             continue;
         };
-        if it.next().is_some() {
-            continue; // a real log line has more tokens after `level=…`
+        let prefix = format!("key.{key}=");
+        let mut value: Option<String> = None;
+        for tok in it {
+            if let Some(v) = tok.strip_prefix(&prefix) {
+                value = Some(v.to_string());
+                break;
+            }
         }
-        counts.insert(value.to_string(), n);
+        if let Some(v) = value {
+            out.insert(v, n);
+        }
     }
+    out
+}
+
+#[test]
+fn group_by_level_matches_distribution() {
+    let path = fixture_path().to_str().unwrap();
+    let out = run(&["--count", "--group-by=level", path]);
+    let counts = parse_count_rows(&out.stdout, "level");
     assert_eq!(counts.get("debug"), Some(&N_DEBUG));
     assert_eq!(counts.get("error"), Some(&N_ERROR));
     assert_eq!(counts.get("info"), Some(&N_INFO));
     assert_eq!(counts.get("warn"), Some(&N_WARN));
     assert_eq!(counts.get("critical"), Some(&N_CRITICAL));
+}
+
+#[test]
+fn group_by_without_count_errors() {
+    let out = Command::new(riplog_bin())
+        .args(["--group-by=level", fixture_path().to_str().unwrap()])
+        .output()
+        .expect("spawn riplog");
+    assert!(!out.status.success(), "expected non-zero exit");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("--count"),
+        "stderr should mention --count: {err}"
+    );
+}
+
+#[test]
+fn bucket_alone_partitions_time_range() {
+    // Fixture spans 20s starting at 18:00:00 (200 lines @ 0.1s apart). A
+    // 5-second bucket yields exactly 4 groups of 50 lines each, epoch-aligned.
+    let path = fixture_path().to_str().unwrap();
+    let out = run(&["--count", "--bucket=5s", path]);
+    let mut buckets: Vec<(String, String, usize)> = Vec::new();
+    for line in lines(&out.stdout) {
+        let mut count: Option<usize> = None;
+        let mut b_start: Option<String> = None;
+        let mut b_end: Option<String> = None;
+        let mut has_t_start = false;
+        let mut has_t_end = false;
+        for tok in line.split_whitespace() {
+            if let Some(v) = tok.strip_prefix("count=") {
+                count = v.parse().ok();
+            } else if let Some(v) = tok.strip_prefix("bucket.start=") {
+                b_start = Some(v.to_string());
+            } else if let Some(v) = tok.strip_prefix("bucket.end=") {
+                b_end = Some(v.to_string());
+            } else if tok.starts_with("time.start=") {
+                has_t_start = true;
+            } else if tok.starts_with("time.end=") {
+                has_t_end = true;
+            }
+        }
+        if let (Some(c), Some(s), Some(e)) = (count, b_start, b_end) {
+            assert!(has_t_start && has_t_end, "missing time range in {line:?}");
+            buckets.push((s, e, c));
+        }
+    }
+    buckets.sort();
+    let want: Vec<(&str, &str)> = vec![
+        ("2026-04-24T18:00:00Z", "2026-04-24T18:00:05Z"),
+        ("2026-04-24T18:00:05Z", "2026-04-24T18:00:10Z"),
+        ("2026-04-24T18:00:10Z", "2026-04-24T18:00:15Z"),
+        ("2026-04-24T18:00:15Z", "2026-04-24T18:00:20Z"),
+    ];
+    let got: Vec<(&str, &str)> = buckets
+        .iter()
+        .map(|(s, e, _)| (s.as_str(), e.as_str()))
+        .collect();
+    assert_eq!(got, want);
+    for (_, _, n) in &buckets {
+        assert_eq!(*n, 50, "expected 50 lines per 5s bucket, got {buckets:?}");
+    }
+}
+
+#[test]
+fn n_buckets_partitions_window_evenly() {
+    // Fixture spans [18:00:00, 18:00:19.9] (200 lines @ 0.1s apart). With
+    // --from start --to end and --n-buckets=4, we expect 4 buckets aligned
+    // to the window start (18:00:00). Span = 19.9s, so each bucket is 4.975s
+    // wide and the start boundaries are 0, 4.975, 9.95, 14.925 seconds.
+    // Verify there are exactly 4 buckets, total count = 200, and each bucket
+    // is non-empty. Bucket counts sum to 200 (no line dropped).
+    let path = fixture_path().to_str().unwrap();
+    let out = run(&["--count", "--n-buckets=4", "--from=start", "--to=end", path]);
+    let mut total = 0usize;
+    let mut n_rows = 0usize;
+    for line in lines(&out.stdout) {
+        let mut count: Option<usize> = None;
+        let mut has_b_start = false;
+        let mut has_b_end = false;
+        for tok in line.split_whitespace() {
+            if let Some(v) = tok.strip_prefix("count=") {
+                count = v.parse().ok();
+            } else if tok.starts_with("bucket.start=") {
+                has_b_start = true;
+            } else if tok.starts_with("bucket.end=") {
+                has_b_end = true;
+            }
+        }
+        if let Some(c) = count {
+            assert!(
+                has_b_start && has_b_end,
+                "row missing bucket boundaries: {line:?}"
+            );
+            total += c;
+            n_rows += 1;
+        }
+    }
+    assert_eq!(n_rows, 4, "expected 4 buckets");
+    // Last fixture line (18:00:19.9) sits past 4 * (19.9/4) = 19.9 — so 200
+    // matched lines fall into the 4 buckets (the last line equals the upper
+    // bound, which is included).
+    assert_eq!(total, 200);
+}
+
+#[test]
+fn n_buckets_without_window_uses_file_range() {
+    // No --from/--to: the window comes from the file's first/last
+    // timestamps. 200 lines / 4 buckets = 50 lines per bucket exactly when
+    // the divide lines up.
+    let path = fixture_path().to_str().unwrap();
+    let out = run(&["--count", "--n-buckets=4", path]);
+    let mut total = 0usize;
+    let mut n_rows = 0usize;
+    for line in lines(&out.stdout) {
+        for tok in line.split_whitespace() {
+            if let Some(v) = tok.strip_prefix("count=") {
+                let c: usize = v.parse().unwrap();
+                total += c;
+                n_rows += 1;
+            }
+        }
+    }
+    assert_eq!(n_rows, 4);
+    assert_eq!(total, 200);
 }
 
 #[test]
@@ -277,6 +413,188 @@ fn finish_with_sigint(child: std::process::Child) -> usize {
 
 const FOLLOW_TICK: Duration = Duration::from_millis(400);
 
+/// Big fixture with strictly monotone timestamps spanning 1+ hour, just
+/// large enough to trigger parallel chunk splitting (≥ `MIN_BYTES_PER_WORKER`
+/// * 4 = 16 MiB). Used for streaming tests where the close-on-`max_ts >
+/// end+grace` invariant requires that timestamps don't wrap.
+fn big_monotone_fixture() -> &'static Path {
+    static PATH: OnceLock<PathBuf> = OnceLock::new();
+    PATH.get_or_init(|| {
+        let dir = std::env::temp_dir().join("riplog-it");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("big-monotone-fixture.log");
+        // 300_000 lines @ 100/sec → 3000s = 50 minutes. ~18 MiB on disk.
+        let mut buf: Vec<u8> = Vec::with_capacity(20 * 1024 * 1024);
+        for i in 0..300_000u64 {
+            let level = match i % 5 {
+                0 => "info",
+                1 => "warn",
+                2 => "error",
+                3 => "debug",
+                _ => "critical",
+            };
+            let total_ms = i * 10;
+            let secs = total_ms / 1000;
+            let ms = total_ms % 1000;
+            let h = 18 + secs / 3600;
+            let m = (secs / 60) % 60;
+            let s = secs % 60;
+            let line = format!(
+                "time=2026-04-24T{h:02}:{m:02}:{s:02}.{ms:03}Z level={level} msg=\"line {i}\"\n"
+            );
+            buf.extend_from_slice(line.as_bytes());
+        }
+        fs::write(&path, &buf).unwrap();
+        path
+    })
+    .as_path()
+}
+
+#[cfg(unix)]
+#[test]
+fn follow_with_parallel_does_not_interleave() {
+    // Multi-file follow with -j: pre-rotation file is parallel-scanned,
+    // last file is followed. Workers must batch (not stream) — otherwise
+    // their bucket rows would interleave on the shared writer. Compare
+    // parallel vs sequential output: must be byte-identical at SIGINT.
+    let prerot = big_monotone_fixture();
+    let last_path = std::env::temp_dir().join("riplog-it-follow-par-last.log");
+    fs::write(&last_path, b"").unwrap();
+
+    fn run_once(j: Option<&str>, prerot: &Path, last: &Path) -> Vec<u8> {
+        let mut cmd = Command::new(riplog_bin());
+        if let Some(j) = j {
+            cmd.arg(format!("-j={j}"));
+        }
+        cmd.args([
+            "-F",
+            "--count",
+            "--group-by=level",
+            "--bucket=10m",
+            prerot.to_str().unwrap(),
+            last.to_str().unwrap(),
+        ]);
+        let child = cmd
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        // Sequential scan of an 18-MiB fixture in debug builds takes
+        // ~1.5–2s. Wait long enough for both runs to finish the initial
+        // scan and reach the follow-poll loop before SIGINT'ing — otherwise
+        // sequential's mid-scan stream buffer differs from parallel's
+        // post-merge flush_remaining.
+        thread::sleep(Duration::from_secs(3));
+        let pid = child.id() as libc::pid_t;
+        unsafe {
+            libc::kill(pid, libc::SIGINT);
+        }
+        child.wait_with_output().unwrap().stdout
+    }
+
+    let seq = run_once(None, prerot, &last_path);
+    let par = run_once(Some("4"), prerot, &last_path);
+    assert_eq!(
+        seq, par,
+        "parallel follow output must match sequential — workers should not stream"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn follow_bucket_emits_on_close() {
+    // Stream bucketed counts as buckets close. With --bucket=2s
+    // --window-secs=1, bucket A=[18:00:00, 18:00:02) closes once a line
+    // arrives whose ts > 18:00:03 (A.end + window). Append 3 lines in A,
+    // then 2 lines in B=[18:00:04, 18:00:06) — that triggers A's flush.
+    // SIGINT then flushes B in flush_remaining.
+    let path = std::env::temp_dir().join("riplog-it-follow-bucket.log");
+    fs::write(&path, b"").unwrap();
+    let child = Command::new(riplog_bin())
+        .args([
+            "-F",
+            "--count",
+            "--bucket=2s",
+            "--window-secs=1",
+            path.to_str().unwrap(),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    thread::sleep(FOLLOW_TICK);
+
+    append_lines(
+        &path,
+        &[
+            "time=2026-04-24T18:00:00.1Z level=info msg=a1",
+            "time=2026-04-24T18:00:00.5Z level=info msg=a2",
+            "time=2026-04-24T18:00:01.5Z level=info msg=a3",
+        ],
+    );
+    thread::sleep(FOLLOW_TICK);
+
+    append_lines(
+        &path,
+        &[
+            "time=2026-04-24T18:00:04.1Z level=info msg=b1",
+            "time=2026-04-24T18:00:04.5Z level=info msg=b2",
+        ],
+    );
+    thread::sleep(FOLLOW_TICK);
+
+    let pid = child.id() as libc::pid_t;
+    unsafe {
+        libc::kill(pid, libc::SIGINT);
+    }
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let rows: Vec<&str> = stdout.lines().filter(|l| l.starts_with("count=")).collect();
+    assert_eq!(rows.len(), 2, "expected 2 bucket rows, got: {stdout:?}");
+    assert!(
+        rows[0].contains("count=3") && rows[0].contains("bucket.start=2026-04-24T18:00:00Z"),
+        "first row should be bucket A with count 3: {:?}",
+        rows[0]
+    );
+    assert!(
+        rows[1].contains("count=2") && rows[1].contains("bucket.start=2026-04-24T18:00:04Z"),
+        "second row should be bucket B with count 2: {:?}",
+        rows[1]
+    );
+}
+
+#[test]
+fn follow_rejects_group_by_without_bucket() {
+    let path = std::env::temp_dir().join("riplog-it-follow-rej-gb.log");
+    fs::write(&path, b"").unwrap();
+    let out = Command::new(riplog_bin())
+        .args(["-f", "--count", "--group-by=level", path.to_str().unwrap()])
+        .output()
+        .expect("spawn riplog");
+    assert!(!out.status.success(), "expected non-zero exit");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("--bucket"),
+        "stderr should mention --bucket: {err}"
+    );
+}
+
+#[test]
+fn follow_rejects_n_buckets() {
+    let path = std::env::temp_dir().join("riplog-it-follow-rej-nb.log");
+    fs::write(&path, b"").unwrap();
+    let out = Command::new(riplog_bin())
+        .args(["-f", "--count", "--n-buckets=10", path.to_str().unwrap()])
+        .output()
+        .expect("spawn riplog");
+    assert!(!out.status.success(), "expected non-zero exit");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("-f") || err.contains("-F"),
+        "stderr should mention -f/-F: {err}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn follow_reopen_handles_rotation() {
@@ -348,13 +666,13 @@ fn multi_file_count_matches_concatenation() {
 }
 
 #[test]
-fn multi_file_count_by_aggregates_across_files() {
+fn multi_file_group_by_aggregates_across_files() {
     let (a, b) = split_fixture();
-    let multi = run_with_files(&["--count-by=level"], &[&a, &b]);
-    let single = run_with_files(&["--count-by=level"], &[fixture_path()]);
+    let multi = run_with_files(&["--count", "--group-by=level"], &[&a, &b]);
+    let single = run_with_files(&["--count", "--group-by=level"], &[fixture_path()]);
     assert_eq!(
         multi.stdout, single.stdout,
-        "multi and single --count-by output should be byte-identical"
+        "multi and single --group-by output should be byte-identical"
     );
 }
 
@@ -551,10 +869,39 @@ fn parallel_count_matches_sequential() {
 }
 
 #[test]
-fn parallel_count_by_matches_sequential() {
+fn parallel_group_by_matches_sequential() {
     let path = big_fixture().to_str().unwrap();
-    let seq = run(&["--count-by=level", path]);
-    let par = run(&["-j=4", "--count-by=level", path]);
+    let seq = run(&["--count", "--group-by=level", path]);
+    let par = run(&["-j=4", "--count", "--group-by=level", path]);
+    assert_eq!(seq.stdout, par.stdout);
+}
+
+#[test]
+fn parallel_bucket_matches_sequential() {
+    // big_fixture spans ~50_000 seconds; 10-minute buckets give ~83 buckets,
+    // comfortably more than -j=4 workers, so the bucket-aligned parallel path
+    // fires (rather than falling back to byte-midpoint chunking). Output must
+    // be byte-identical to the sequential run.
+    let path = big_fixture().to_str().unwrap();
+    let seq = run(&["--count", "--group-by=level", "--bucket=10m", path]);
+    let par = run(&["-j=4", "--count", "--group-by=level", "--bucket=10m", path]);
+    assert_eq!(seq.stdout, par.stdout);
+}
+
+#[test]
+fn parallel_n_buckets_matches_sequential() {
+    // --n-buckets path: window comes from the file's first/last timestamps,
+    // 60 buckets / 4 workers = 15 buckets per worker. Sequential and parallel
+    // outputs must match.
+    let path = big_fixture().to_str().unwrap();
+    let seq = run(&["--count", "--group-by=level", "--n-buckets=60", path]);
+    let par = run(&[
+        "-j=4",
+        "--count",
+        "--group-by=level",
+        "--n-buckets=60",
+        path,
+    ]);
     assert_eq!(seq.stdout, par.stdout);
 }
 
@@ -625,6 +972,60 @@ fn sort_by_orders_stdin_lines_lex() {
     let want = "time=2026-04-24T18:00:01Z msg=first\n\
                 time=2026-04-24T18:00:02Z msg=second\n\
                 time=2026-04-24T18:00:03Z msg=third\n";
+    assert_eq!(String::from_utf8_lossy(&out.stdout), want);
+}
+
+#[test]
+fn stdin_bucket_streams_in_time_order() {
+    // Stdin + --bucket activates streaming aggregation: rows come out in
+    // bucket-asc, count-desc-within-bucket order. Today's batch path
+    // (Counter::report) would sort globally by count desc, which would
+    // produce a clearly different sequence — so this test is sensitive to
+    // the streaming code path being wired up for stdin.
+    //
+    // Three buckets, intentionally lopsided per bucket so count-desc within
+    // a bucket flips the order across buckets:
+    //   A (18:00:00..01): 3×info + 2×error  -> info first
+    //   B (18:00:01..02): 4×error + 1×info  -> error first
+    //   C (18:00:02..03): 5×info             -> info only
+    let mut child = Command::new(riplog_bin())
+        .args([
+            "--count",
+            "--group-by=level",
+            "--bucket=1s",
+            "--window-secs=1",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let input = b"\
+time=2026-04-24T18:00:00Z level=info msg=a\n\
+time=2026-04-24T18:00:00Z level=error msg=b\n\
+time=2026-04-24T18:00:00Z level=info msg=a\n\
+time=2026-04-24T18:00:00Z level=error msg=b\n\
+time=2026-04-24T18:00:00Z level=info msg=a\n\
+time=2026-04-24T18:00:01Z level=error msg=b\n\
+time=2026-04-24T18:00:01Z level=info msg=a\n\
+time=2026-04-24T18:00:01Z level=error msg=b\n\
+time=2026-04-24T18:00:01Z level=error msg=b\n\
+time=2026-04-24T18:00:01Z level=error msg=b\n\
+time=2026-04-24T18:00:02Z level=info msg=a\n\
+time=2026-04-24T18:00:02Z level=info msg=a\n\
+time=2026-04-24T18:00:02Z level=info msg=a\n\
+time=2026-04-24T18:00:02Z level=info msg=a\n\
+time=2026-04-24T18:00:02Z level=info msg=a\n";
+    child.stdin.as_mut().unwrap().write_all(input).unwrap();
+    drop(child.stdin.take());
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "stderr: {:?}", out.stderr);
+    let want = "\
+count=3 key.level=info bucket.start=2026-04-24T18:00:00Z bucket.end=2026-04-24T18:00:01Z time.start=2026-04-24T18:00:00Z time.end=2026-04-24T18:00:00Z\n\
+count=2 key.level=error bucket.start=2026-04-24T18:00:00Z bucket.end=2026-04-24T18:00:01Z time.start=2026-04-24T18:00:00Z time.end=2026-04-24T18:00:00Z\n\
+count=4 key.level=error bucket.start=2026-04-24T18:00:01Z bucket.end=2026-04-24T18:00:02Z time.start=2026-04-24T18:00:01Z time.end=2026-04-24T18:00:01Z\n\
+count=1 key.level=info bucket.start=2026-04-24T18:00:01Z bucket.end=2026-04-24T18:00:02Z time.start=2026-04-24T18:00:01Z time.end=2026-04-24T18:00:01Z\n\
+count=5 key.level=info bucket.start=2026-04-24T18:00:02Z bucket.end=2026-04-24T18:00:03Z time.start=2026-04-24T18:00:02Z time.end=2026-04-24T18:00:02Z\n";
     assert_eq!(String::from_utf8_lossy(&out.stdout), want);
 }
 
@@ -720,6 +1121,71 @@ fn sort_by_composes_with_if_filter() {
     let mut sorted = msgs.clone();
     sorted.sort();
     assert_eq!(msgs, sorted);
+}
+
+#[test]
+fn add_appends_pairs_at_end() {
+    let path = fixture_path().to_str().unwrap();
+    let out = run(&["--limit", "1", "--add", "tag=ok", path]);
+    let line = lines(&out.stdout).into_iter().next().unwrap();
+    assert!(
+        line.contains(" tag=ok"),
+        "expected appended pair, got {:?}",
+        line
+    );
+}
+
+#[test]
+fn add_comma_separates_pairs() {
+    let path = fixture_path().to_str().unwrap();
+    let out = run(&["--limit", "1", "--add=tag=ok,extra=2", path]);
+    let line = lines(&out.stdout).into_iter().next().unwrap();
+    assert!(
+        line.contains(" tag=ok") && line.contains(" extra=2"),
+        "got {:?}",
+        line
+    );
+}
+
+#[test]
+fn add_conflicts_with_raw_key() {
+    let path = fixture_path().to_str().unwrap();
+    let out = Command::new(riplog_bin())
+        .args(["--raw-key", "msg", "--add", "msg=hello", path])
+        .output()
+        .expect("spawn riplog");
+    assert!(
+        !out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("conflicts with `--raw-key`"),
+        "stderr should mention conflict: {err}"
+    );
+}
+
+#[test]
+fn rm_drops_field() {
+    let path = fixture_path().to_str().unwrap();
+    let out = run(&["--limit", "1", "--rm", "msg", path]);
+    let line = lines(&out.stdout).into_iter().next().unwrap();
+    assert!(!line.contains("msg="), "got {:?}", line);
+}
+
+#[test]
+fn rm_conflicts_with_group_by() {
+    let path = fixture_path().to_str().unwrap();
+    let out = Command::new(riplog_bin())
+        .args(["--count", "--group-by", "level", "--rm", "level", path])
+        .output()
+        .expect("spawn riplog");
+    assert!(
+        !out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[cfg(unix)]

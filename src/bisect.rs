@@ -16,7 +16,7 @@
 use std::io::{Read, Seek, SeekFrom};
 
 use crate::logfmt;
-use crate::timestamp::{Timestamp, extract_timestamp};
+use crate::timestamp::{extract_timestamp, Timestamp};
 
 /// Which frontier to find.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
