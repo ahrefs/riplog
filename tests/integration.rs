@@ -1214,3 +1214,377 @@ fn follow_no_reopen_misses_rotation() {
         "-f should miss the post-rotation line"
     );
 }
+
+// ---------------- `--json` (JSONL output) ----------------
+
+#[test]
+fn json_line_output_each_line_parses() {
+    let path = fixture_path().to_str().unwrap();
+    let out = run(&["--limit=10", "--json", path]);
+    let text = String::from_utf8(out.stdout).unwrap();
+    let parsed: Vec<serde_json::Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("each JSONL line must parse"))
+        .collect();
+    assert_eq!(parsed.len(), 10);
+    for v in &parsed {
+        let obj = v.as_object().expect("each line is a JSON object");
+        // The fixture always has these fields.
+        assert!(obj.contains_key("time"));
+        assert!(obj.contains_key("level"));
+        // Every value is a JSON string (no type coercion).
+        for (_, val) in obj.iter() {
+            assert!(val.is_string(), "expected string, got {val}");
+        }
+    }
+}
+
+#[test]
+fn json_line_output_preserves_logfmt_order() {
+    // First line of the fixture has well-known field order.
+    let path = fixture_path().to_str().unwrap();
+    let out = run(&["--limit=1", "--json", path]);
+    let line = String::from_utf8(out.stdout).unwrap();
+    // Indices in the raw string: `time` must come before `level`.
+    let idx_time = line.find("\"time\"").unwrap();
+    let idx_level = line.find("\"level\"").unwrap();
+    assert!(idx_time < idx_level, "key order not preserved: {line}");
+}
+
+#[test]
+fn json_bare_count_is_object() {
+    let path = fixture_path().to_str().unwrap();
+    let out = run(&["--json", "--count", path]);
+    let line = String::from_utf8(out.stdout).unwrap();
+    let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+    assert_eq!(v["count"].as_u64(), Some(COUNT as u64));
+}
+
+#[test]
+fn json_aggregation_row_flat_keys() {
+    let path = fixture_path().to_str().unwrap();
+    let out = run(&["--json", "--count", "--group-by=level", path]);
+    let text = String::from_utf8(out.stdout).unwrap();
+    let mut total = 0u64;
+    for line in text.lines() {
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        // `count` must be a JSON number.
+        let c = v["count"].as_u64().expect("count is u64");
+        total += c;
+        // Flat key prefixing.
+        assert!(v["key.level"].is_string(), "key.level missing on: {line}");
+    }
+    assert_eq!(total, COUNT as u64);
+}
+
+#[test]
+fn json_aggregation_with_bucket_has_bucket_fields() {
+    let path = fixture_path().to_str().unwrap();
+    let out = run(&["--json", "--count", "--group-by=level", "--bucket=5s", path]);
+    let text = String::from_utf8(out.stdout).unwrap();
+    let first = text.lines().next().expect("at least one row");
+    let v: serde_json::Value = serde_json::from_str(first).unwrap();
+    assert!(v["bucket.start"].is_string());
+    assert!(v["bucket.end"].is_string());
+    assert!(v["time.start"].is_string());
+    assert!(v["time.end"].is_string());
+}
+
+#[test]
+fn json_list_keys_is_array_of_strings() {
+    let path = fixture_path().to_str().unwrap();
+    let out = run(&["--json", "--list-keys", path]);
+    let text = String::from_utf8(out.stdout).unwrap();
+    let v: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+    let arr = v.as_array().expect("JSON array");
+    assert!(arr.iter().all(|x| x.is_string()));
+    let strs: Vec<&str> = arr.iter().map(|x| x.as_str().unwrap()).collect();
+    assert!(strs.contains(&"level"));
+    assert!(strs.contains(&"time"));
+    // Sorted, like the logfmt variant.
+    let mut sorted = strs.clone();
+    sorted.sort_unstable();
+    assert_eq!(strs, sorted);
+}
+
+#[test]
+fn json_list_values_for_single_is_array_of_strings() {
+    let path = fixture_path().to_str().unwrap();
+    let out = run(&["--json", "--list-values-for=level", path]);
+    let text = String::from_utf8(out.stdout).unwrap();
+    let v: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+    let arr = v.as_array().expect("JSON array");
+    assert!(arr.iter().all(|x| x.is_string()));
+    let strs: Vec<&str> = arr.iter().map(|x| x.as_str().unwrap()).collect();
+    for expected in &["critical", "debug", "error", "info", "warn"] {
+        assert!(strs.contains(expected), "missing {expected} in {strs:?}");
+    }
+}
+
+#[test]
+fn json_list_values_for_multi_is_array_of_objects() {
+    let path = fixture_path().to_str().unwrap();
+    let out = run(&["--json", "--list-values-for=level,msg", path]);
+    let text = String::from_utf8(out.stdout).unwrap();
+    let v: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+    let arr = v.as_array().expect("JSON array");
+    assert!(!arr.is_empty());
+    // Every element: `{"key": "...", "value": "..."}`.
+    for e in arr {
+        let obj = e.as_object().expect("element is object");
+        assert!(obj["key"].is_string());
+        assert!(obj["value"].is_string());
+    }
+    // Both keys must appear.
+    let keys: std::collections::HashSet<&str> =
+        arr.iter().map(|e| e["key"].as_str().unwrap()).collect();
+    assert!(keys.contains("level"));
+    assert!(keys.contains("msg"));
+}
+
+#[test]
+fn json_conflicts_with_raw_key() {
+    let path = fixture_path().to_str().unwrap();
+    let out = Command::new(riplog_bin())
+        .args(["--json", "--raw-key=msg", path])
+        .output()
+        .expect("spawn riplog");
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("cannot be used with"),
+        "stderr should mention conflict: {err}"
+    );
+}
+
+#[test]
+fn json_conflicts_with_color_always() {
+    let path = fixture_path().to_str().unwrap();
+    let out = Command::new(riplog_bin())
+        .args(["--json", "--color=always", path])
+        .output()
+        .expect("spawn riplog");
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("--color=always"),
+        "stderr should mention conflict: {err}"
+    );
+}
+
+#[test]
+fn json_with_add_and_rm() {
+    let path = fixture_path().to_str().unwrap();
+    let out = run(&[
+        "--limit=1",
+        "--json",
+        "--add=extra=hi",
+        "--rm",
+        "time",
+        path,
+    ]);
+    let line = String::from_utf8(out.stdout).unwrap();
+    let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+    let obj = v.as_object().unwrap();
+    assert!(!obj.contains_key("time"), "time should be removed");
+    assert_eq!(obj["extra"].as_str(), Some("hi"));
+}
+
+#[test]
+fn json_stdin_bucket_streaming() {
+    // Feed a deterministic mini-stream; assert at least one bucket row
+    // emits as JSONL with the expected shape.
+    let mut child = Command::new(riplog_bin())
+        .args(["--json", "--count", "--group-by=level", "--bucket=1s"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut input = String::new();
+    for i in 0..5 {
+        input.push_str(&format!(
+            "time=2026-04-24T18:00:{:02}Z level=info msg=hello\n",
+            i
+        ));
+    }
+    // Drive a few buckets forward so the early ones close.
+    for i in 30..32 {
+        input.push_str(&format!(
+            "time=2026-04-24T18:00:{:02}Z level=info msg=hello\n",
+            i
+        ));
+    }
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    drop(child.stdin.take());
+    let out = child.wait_with_output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(!text.is_empty(), "no JSONL rows emitted");
+    for line in text.lines() {
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert!(v["count"].is_number());
+        assert!(v["bucket.start"].is_string());
+    }
+}
+
+// ---------------- `-` (stdin alias in file list) ----------------
+
+/// Run riplog with `args` and feed `stdin_in` on stdin. Asserts success.
+fn run_with_stdin(args: &[&str], stdin_in: &[u8]) -> std::process::Output {
+    let mut child = Command::new(riplog_bin())
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn riplog");
+    child.stdin.as_mut().unwrap().write_all(stdin_in).unwrap();
+    drop(child.stdin.take());
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "riplog {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out
+}
+
+#[test]
+fn stdin_dash_alone_equivalent_to_no_files() {
+    let input = b"time=2026-04-24T18:00:00Z level=info msg=a\n\
+                  time=2026-04-24T18:00:01Z level=warn msg=b\n";
+    let with_dash = run_with_stdin(&["-"], input);
+    let without_dash = run_with_stdin(&[], input);
+    assert_eq!(with_dash.stdout, without_dash.stdout);
+}
+
+#[test]
+fn stdin_dash_after_file_streams_both() {
+    let path = fixture_path().to_str().unwrap();
+    let stdin_in = b"time=2026-04-24T18:00:00Z level=info msg=fromstdin\n";
+    // Only one matching critical line in the fixture; stdin adds one info line.
+    let out = run_with_stdin(&["--if=level=info", path, "-"], stdin_in);
+    let lines = lines(&out.stdout);
+    // Last line must be the stdin-injected one (file streams first, then stdin).
+    assert!(
+        lines.last().unwrap().contains("fromstdin"),
+        "expected stdin line last, got: {lines:?}"
+    );
+}
+
+#[test]
+fn stdin_dash_count_aggregates_across_sources() {
+    let path = fixture_path().to_str().unwrap();
+    let stdin_in = b"time=2026-04-24T18:00:00Z level=info msg=a\n\
+                     time=2026-04-24T18:00:01Z level=warn msg=b\n";
+    let out = run_with_stdin(&["--count", path, "-"], stdin_in);
+    let n: usize = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .expect("count is an integer");
+    assert_eq!(n, COUNT + 2);
+}
+
+#[test]
+fn stdin_dash_group_by_aggregates_across_sources() {
+    let path = fixture_path().to_str().unwrap();
+    // Add a synthetic `level=info` line via stdin; the resulting info count
+    // should be the fixture's info count plus 1.
+    let stdin_in = b"time=2026-04-24T18:00:00Z level=info msg=extra\n";
+    let out = run_with_stdin(&["--count", "--group-by=level", path, "-"], stdin_in);
+    let text = String::from_utf8_lossy(&out.stdout);
+    let info_line = text
+        .lines()
+        .find(|l| l.contains("key.level=info"))
+        .expect("info row");
+    // count=<N> is the first token; parse it.
+    let count: usize = info_line["count=".len()..]
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(count, N_INFO + 1);
+}
+
+#[test]
+fn stdin_dash_rejects_follow() {
+    let path = fixture_path().to_str().unwrap();
+    let out = Command::new(riplog_bin())
+        .args(["-F", path, "-"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn riplog");
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("`-` (stdin)"),
+        "expected stdin-conflict message, got: {err}"
+    );
+}
+
+#[test]
+fn stdin_dash_rejects_time_range() {
+    let path = fixture_path().to_str().unwrap();
+    let out = Command::new(riplog_bin())
+        .args(["--time-range", path, "-"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn riplog");
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("`-` (stdin)"), "got: {err}");
+}
+
+#[test]
+fn stdin_dash_duplicate_rejected() {
+    let out = Command::new(riplog_bin())
+        .args(["-", "-"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn riplog");
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("more than once"), "got: {err}");
+}
+
+#[test]
+fn stdin_dash_from_resolves_against_real_file() {
+    // With `--from start`, `start` anchors on the real file's first timestamp
+    // (2026-04-24T18:00:00Z, per fixture). The stdin-injected line at
+    // 18:00:00Z passes; the one before it (17:59:59Z) is filtered out.
+    let path = fixture_path().to_str().unwrap();
+    let stdin_in = b"time=2026-04-24T17:59:59Z level=info msg=before\n\
+                     time=2026-04-24T18:00:00Z level=info msg=after\n";
+    let out = run_with_stdin(&["--from=start", "--if=msg=~stdin", path, "-"], stdin_in);
+    // Neither stdin line matches the regex; this just smoke-checks that the
+    // run completes (i.e., --from + stdin doesn't bail).
+    assert!(out.status.success());
+
+    // Now actually look at the stdin lines: `before` should be filtered out
+    // (before the resolved `start`), `after` should pass.
+    let out = run_with_stdin(&["--from=start", "--if=level=info", path, "-"], stdin_in);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("msg=after"), "stdin 'after' line missing");
+    assert!(
+        !text.contains("msg=before"),
+        "stdin 'before' line should be filtered by --from"
+    );
+}
+
+#[test]
+fn stdin_dash_parallel_falls_back_to_sequential() {
+    // `-j` should still work when `-` is in the file list. Real file uses
+    // workers; stdin runs sequentially. Just smoke-test the combination.
+    let path = fixture_path().to_str().unwrap();
+    let stdin_in = b"time=2026-04-24T18:00:00Z level=info msg=fromstdin\n";
+    let out = run_with_stdin(&["-j", "--count", path, "-"], stdin_in);
+    let n: usize = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
+    assert_eq!(n, COUNT + 1);
+}

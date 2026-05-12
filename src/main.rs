@@ -3,7 +3,9 @@
 mod bisect;
 mod cli;
 mod filter;
+mod json;
 mod logfmt;
+mod output;
 mod parallel;
 mod run;
 mod sort;

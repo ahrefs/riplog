@@ -16,6 +16,15 @@ range that straddles a log rotation works as expected. `-f`/`-F` is
 attached to the *last* file — `riplog foo.log.1 foo.log -F` reads the
 rotated log, then the current log, then keeps tailing it.
 
+Use `-` as a file argument to read from stdin in position — e.g.
+`riplog rotated.log.1 rotated.log - --if 'level=error'` streams the
+two rotated logs, then stdin. `-` may appear at most once, and is
+incompatible with `-f`, `-F`, and `--time-range`. With `-` in the
+list, symbolic `--from`/`--to` anchors and `--n-buckets` resolve
+against the real files' span; the resolved window is then applied
+as a per-line filter to stdin too. `--bucket=DURATION` switches to
+streaming output (per-bucket rows emit as they close).
+
 ## Install
 
 Clone this and `cargo install --path=.` from inside the repo should do it.
@@ -63,6 +72,16 @@ Make sure `~/.cargo/bin` is in your path.
 - `--color <auto|always|never>`: colorize. `auto` is on for terminal
   stdout without `-o`.
 - `-n, --limit <N>`: stop after `N` matched lines.
+- `--json`: emit JSONL (one JSON value per line) instead of logfmt.
+  Matched lines become JSON objects with keys in logfmt parse order;
+  all values stay JSON strings (no number/bool coercion). Aggregation
+  rows (`--count` + `--group-by`/`--bucket`/`--n-buckets`) become JSON
+  objects with flat keys (`count` is a number, `key.<k>`, `bucket.start`,
+  `bucket.end`, `time.start`, `time.end` are strings). `--count` alone
+  emits `{"count": N}`. `--list-keys` and `--list-values-for` emit one
+  JSON array (multi-key `--list-values-for` emits an array of
+  `{"key": K, "value": V}` objects). Conflicts with `--raw-key` and
+  `--color=always`.
 
 ## Aggregation (suppresses line output)
 

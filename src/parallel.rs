@@ -12,7 +12,7 @@ use std::sync::Mutex;
 
 use crate::cli::Cli;
 use crate::filter::Filter;
-use crate::run::{make_sinks, stream_bounded, BucketSpec, Sampler, Sinks, TimeFilter};
+use crate::run::{make_sinks, stream_bounded, BucketSpec, LineMode, Sampler, Sinks, TimeFilter};
 use crate::transform::LineTransform;
 
 /// Below this many bytes per worker, parallel mode falls back to sequential —
@@ -35,13 +35,12 @@ pub(crate) struct Job<'a> {
     pub filter: &'a Filter,
     pub sampler: Option<Sampler>,
     pub suppress_lines: bool,
-    pub colorize: bool,
+    pub line_mode: LineMode,
     pub bucket: Option<BucketSpec>,
     pub tz: jiff::tz::TimeZone,
     pub output: &'a mut (dyn Write + Send),
     pub master: &'a mut Sinks,
     pub line_transform: Option<LineTransform>,
-    pub passthrough_emit: bool,
 }
 
 /// Spawn `job.n_workers` threads searching disjoint chunks of `job.path`
@@ -58,13 +57,12 @@ pub(crate) fn run(job: Job<'_>) -> anyhow::Result<()> {
         filter,
         sampler,
         suppress_lines,
-        colorize,
+        line_mode,
         bucket,
         tz,
         output,
         master,
         line_transform,
-        passthrough_emit,
     } = job;
 
     let end_byte = start_byte.saturating_add(max_bytes);
@@ -106,11 +104,10 @@ pub(crate) fn run(job: Job<'_>) -> anyhow::Result<()> {
                         cli,
                         sampler,
                         suppress_lines,
-                        colorize,
+                        line_mode,
                         bucket,
                         tz,
                         worker_tf,
-                        passthrough_emit,
                     );
                     let mut file = File::open(path)?;
                     file.seek(SeekFrom::Start(cs))?;

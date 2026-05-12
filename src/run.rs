@@ -20,12 +20,10 @@ use crate::bisect::{self, Side};
 use crate::cli::{Cli, ColorMode};
 use crate::filter::Filter;
 use crate::logfmt;
+use crate::output;
 use crate::sort::SortBuffer;
 use crate::timestamp::{self, Timestamp};
-use crate::transform::{
-    parse_line_transform, validate_rm_vs_features, write_colored_line, write_plain_reconstructed,
-    EmitScratch, LineTransform,
-};
+use crate::transform::{parse_line_transform, validate_rm_vs_features, EmitScratch, LineTransform};
 
 /// Set by the SIGINT handler; checked in tight loops so we can exit cleanly
 /// and still emit `--count` / `--list-keys` / `--count-by` summaries.
@@ -69,16 +67,41 @@ impl KeyGather {
         }
     }
 
-    fn report<W: Write>(&self, out: &mut W) -> std::io::Result<()> {
+    fn report<W: Write>(&self, out: &mut W, json: bool) -> std::io::Result<()> {
         if !self.enabled {
             return Ok(());
         }
-        emit_sorted(&self.keys, out)
+        if json {
+            output::write_string_set_json(out, &self.keys)
+        } else {
+            output::write_string_set_logfmt(out, &self.keys)
+        }
     }
 
     fn merge(&mut self, other: Self) {
         self.keys.extend(other.keys);
     }
+}
+
+/// `-` in the file list is the Unix idiom for "read from stdin in position".
+#[inline]
+pub(crate) fn is_stdin_path(p: &Path) -> bool {
+    p == Path::new("-")
+}
+
+/// How matched lines are emitted. Exactly one branch is active for a given
+/// run, decided once in `run::run` from `--color`, `--json`, and whether
+/// the memcpy fast path is eligible (no filter, no `--rm`/`--add`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum LineMode {
+    /// Copy the input bytes verbatim — the fast path.
+    Passthrough,
+    /// JSONL: one JSON object per line.
+    Json,
+    /// ANSI-colored logfmt reconstruction.
+    Colored,
+    /// Plain logfmt reconstruction (no color).
+    Plain,
 }
 
 /// Find the first pair with key `key`, unescape its value into `scratch`,
@@ -107,15 +130,6 @@ fn intern_into_set(set: &mut RapidHashSet<SmartString>, s: &str) {
         x.push_str(s);
         set.insert(x);
     }
-}
-
-fn emit_sorted<W: Write>(set: &RapidHashSet<SmartString>, out: &mut W) -> std::io::Result<()> {
-    let mut sorted: Vec<&SmartString> = set.iter().collect();
-    sorted.sort_unstable();
-    for v in sorted {
-        writeln!(out, "{v}")?;
-    }
-    Ok(())
 }
 
 /// Collects every distinct value seen for each requested key, on matched
@@ -154,18 +168,15 @@ impl ValueGather {
         }
     }
 
-    fn report<W: Write>(&self, out: &mut W) -> std::io::Result<()> {
+    fn report<W: Write>(&self, out: &mut W, json: bool) -> std::io::Result<()> {
         if !self.is_active() {
             return Ok(());
         }
-        let multi = self.keys.len() > 1;
-        for (key, set) in self.keys.iter().zip(self.values.iter()) {
-            if multi {
-                writeln!(out, "# {key}")?;
-            }
-            emit_sorted(set, out)?;
+        if json {
+            output::write_values_summary_json(out, &self.keys, &self.values)
+        } else {
+            output::write_values_summary_logfmt(out, &self.keys, &self.values)
         }
-        Ok(())
     }
 
     fn merge(&mut self, other: Self) {
@@ -304,10 +315,13 @@ struct Counter {
     /// streaming flush methods are no-ops and end-of-process output goes
     /// through `report` (today's count-desc, single-emission behaviour).
     streaming: bool,
+    /// `--json` mode: row emission goes through the JSON serializer instead
+    /// of logfmt.
+    output_json: bool,
 }
 
 impl Counter {
-    fn new(keys: Vec<SmartString>, bucket: Option<BucketSpec>) -> Self {
+    fn new(keys: Vec<SmartString>, bucket: Option<BucketSpec>, output_json: bool) -> Self {
         Self {
             keys,
             bucket,
@@ -316,6 +330,7 @@ impl Counter {
             max_ts_seen: None,
             close_grace_nanos: 0,
             streaming: false,
+            output_json,
         }
     }
 
@@ -376,25 +391,20 @@ impl Counter {
         stats: &GroupStats,
         tz: &jiff::tz::TimeZone,
     ) -> std::io::Result<()> {
-        write!(out, "count={}", stats.count)?;
-        for (k, v) in self.keys.iter().zip(combo.iter()) {
-            write!(out, " key.{k}=")?;
-            logfmt::write_logfmt_value(out, v.as_str())?;
+        let bucket = match (self.bucket, bucket_ts) {
+            (Some(bspec), Some(start)) => Some((start, start + bspec.nanos)),
+            _ => None,
+        };
+        let time_range = match (stats.min_ts, stats.max_ts) {
+            (Some(a), Some(b)) => Some((a, b)),
+            _ => None,
+        };
+        let count = stats.count as u64;
+        if self.output_json {
+            output::write_agg_row_json(out, count, &self.keys, combo, bucket, time_range, tz)
+        } else {
+            output::write_agg_row_logfmt(out, count, &self.keys, combo, bucket, time_range, tz)
         }
-        if let (Some(bspec), Some(start)) = (self.bucket, bucket_ts) {
-            let end = start + bspec.nanos;
-            write!(
-                out,
-                " bucket.start={}",
-                timestamp::format_rfc3339(start, tz)
-            )?;
-            write!(out, " bucket.end={}", timestamp::format_rfc3339(end, tz))?;
-        }
-        if let (Some(a), Some(b)) = (stats.min_ts, stats.max_ts) {
-            write!(out, " time.start={}", timestamp::format_rfc3339(a, tz))?;
-            write!(out, " time.end={}", timestamp::format_rfc3339(b, tz))?;
-        }
-        writeln!(out)
     }
 
     /// Batch-mode end-of-run report: count desc, ties broken by key.
@@ -492,7 +502,7 @@ impl Counter {
         entries.sort_unstable_by(|a, b| {
             a.1.cmp(&b.1)
                 .then_with(|| b.2.count.cmp(&a.2.count))
-                .then_with(|| a.0.cmp(&b.0))
+                .then_with(|| a.0.cmp(b.0))
         });
         for (combo, bucket_ts, stats) in entries {
             self.write_row(out, combo, bucket_ts, stats, tz)?;
@@ -623,14 +633,30 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
 
     let sampler = build_sampler(cli)?;
 
-    let colorize = match cli.color {
-        ColorMode::Always => true,
-        ColorMode::Never => false,
-        ColorMode::Auto => cli.output.is_none() && std::io::stdout().is_terminal(),
+    if cli.json && matches!(cli.color, ColorMode::Always) {
+        anyhow::bail!("`--json` cannot be combined with `--color=always`");
+    }
+    let colorize = if cli.json {
+        false
+    } else {
+        match cli.color {
+            ColorMode::Always => true,
+            ColorMode::Never => false,
+            ColorMode::Auto => cli.output.is_none() && std::io::stdout().is_terminal(),
+        }
     };
 
-    // Memcpy fast path: unchanged for entire run (`filter` / CLI transforms / color).
-    let passthrough_emit = !colorize && line_transform.is_none() && filter.is_empty();
+    // Pick the line emitter once. Order matters: passthrough is the memcpy
+    // fast path, only eligible when no transform/filter/color/json applies.
+    let line_mode = if cli.json {
+        LineMode::Json
+    } else if colorize {
+        LineMode::Colored
+    } else if line_transform.is_none() && filter.is_empty() {
+        LineMode::Passthrough
+    } else {
+        LineMode::Plain
+    };
 
     // `Send` so the parallel path can hand `&mut output` to its workers
     // through a shared `Mutex`. Using the unlocked `Stdout` (rather than
@@ -672,11 +698,10 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
             cli,
             sampler.clone(),
             suppress_lines,
-            colorize,
+            line_mode,
             bucket,
             tz.clone(),
             line_transform.clone(),
-            passthrough_emit,
         );
         if bucket.is_some() {
             let grace = (cli.window_secs as i64).saturating_mul(1_000_000_000);
@@ -685,6 +710,7 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
         stream_unbounded(
             &mut std::io::stdin().lock(),
             &filter,
+            &TimeFilter::default(),
             &mut output,
             &mut sinks,
         )?;
@@ -692,6 +718,15 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
         flush_sort_buf(&mut sinks, &mut output)?;
         emit_summaries(&sinks, bare_count, &tz, &mut output)?;
         return Ok(());
+    }
+
+    let n_stdin = cli.files.iter().filter(|p| is_stdin_path(p)).count();
+    if n_stdin > 1 {
+        anyhow::bail!("`-` (stdin) cannot appear more than once in the file list");
+    }
+    let has_stdin = n_stdin == 1;
+    if has_stdin && (following || cli.time_range) {
+        anyhow::bail!("`-` (stdin) cannot be combined with `-f`, `-F`, or `--time-range`");
     }
 
     if cli.time_range {
@@ -775,15 +810,15 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
         cli,
         sampler.clone(),
         suppress_lines,
-        colorize,
+        line_mode,
         bucket,
         tz.clone(),
         line_transform.clone(),
-        passthrough_emit,
     );
-    // Master streams under follow; workers always batch (their output would
-    // interleave on the shared writer otherwise) and merge into the master.
-    if following {
+    // Master streams under follow or when stdin (`-`) is in the file list;
+    // workers always batch (their output would interleave on the shared
+    // writer otherwise) and merge into the master.
+    if cli.bucket.is_some() && (following || has_stdin) {
         let grace = (cli.window_secs as i64).saturating_mul(1_000_000_000);
         sinks.enable_streaming(grace);
     }
@@ -806,7 +841,7 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
         if interrupted() || sinks.done() {
             break;
         }
-        if n_workers > 1 && !plan.follow_this_file {
+        if n_workers > 1 && !plan.follow_this_file && !is_stdin_path(plan.path) {
             crate::parallel::run(crate::parallel::Job {
                 path: plan.path,
                 start_byte: plan.start_byte,
@@ -817,13 +852,12 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
                 filter: &filter,
                 sampler: sampler.clone(),
                 suppress_lines,
-                colorize,
+                line_mode,
                 bucket,
                 tz: tz.clone(),
                 output: &mut *output,
                 master: &mut sinks,
                 line_transform: line_transform.clone(),
-                passthrough_emit,
             })?;
             output.flush()?;
         } else {
@@ -859,15 +893,19 @@ struct FilePlan<'a> {
     follow_this_file: bool,
 }
 
-/// Compute the union span across all files (min of per-file first
+/// Compute the union span across all real files (min of per-file first
 /// timestamps, max of per-file lasts) used as the anchor for symbolic
-/// `--from`/`--to` bounds. One head + one tail seek per file.
+/// `--from`/`--to` bounds. One head + one tail seek per file. Stdin (`-`)
+/// entries are skipped — pipes can't be peeked at both ends.
 fn peek_global_window(
     files: &[std::path::PathBuf],
 ) -> anyhow::Result<(Option<Timestamp>, Option<Timestamp>)> {
     let mut first: Option<Timestamp> = None;
     let mut last: Option<Timestamp> = None;
     for path in files {
+        if is_stdin_path(path) {
+            continue;
+        }
         let mut file = File::open(path)?;
         if let Some(t) = bisect::peek_first_timestamp(&mut file)? {
             first = Some(first.map_or(t, |cur| cur.min(t)));
@@ -889,6 +927,17 @@ fn plan_file<'a>(
     tf: TimeFilter,
     follow_this_file: bool,
 ) -> anyhow::Result<FilePlan<'a>> {
+    // Stdin can't be bisected; phase 2 detects `-` and streams unbounded
+    // with the time filter applied per-line.
+    if is_stdin_path(path) {
+        return Ok(FilePlan {
+            path,
+            start_byte: 0,
+            max_bytes: 0,
+            tf,
+            follow_this_file: false,
+        });
+    }
     let mut file = File::open(path)?;
     let file_len = file.seek(SeekFrom::End(0))?;
     let window = (cli.window_secs as i64).saturating_mul(1_000_000_000);
@@ -943,6 +992,12 @@ fn stream_plan<W: Write>(
         follow_this_file,
     } = plan;
 
+    if is_stdin_path(path) {
+        // No bisect, no follow loop. Per-line `tf` still applies (resolved
+        // against the real files' span by the caller).
+        return stream_unbounded(&mut std::io::stdin().lock(), filter, &tf, output, sinks);
+    }
+
     let mut file = File::open(path)?;
     file.seek(SeekFrom::Start(start_byte))?;
     let file_for_reopen = if follow_this_file {
@@ -984,15 +1039,20 @@ fn emit_summaries<W: Write>(
     output: &mut W,
 ) -> anyhow::Result<()> {
     sinks.stats.report();
+    let json = sinks.counter.output_json;
     if sinks.counter.streaming {
         sinks.counter.flush_remaining(output, tz)?;
     } else {
         sinks.counter.report(output, tz)?;
     }
-    sinks.keys.report(output)?;
-    sinks.values.report(output)?;
+    sinks.keys.report(output, json)?;
+    sinks.values.report(output, json)?;
     if count_only {
-        writeln!(output, "{}", sinks.stats.matched_lines)?;
+        if json {
+            output::write_count_json(output, sinks.stats.matched_lines as u64)?;
+        } else {
+            writeln!(output, "{}", sinks.stats.matched_lines)?;
+        }
     }
     output.flush()?;
     Ok(())
@@ -1065,7 +1125,8 @@ pub(crate) struct Sinks {
     sampler: Option<Sampler>,
     sort_buf: Option<SortBuffer>,
     suppress_lines: bool,
-    colorize: bool,
+    /// Picks the line emitter (passthrough / json / colored / plain).
+    line_mode: LineMode,
     limit: Option<usize>,
     /// Display timezone, used by the streaming bucket flush to format
     /// `bucket.start` / `bucket.end` / `time.start` / `time.end` on the fly.
@@ -1073,8 +1134,6 @@ pub(crate) struct Sinks {
     /// When set, `--rm` / `--add` mutate emitted lines (not used for `--if`).
     transform: Option<LineTransform>,
     emit_scratch: EmitScratch,
-    /// When true, emit matched lines by copying input bytes (no parse-roundtrip).
-    passthrough_emit: bool,
 }
 
 impl Sinks {
@@ -1188,18 +1247,20 @@ fn resolve_bucket_spec(
 /// fields are derived from `cli`; the `sampler` template is cloned in (its
 /// inner `Arc<Filter>` is shared, so cloning is cheap). All collected
 /// state (counts, gathers, sort buffer) starts empty.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn make_sinks(
     cli: &Cli,
     sampler: Option<Sampler>,
     suppress_lines: bool,
-    colorize: bool,
+    line_mode: LineMode,
     bucket: Option<BucketSpec>,
     tz: jiff::tz::TimeZone,
     transform: Option<LineTransform>,
-    passthrough_emit: bool,
 ) -> Sinks {
-    let counter = Counter::new(cli.group_by.iter().map(SmartString::from).collect(), bucket);
+    let counter = Counter::new(
+        cli.group_by.iter().map(SmartString::from).collect(),
+        bucket,
+        matches!(line_mode, LineMode::Json),
+    );
     Sinks {
         stats: Stats::default(),
         counter,
@@ -1209,12 +1270,11 @@ pub(crate) fn make_sinks(
         sampler,
         sort_buf: cli.sort_by.as_deref().map(SortBuffer::new),
         suppress_lines,
-        colorize,
+        line_mode,
         limit: cli.limit,
         tz,
         transform,
         emit_scratch: EmitScratch::default(),
-        passthrough_emit,
     }
 }
 
@@ -1250,6 +1310,7 @@ pub(crate) fn stream_bounded<R: BufRead, W: Write + ?Sized>(
 fn stream_unbounded<R: Read, W: Write>(
     reader: &mut R,
     filter: &Filter,
+    tf: &TimeFilter,
     output: &mut W,
     sinks: &mut Sinks,
 ) -> anyhow::Result<()> {
@@ -1261,14 +1322,7 @@ fn stream_unbounded<R: Read, W: Write>(
         if n == 0 {
             break;
         }
-        process_line(
-            &mut line_buf,
-            filter,
-            &TimeFilter::default(),
-            output,
-            sinks,
-            n,
-        )?;
+        process_line(&mut line_buf, filter, tf, output, sinks, n)?;
         output.flush()?;
         if sinks.done() {
             break;
@@ -1339,20 +1393,11 @@ fn process_line<W: Write + ?Sized>(
                 let raw = &mut sinks.raw;
                 let scratch = &mut sinks.emit_scratch;
                 let suppress = sinks.suppress_lines;
-                let color = sinks.colorize;
+                let mode = sinks.line_mode;
                 sort_buf.capture(parsed, |w| {
                     emit_match(
-                        parsed,
-                        line_buf,
-                        raw_len,
-                        parse_end,
-                        raw,
-                        suppress,
-                        color,
-                        line_tf,
-                        scratch,
-                        sinks.passthrough_emit,
-                        w,
+                        parsed, line_buf, raw_len, parse_end, raw, suppress, mode, line_tf,
+                        scratch, w,
                     )
                 })?;
             }
@@ -1364,10 +1409,9 @@ fn process_line<W: Write + ?Sized>(
                 parse_end,
                 &mut sinks.raw,
                 sinks.suppress_lines,
-                sinks.colorize,
+                sinks.line_mode,
                 line_tf,
                 &mut sinks.emit_scratch,
-                sinks.passthrough_emit,
                 output,
             )?;
         }
@@ -1391,8 +1435,8 @@ fn append_reconstructed_plain_tail(
 }
 
 /// Emit one matched line to `out`: the `--raw-key` extraction (if any),
-/// followed by the full line (colored or raw) unless line output is
-/// suppressed by an aggregation/raw-key mode.
+/// followed by the full line in the configured `LineMode` unless line output
+/// is suppressed by an aggregation/raw-key mode.
 #[allow(clippy::too_many_arguments)]
 fn emit_match<W: Write + ?Sized>(
     parsed: &[(&str, &str)],
@@ -1401,10 +1445,9 @@ fn emit_match<W: Write + ?Sized>(
     parse_end: usize,
     raw: &mut RawExtractor,
     suppress_lines: bool,
-    colorize: bool,
+    mode: LineMode,
     transform: Option<&LineTransform>,
     scratch: &mut EmitScratch,
-    passthrough_emit: bool,
     out: &mut W,
 ) -> std::io::Result<()> {
     raw.emit(parsed, out)?;
@@ -1413,23 +1456,24 @@ fn emit_match<W: Write + ?Sized>(
         return Ok(());
     }
 
-    if passthrough_emit {
-        out.write_all(line_buf)?;
-        if raw_len == parse_end {
-            out.write_all(b"\n")?;
-        }
-    } else {
-        scratch.write_slow(out, |buf| {
-            if colorize {
-                write_colored_line(buf, parsed, transform)
-            } else {
-                write_plain_reconstructed(buf, parsed, transform)?;
-                append_reconstructed_plain_tail(buf, line_buf, raw_len, parse_end);
-                Ok(())
+    match mode {
+        LineMode::Passthrough => {
+            out.write_all(line_buf)?;
+            if raw_len == parse_end {
+                out.write_all(b"\n")?;
             }
-        })?;
+            Ok(())
+        }
+        LineMode::Json => output::write_json_line(out, parsed, transform, &mut scratch.str_buf),
+        LineMode::Colored => scratch.write_slow(out, |buf| {
+            output::write_colored_line(buf, parsed, transform)
+        }),
+        LineMode::Plain => scratch.write_slow(out, |buf| {
+            output::write_plain_reconstructed(buf, parsed, transform)?;
+            append_reconstructed_plain_tail(buf, line_buf, raw_len, parse_end);
+            Ok(())
+        }),
     }
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

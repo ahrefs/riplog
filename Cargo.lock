@@ -636,6 +636,7 @@ dependencies = [
  "proptest",
  "rapidhash",
  "regex",
+ "serde_json",
  "smallvec",
  "smartstring",
  "vecmap-rs",

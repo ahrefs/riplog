@@ -17,6 +17,13 @@ pub struct Cli {
     /// processed in order; aggregated output (`--count`, `--group-by`,
     /// `--list-keys`, `--list-values-for`) is emitted once at the end and
     /// reflects the union of all files.
+    /// `-` is accepted as a file argument meaning stdin (may appear at most
+    /// once), processed in position alongside files — e.g.
+    /// `riplog rotated.log.1 rotated.log -` streams the two rotated logs,
+    /// then stdin. Symbolic `--from`/`--to` anchors and `--n-buckets`
+    /// resolve against the real files' span (stdin is skipped); the
+    /// resolved window is then applied as a per-line filter to stdin too.
+    /// `-` cannot be combined with `-f`, `-F`, or `--time-range`.
     /// Note: `--from`/`--to` are applied per file (each file is bisected
     /// independently, then strictly time-filtered), so a time range that
     /// straddles a log rotation works as expected. `-f`/`-F` is attached
@@ -165,6 +172,14 @@ pub struct Cli {
     /// and `-o` is not used.
     #[arg(long, value_enum, default_value_t = ColorMode::Auto, env="COLOR")]
     pub color: ColorMode,
+
+    /// Emit output as JSONL (one JSON value per line) instead of logfmt.
+    /// Each matched line becomes a JSON object; aggregation rows become
+    /// JSON objects with flat keys (`count`, `key.<k>`, `bucket.start`, …);
+    /// `--list-keys` / `--list-values-for` emit a single JSON array.
+    /// Conflicts with `--raw-key` and `--color=always`.
+    #[arg(long, conflicts_with = "raw_key")]
+    pub json: bool,
 
     /// Buffer matched lines and emit them at end sorted by `<KEY>`'s value
     /// (lexicographic). Lines lacking the key sort first (as if their value
