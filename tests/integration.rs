@@ -626,6 +626,53 @@ fn follow_reopen_handles_rotation() {
     );
 }
 
+/// `riplog rotated.log current.log -F`: both files must be read in full
+/// before the follow loop attaches to `current.log` (the rotation use case).
+/// Regression for a bug where the last file's `start_byte` was set to EOF,
+/// silently skipping its pre-existing content.
+#[cfg(unix)]
+#[test]
+fn follow_multi_file_reads_last_fully_then_tails() {
+    let dir = std::env::temp_dir().join("riplog-it-follow-multi");
+    fs::create_dir_all(&dir).unwrap();
+    let rotated = dir.join("rotated.log");
+    let current = dir.join("current.log");
+    fs::write(
+        &rotated,
+        "level=info time=2026-04-24T18:00:00Z msg=r1\n\
+         level=info time=2026-04-24T18:00:01Z msg=r2\n",
+    )
+    .unwrap();
+    fs::write(
+        &current,
+        "level=info time=2026-04-24T18:00:02Z msg=c1\n\
+         level=info time=2026-04-24T18:00:03Z msg=c2\n",
+    )
+    .unwrap();
+
+    let child = Command::new(riplog_bin())
+        .args(["-F", "--count"])
+        .arg(&rotated)
+        .arg(&current)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    thread::sleep(FOLLOW_TICK);
+
+    append_lines(
+        &current,
+        &["level=info time=2026-04-24T18:00:10Z msg=after1"],
+    );
+    thread::sleep(FOLLOW_TICK);
+
+    assert_eq!(
+        finish_with_sigint(child),
+        5,
+        "expected 2 rotated + 2 current + 1 appended"
+    );
+}
+
 /// Run `riplog` with `args` followed by each path stringified. Saves the
 /// `&[args, &[a.to_str().unwrap(), b.to_str().unwrap()]].concat()` dance
 /// across the multi-file tests below.

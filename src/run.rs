@@ -827,11 +827,18 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
     // window. Output is suppressed during planning — only summaries and
     // matched lines are written, in file order, in phase 2.
     let last_idx = cli.files.len() - 1;
+    // `tail -F`-style start-at-EOF only applies to the classic single-file
+    // case. With multiple files (e.g. `foo.log.1 foo.log -F`), the last
+    // file is read fully — completing the rotated → current → tail story.
+    let single_file = cli.files.len() == 1;
     let plans: Vec<FilePlan<'_>> = cli
         .files
         .iter()
         .enumerate()
-        .map(|(i, path)| plan_file(path, cli, tf, following && i == last_idx))
+        .map(|(i, path)| {
+            let last = i == last_idx;
+            plan_file(path, cli, tf, following && last, following && last && single_file)
+        })
         .collect::<anyhow::Result<_>>()?;
 
     // Phase 2: stream each planned range in order. Only the last file may
@@ -926,6 +933,7 @@ fn plan_file<'a>(
     cli: &Cli,
     tf: TimeFilter,
     follow_this_file: bool,
+    tail_from_eof: bool,
 ) -> anyhow::Result<FilePlan<'a>> {
     // Stdin can't be bisected; phase 2 detects `-` and streams unbounded
     // with the time filter applied per-line.
@@ -945,7 +953,7 @@ fn plan_file<'a>(
     let t_bisect = Instant::now();
     let start_byte: u64 = match tf.from {
         Some(t1) => bisect::bisect(&mut file, t1, window, Side::Lower)?,
-        None if follow_this_file => file_len, // tail-from-EOF when no --from
+        None if tail_from_eof => file_len, // `tail -F`-style start at EOF
         None => 0,
     };
     let end_byte: u64 = match tf.to {
