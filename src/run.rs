@@ -3,8 +3,6 @@
 //! follow.
 
 use anyhow::Context as _;
-use humanize_bytes::humanize_bytes_binary;
-use smartstring::alias::String as SmartString;
 use std::{
     fs::File,
     io::{BufRead, BufReader, BufWriter, IsTerminal, Read, Seek, SeekFrom, Write},
@@ -14,16 +12,16 @@ use std::{
 
 use crate::bucket::{resolve_bucket_spec, BucketSpec};
 use crate::cli::{Cli, ColorMode};
-use crate::counter::Counter;
+use crate::file_plan::{peek_global_window, plan_file, FilePlan};
 use crate::filter::Filter;
 use crate::logfmt;
 use crate::output::{JsonlFormat, JsonlOptions, LogfmtFormat, LogfmtOptions, OutputFormat};
 use crate::raw_extractor::RawExtractor;
-use crate::sampler::{build_sampler, Sampler};
+use crate::sampler::build_sampler;
 use crate::signal_handling::{install_signal_handler, interrupted};
-use crate::sort::SortBuffer;
-use crate::stats::{emit_summaries, KeyGather, Stats, ValueGather};
-use crate::time_bisect::{self, Side};
+use crate::sinks::{flush_sort_buf, make_sinks, LineMode, Sinks};
+use crate::stats::emit_summaries;
+use crate::time_bisect;
 use crate::timestamp::{self, Timestamp};
 use crate::transform::{
     parse_line_transform, transform_views, validate_rm_vs_features, EmitScratch,
@@ -33,21 +31,6 @@ use crate::transform::{
 #[inline]
 pub(crate) fn is_stdin_path(p: &Path) -> bool {
     p == Path::new("-")
-}
-
-/// How matched lines are emitted. Exactly one branch is active for a given
-/// run, decided once in `run::run` from `--color`, `--json`, and whether
-/// the memcpy fast path is eligible (no filter, no `--rm`/`--add`).
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum LineMode {
-    /// Copy the input bytes verbatim — the fast path.
-    Passthrough,
-    /// JSONL: one JSON object per line.
-    Json,
-    /// ANSI-colored logfmt reconstruction.
-    Colored,
-    /// Plain logfmt reconstruction (no color).
-    Plain,
 }
 
 /// Strict timestamp filter applied per-line on top of the bisected byte range.
@@ -403,109 +386,6 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn flush_sort_buf<W: Write>(sinks: &mut Sinks, out: &mut W) -> std::io::Result<()> {
-    if let Some(sort_buf) = sinks.sort_buf.take() {
-        sort_buf.emit(out)?;
-        out.flush()?;
-    }
-    Ok(())
-}
-
-/// Resolved per-file plan produced by phase 1: a byte slice (start, len),
-/// the strict time-filter to apply on top of it, and whether this file
-/// should be followed after EOF. The file is reopened in phase 2 so phase 1
-/// doesn't hold N file descriptors simultaneously.
-struct FilePlan<'a> {
-    path: &'a Path,
-    start_byte: u64,
-    /// `end_byte - start_byte`. Phase 2 reads exactly this many bytes.
-    max_bytes: u64,
-    tf: TimeFilter,
-    follow_this_file: bool,
-}
-
-/// Compute the union span across all real files (min of per-file first
-/// timestamps, max of per-file lasts) used as the anchor for symbolic
-/// `--from`/`--to` bounds. One head + one tail seek per file. Stdin (`-`)
-/// entries are skipped — pipes can't be peeked at both ends.
-fn peek_global_window(
-    files: &[std::path::PathBuf],
-) -> anyhow::Result<(Option<Timestamp>, Option<Timestamp>)> {
-    let mut first: Option<Timestamp> = None;
-    let mut last: Option<Timestamp> = None;
-    for path in files {
-        if is_stdin_path(path) {
-            continue;
-        }
-        let mut file = File::open(path)?;
-        if let Some(t) = time_bisect::peek_first_timestamp(&mut file)? {
-            first = Some(first.map_or(t, |cur| cur.min(t)));
-        }
-        if let Some(t) = time_bisect::peek_last_timestamp(&mut file)? {
-            last = Some(last.map_or(t, |cur| cur.max(t)));
-        }
-    }
-    Ok((first, last))
-}
-
-/// Phase 1: open `path`, bisect to the absolute byte slice corresponding to
-/// `tf`, and return the resolved range. The file is dropped on return so
-/// phase 1 doesn't pin a file descriptor; phase 2 reopens it. Independent
-/// across files (so it parallelizes cleanly).
-fn plan_file<'a>(
-    path: &'a Path,
-    cli: &Cli,
-    tf: TimeFilter,
-    follow_this_file: bool,
-    tail_from_eof: bool,
-) -> anyhow::Result<FilePlan<'a>> {
-    // Stdin can't be bisected; phase 2 detects `-` and streams unbounded
-    // with the time filter applied per-line.
-    if is_stdin_path(path) {
-        return Ok(FilePlan {
-            path,
-            start_byte: 0,
-            max_bytes: 0,
-            tf,
-            follow_this_file: false,
-        });
-    }
-    let mut file = File::open(path)?;
-    let file_len = file.seek(SeekFrom::End(0))?;
-    let window = (cli.window_secs as i64).saturating_mul(1_000_000_000);
-
-    let t_bisect = Instant::now();
-    let start_byte: u64 = match tf.from {
-        Some(t1) => time_bisect::bisect(&mut file, t1, window, Side::Lower)?,
-        None if tail_from_eof => file_len, // `tail -F`-style start at EOF
-        None => 0,
-    };
-    let end_byte: u64 = match tf.to {
-        Some(t2) if !follow_this_file => time_bisect::bisect(&mut file, t2, window, Side::Upper)?,
-        _ => file_len,
-    };
-
-    if cli.from.is_some() || cli.to.is_some() {
-        log::info!(
-            "bisect {}: [{}, {}] window={}s -> bytes [{start_byte}, {end_byte}) ({}) in {:.3}s",
-            path.display(),
-            cli.from.as_deref().unwrap_or("-"),
-            cli.to.as_deref().unwrap_or("-"),
-            cli.window_secs,
-            humanize_bytes_binary!(end_byte.saturating_sub(start_byte)),
-            t_bisect.elapsed().as_secs_f64()
-        );
-    }
-
-    Ok(FilePlan {
-        path,
-        start_byte,
-        max_bytes: end_byte.saturating_sub(start_byte),
-        tf,
-        follow_this_file,
-    })
-}
-
 /// Phase 2: open `plan.path`, seek to the planned start, stream the bounded
 /// byte range through filters and sinks, then optionally attach the follow
 /// loop.
@@ -586,53 +466,6 @@ fn stream_plan<W: Write>(
     Ok(())
 }
 
-/// Bundles per-line bookkeeping (stats + summarisers) so the streaming
-/// helpers don't drown in arguments.
-pub(crate) struct Sinks {
-    pub(crate) stats: Stats,
-    pub(crate) counter: Counter,
-    pub(crate) keys: KeyGather,
-    pub(crate) values: ValueGather,
-    raw: RawExtractor,
-    sampler: Option<Sampler>,
-    sort_buf: Option<SortBuffer>,
-    suppress_lines: bool,
-    /// Picks the line emitter (passthrough / json / colored / plain).
-    pub(crate) line_mode: LineMode,
-    limit: Option<usize>,
-    /// Display timezone, used by the streaming bucket flush to format
-    /// `bucket.start` / `bucket.end` / `time.start` / `time.end` on the fly.
-    tz: jiff::tz::TimeZone,
-    emit_scratch: EmitScratch,
-}
-
-impl Sinks {
-    #[inline]
-    fn done(&self) -> bool {
-        matches!(self.limit, Some(n) if self.stats.matched_lines >= n)
-    }
-
-    /// Activate streaming bucket emission on the underlying counter. Should
-    /// only be called on the *master* `Sinks` in follow mode — workers must
-    /// stay batched so their output can't interleave on the shared writer.
-    pub(crate) fn enable_streaming(&mut self, close_grace_nanos: i64) {
-        self.counter.enable_streaming(close_grace_nanos);
-    }
-
-    /// Fold per-worker collected state into `self`. `started` and the
-    /// configuration fields (`suppress_lines`, `colorize`, `limit`, ...)
-    /// are kept from `self`.
-    pub(crate) fn merge(&mut self, other: Self) {
-        self.stats.merge(other.stats);
-        self.counter.merge(other.counter);
-        self.keys.merge(other.keys);
-        self.values.merge(other.values);
-        if let (Some(a), Some(b)) = (self.sort_buf.as_mut(), other.sort_buf) {
-            a.merge(b);
-        }
-    }
-}
-
 /// Resolve `--parallel` to a worker count. `None` → 1 (sequential).
 /// `Some(0)` → all available cores (set by `default_missing_value` when the
 /// flag is given without a value). `Some(n)` → `n` workers.
@@ -643,35 +476,6 @@ pub(crate) fn resolve_parallelism(cli: &Cli) -> usize {
             .map(|n| n.get())
             .unwrap_or(1),
         Some(n) => n,
-    }
-}
-
-/// Construct a fresh `Sinks` for the master or a worker. Configuration
-/// fields are derived from `cli`; the `sampler` template is cloned in (its
-/// inner `Arc<Filter>` is shared, so cloning is cheap). All collected
-/// state (counts, gathers, sort buffer) starts empty.
-pub(crate) fn make_sinks(
-    cli: &Cli,
-    sampler: Option<Sampler>,
-    suppress_lines: bool,
-    line_mode: LineMode,
-    bucket: Option<BucketSpec>,
-    tz: jiff::tz::TimeZone,
-) -> Sinks {
-    let counter = Counter::new(cli.group_by.iter().map(SmartString::from).collect(), bucket);
-    Sinks {
-        stats: Stats::default(),
-        counter,
-        keys: KeyGather::new(cli.list_keys),
-        values: ValueGather::new(cli.list_values_for.iter().map(SmartString::from).collect()),
-        raw: RawExtractor::new(cli.raw_key.as_deref()),
-        sampler,
-        sort_buf: cli.sort_by.as_deref().map(SortBuffer::new),
-        suppress_lines,
-        line_mode,
-        limit: cli.limit,
-        tz,
-        emit_scratch: EmitScratch::default(),
     }
 }
 

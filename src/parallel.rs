@@ -13,8 +13,9 @@ use std::sync::Mutex;
 use crate::bucket::BucketSpec;
 use crate::cli::Cli;
 use crate::filter::Filter;
-use crate::run::{make_sinks, stream_bounded, LineMode, Sinks, TimeFilter};
+use crate::run::{stream_bounded, TimeFilter};
 use crate::sampler::Sampler;
+use crate::sinks::{make_sinks, LineMode, Sinks};
 use crate::transform::{transform_views, LineTransform};
 
 /// Below this many bytes per worker, parallel mode falls back to sequential —

@@ -180,13 +180,13 @@ impl Stats {
 /// optional bare `--count` number. Pulled out so the `run::run`
 /// happy-path doesn't have to thread `bare_count` through everywhere.
 pub(crate) fn emit_summaries<W: Write>(
-    sinks: &crate::run::Sinks,
+    sinks: &crate::sinks::Sinks,
     count_only: bool,
     tz: &jiff::tz::TimeZone,
     output: &mut W,
 ) -> anyhow::Result<()> {
     sinks.stats.report();
-    let json = matches!(sinks.line_mode, crate::run::LineMode::Json);
+    let json = matches!(sinks.line_mode, crate::sinks::LineMode::Json);
     if sinks.counter.streaming {
         sinks.counter.flush_remaining(output, tz, json)?;
     } else {
