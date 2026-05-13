@@ -1,8 +1,7 @@
 //! Per-line processing pipeline. Bundles the borrows that `process_line`
 //! threaded as separate arguments (filter, time-filter, sinks, transform
-//! views) plus a reusable line buffer, into a single struct. The streaming
-//! helpers in `run.rs` hold `&mut Pipeline` and call `process_line` for each
-//! line read.
+//! views) into a single struct. The streaming helpers in `run.rs` hold
+//! `&mut Pipeline` and call `process_line` for each line read.
 
 use std::io::Write;
 
@@ -15,8 +14,7 @@ use crate::sinks::{LineMode, Sinks};
 use crate::timestamp;
 use crate::transform::EmitScratch;
 
-/// Per-line state bundle: the borrows that every line-processing call needs,
-/// plus the reusable byte buffer that `read_until` fills.
+/// Per-line state bundle: the borrows that every line-processing call needs.
 ///
 /// One `Pipeline` is constructed per stream (per file, or once for stdin).
 /// In the parallel path each worker builds its own, since `sinks` is
@@ -27,9 +25,6 @@ pub(crate) struct Pipeline<'a> {
     pub(crate) sinks: &'a mut Sinks,
     pub(crate) add_pairs: &'a [(&'a str, &'a str)],
     pub(crate) remove_keys: &'a [&'a str],
-    /// Reused across calls: `read_until` appends into it, `process_line`
-    /// clears at the end.
-    pub(crate) line_buf: Vec<u8>,
 }
 
 impl<'a> Pipeline<'a> {
@@ -46,34 +41,33 @@ impl<'a> Pipeline<'a> {
             sinks,
             add_pairs,
             remove_keys,
-            line_buf: Vec::new(),
         }
     }
 
-    /// Process the bytes currently in `self.line_buf` (the caller just
-    /// appended `n_bytes` to it via `read_until`). Writes any matched
-    /// output to `output`. Clears `self.line_buf` on return.
+    /// Process one line. `line` may include a trailing `\n` or `\r\n`; it is
+    /// preserved verbatim in passthrough output. The caller owns the buffer
+    /// (typically a slice into a `BufReader`'s internal buffer or a small
+    /// carry-over `Vec`).
     pub(crate) fn process_line<W: Write + ?Sized>(
         &mut self,
-        n_bytes: usize,
+        line: &[u8],
         output: &mut W,
     ) -> anyhow::Result<()> {
         // Preserve the original bytes for output; trim a trailing newline for parsing.
-        let raw_len = self.line_buf.len();
+        let raw_len = line.len();
         let mut parse_end = raw_len;
-        while parse_end > 0 && matches!(self.line_buf[parse_end - 1], b'\n' | b'\r') {
+        while parse_end > 0 && matches!(line[parse_end - 1], b'\n' | b'\r') {
             parse_end -= 1;
         }
 
-        self.sinks.stats.bytes += n_bytes;
+        self.sinks.stats.bytes += raw_len;
         self.sinks.stats.total_lines += 1;
 
-        let parse_slice = &self.line_buf[..parse_end];
+        let parse_slice = &line[..parse_end];
         let line_str = match std::str::from_utf8(parse_slice) {
             Ok(s) => s,
             Err(_) => {
                 self.sinks.stats.invalid_utf += 1;
-                self.line_buf.clear();
                 return Ok(());
             }
         };
@@ -98,14 +92,9 @@ impl<'a> Pipeline<'a> {
         if matched {
             self.sinks.stats.matched_lines += 1;
             self.sinks.counter.record(parsed, ts);
-            // Streaming mode (`-f`/`-F` + `--bucket`): emit any buckets that
-            // have passed the close threshold. Cheap when nothing is closeable;
-            // a no-op when streaming is off.
-            self.sinks.counter.flush_closed(
-                output,
-                &self.sinks.tz,
-                matches!(self.sinks.line_mode, LineMode::Json),
-            )?;
+            // Streaming-bucket `flush_closed` used to live here; it now runs
+            // once per chunk in the streaming loops (`run::stream_*` /
+            // `follow_loop`), which is a real win when many lines match.
             self.sinks.keys.record(parsed);
             self.sinks.values.record(parsed);
             if let Some(sort_buf) = self.sinks.sort_buf.as_mut() {
@@ -116,13 +105,12 @@ impl<'a> Pipeline<'a> {
                     let scratch = &mut self.sinks.emit_scratch;
                     let suppress = self.sinks.suppress_lines;
                     let mode = self.sinks.line_mode;
-                    let line_buf = &self.line_buf;
                     let add_pairs = self.add_pairs;
                     let remove_keys = self.remove_keys;
                     sort_buf.capture(parsed, |w| {
                         emit_match(
                             parsed,
-                            line_buf,
+                            line,
                             raw_len,
                             parse_end,
                             raw,
@@ -138,7 +126,7 @@ impl<'a> Pipeline<'a> {
             } else {
                 emit_match(
                     parsed,
-                    &self.line_buf,
+                    line,
                     raw_len,
                     parse_end,
                     &mut self.sinks.raw,
@@ -151,7 +139,6 @@ impl<'a> Pipeline<'a> {
                 )?;
             }
         }
-        self.line_buf.clear();
         Ok(())
     }
 }

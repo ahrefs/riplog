@@ -510,7 +510,7 @@ fn stream_plan<W: Write>(
     } else {
         None
     };
-    let mut reader = BufReader::new(file);
+    let mut reader = BufReader::with_capacity(STREAM_BUF_CAP, file);
 
     let mut pipeline = Pipeline::new(filter, &tf, sinks, add_pairs, remove_keys);
     stream_bounded(&mut reader, max_bytes, &mut pipeline, output)?;
@@ -518,9 +518,9 @@ fn stream_plan<W: Write>(
 
     if let Some(handle) = file_for_reopen {
         // Re-borrow check: the original `sinks.done()` call after stream_bounded
-        // is gated through the pipeline's borrow. Drop the pipeline so we can
-        // re-check `sinks.done()` and build a fresh one for the follow loop.
-        drop(pipeline);
+        // is gated through the pipeline's borrow. End the borrow so we can
+        // re-check `sinks.done()` and build a fresh pipeline for the follow loop.
+        let _ = pipeline;
         if !interrupted() && !sinks.done() {
             // Follow mode ignores the per-file `tf` (newly arrived lines have
             // no resolved time bound), matching the previous behavior where
@@ -554,49 +554,142 @@ pub(crate) fn resolve_parallelism(cli: &Cli) -> usize {
     }
 }
 
+/// BufReader capacity for streaming reads. 128 KB is the sweet spot from a
+/// sweep on `foo.log` (2.8 GB): 8 KB is clearly bad, 32 KB recovers most of
+/// it, 128 KB wins marginally on aggregate/parallel modes, sizes above are
+/// noise. Big enough to fit pathologically long log lines without spilling
+/// into the carryover `tail`.
+pub(crate) const STREAM_BUF_CAP: usize = 128 * 1024;
+
+/// Run the per-chunk `Counter::flush_closed`. Borrow-split so the call site
+/// in the streaming loop doesn't have to.
+#[inline]
+fn flush_closed_chunk<W: Write + ?Sized>(
+    pipeline: &mut Pipeline<'_>,
+    output: &mut W,
+) -> std::io::Result<()> {
+    let json = matches!(pipeline.sinks.line_mode, LineMode::Json);
+    let sinks = &mut *pipeline.sinks;
+    sinks.counter.flush_closed(output, &sinks.tz, json)
+}
+
 /// Read a fixed byte budget from `reader`, write matching lines to `output`.
+///
+/// Uses `fill_buf` + `memchr::memchr_iter` so newline scanning is one SIMD
+/// pass per chunk and per-line bookkeeping (interrupt + `sinks.done`) only
+/// runs at chunk granularity, except for the `--limit` `done` check which
+/// still fires per matched line to stop mid-chunk.
 pub(crate) fn stream_bounded<R: BufRead, W: Write + ?Sized>(
     reader: &mut R,
     max_bytes: u64,
     pipeline: &mut Pipeline<'_>,
     output: &mut W,
 ) -> anyhow::Result<()> {
+    let mut tail: Vec<u8> = Vec::new();
     let mut total_read: u64 = 0;
 
-    while total_read < max_bytes && !interrupted() {
-        let n = reader.read_until(b'\n', &mut pipeline.line_buf)?;
-        if n == 0 {
+    'outer: while total_read < max_bytes && !interrupted() {
+        let chunk = reader.fill_buf()?;
+        if chunk.is_empty() {
             break;
         }
-        total_read += n as u64;
-        pipeline.process_line(n, output)?;
-        if pipeline.sinks.done() {
-            break;
+        let remaining = (max_bytes - total_read) as usize;
+        let usable_len = chunk.len().min(remaining);
+        let usable = &chunk[..usable_len];
+
+        let mut start = 0;
+        let mut hit_limit_at: Option<usize> = None;
+        for nl in memchr::memchr_iter(b'\n', usable) {
+            if tail.is_empty() {
+                pipeline.process_line(&usable[start..=nl], output)?;
+            } else {
+                tail.extend_from_slice(&usable[start..=nl]);
+                pipeline.process_line(&tail, output)?;
+                tail.clear();
+            }
+            start = nl + 1;
+            if pipeline.sinks.done() {
+                hit_limit_at = Some(nl + 1);
+                break;
+            }
         }
+        if let Some(consumed) = hit_limit_at {
+            reader.consume(consumed);
+            // Final per-chunk flush for buckets that may have just closed.
+            flush_closed_chunk(pipeline, output)?;
+            break 'outer;
+        }
+        if start < usable_len {
+            tail.extend_from_slice(&usable[start..usable_len]);
+        }
+        reader.consume(usable_len);
+        total_read += usable_len as u64;
+        // Per-chunk streaming-bucket flush: no-op when streaming is off
+        // (the common case), real work only when `-f`/`-F` + `--bucket`.
+        flush_closed_chunk(pipeline, output)?;
+    }
+    // Trailing partial line at EOF (no newline). Process it if anything's there.
+    if !tail.is_empty() && !pipeline.sinks.done() {
+        pipeline.process_line(&tail, output)?;
+        flush_closed_chunk(pipeline, output)?;
     }
     Ok(())
 }
 
 /// Read until EOF (e.g. stdin), write matching lines to `output`.
-/// Flushes after every line so interactive pipelines (`tail -f | riplog`)
-/// don't stall in the output BufWriter.
 fn stream_unbounded<R: Read, W: Write>(
     reader: &mut R,
     pipeline: &mut Pipeline<'_>,
     output: &mut W,
 ) -> anyhow::Result<()> {
-    let mut reader = BufReader::new(reader);
+    let mut reader = BufReader::with_capacity(STREAM_BUF_CAP, reader);
+    let mut tail: Vec<u8> = Vec::new();
 
-    while !interrupted() {
-        let n = reader.read_until(b'\n', &mut pipeline.line_buf)?;
-        if n == 0 {
+    // Per-chunk flush instead of per-line: interactive `tail -f | riplog`
+    // accepts batch-latency (bounded by chunk size ~64 KB) for higher
+    // throughput. If a user reports lag on interactive pipes, gate this on
+    // `stdout().is_terminal()` and revert to per-line flush in that case.
+    'outer: while !interrupted() {
+        let chunk = reader.fill_buf()?;
+        if chunk.is_empty() {
             break;
         }
-        pipeline.process_line(n, output)?;
+        let usable_len = chunk.len();
+        let usable = &chunk[..usable_len];
+
+        let mut start = 0;
+        let mut hit_limit_at: Option<usize> = None;
+        for nl in memchr::memchr_iter(b'\n', usable) {
+            if tail.is_empty() {
+                pipeline.process_line(&usable[start..=nl], output)?;
+            } else {
+                tail.extend_from_slice(&usable[start..=nl]);
+                pipeline.process_line(&tail, output)?;
+                tail.clear();
+            }
+            start = nl + 1;
+            if pipeline.sinks.done() {
+                hit_limit_at = Some(nl + 1);
+                break;
+            }
+        }
+        if let Some(consumed) = hit_limit_at {
+            reader.consume(consumed);
+            flush_closed_chunk(pipeline, output)?;
+            output.flush()?;
+            break 'outer;
+        }
+        if start < usable_len {
+            tail.extend_from_slice(&usable[start..usable_len]);
+        }
+        reader.consume(usable_len);
+        flush_closed_chunk(pipeline, output)?;
         output.flush()?;
-        if pipeline.sinks.done() {
-            break;
-        }
+    }
+    if !tail.is_empty() && !pipeline.sinks.done() {
+        pipeline.process_line(&tail, output)?;
+        flush_closed_chunk(pipeline, output)?;
+        output.flush()?;
     }
     Ok(())
 }
@@ -610,12 +703,15 @@ fn follow_loop<W: Write>(
     output: &mut W,
 ) -> anyhow::Result<()> {
     let mut pos = reader.stream_position()?;
+    let mut tail: Vec<u8> = Vec::new();
 
     while !interrupted() {
-        let n = reader.read_until(b'\n', &mut pipeline.line_buf)?;
-        if n == 0 {
+        let chunk = reader.fill_buf()?;
+        if chunk.is_empty() {
+            // No bytes available right now. If we have a buffered partial line,
+            // just wait — don't process it yet (more bytes may complete it).
             output.flush()?;
-            if reopen {
+            if tail.is_empty() && reopen {
                 if let Some((new_handle, new_reader)) = check_rotation(path, &handle, pos)? {
                     log::info!(
                         "follow: file rotated/truncated; reopening {}",
@@ -624,23 +720,42 @@ fn follow_loop<W: Write>(
                     handle = new_handle;
                     reader = new_reader;
                     pos = 0;
-                    pipeline.line_buf.clear();
                     continue;
                 }
             }
             std::thread::sleep(FOLLOW_POLL);
             continue;
         }
-        if !pipeline.line_buf.ends_with(b"\n") {
-            // Partial line — wait for the rest.
-            std::thread::sleep(FOLLOW_POLL);
-            continue;
+        let usable_len = chunk.len();
+        let usable = &chunk[..usable_len];
+
+        let mut start = 0;
+        let mut hit_limit_at: Option<usize> = None;
+        for nl in memchr::memchr_iter(b'\n', usable) {
+            if tail.is_empty() {
+                pipeline.process_line(&usable[start..=nl], output)?;
+            } else {
+                tail.extend_from_slice(&usable[start..=nl]);
+                pipeline.process_line(&tail, output)?;
+                tail.clear();
+            }
+            start = nl + 1;
+            if pipeline.sinks.done() {
+                hit_limit_at = Some(nl + 1);
+                break;
+            }
         }
-        pos += n as u64;
-        pipeline.process_line(n, output)?;
-        if pipeline.sinks.done() {
+        if let Some(consumed) = hit_limit_at {
+            reader.consume(consumed);
+            flush_closed_chunk(pipeline, output)?;
             break;
         }
+        if start < usable_len {
+            tail.extend_from_slice(&usable[start..usable_len]);
+        }
+        reader.consume(usable_len);
+        pos += usable_len as u64;
+        flush_closed_chunk(pipeline, output)?;
     }
     Ok(())
 }

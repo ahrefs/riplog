@@ -61,7 +61,7 @@ where
     if chunks.len() <= 1 {
         let mut file = File::open(path)?;
         file.seek(SeekFrom::Start(start_byte))?;
-        let reader = BufReader::new(file);
+        let reader = BufReader::with_capacity(crate::run::STREAM_BUF_CAP, file);
         let state = work(reader, max_bytes, output)?;
         return Ok(vec![state]);
     }
@@ -85,7 +85,7 @@ where
                 s.spawn(move || -> anyhow::Result<S> {
                     let mut file = File::open(path)?;
                     file.seek(SeekFrom::Start(cs))?;
-                    let reader = BufReader::new(file);
+                    let reader = BufReader::with_capacity(crate::run::STREAM_BUF_CAP, file);
                     let mut sink = UnorderedSink::new(shared);
                     let state = work_ref(reader, ce - cs, &mut sink)?;
                     sink.flush()?;
