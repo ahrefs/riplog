@@ -14,18 +14,14 @@ use crate::bucket::{resolve_bucket_spec, BucketSpec};
 use crate::cli::{Cli, ColorMode};
 use crate::file_plan::{peek_global_window, plan_file, FilePlan};
 use crate::filter::Filter;
-use crate::logfmt;
-use crate::output::{JsonlFormat, JsonlOptions, LogfmtFormat, LogfmtOptions, OutputFormat};
-use crate::raw_extractor::RawExtractor;
+use crate::pipeline::Pipeline;
 use crate::sampler::build_sampler;
 use crate::signal_handling::{install_signal_handler, interrupted};
 use crate::sinks::{flush_sort_buf, make_sinks, LineMode, Sinks};
 use crate::stats::emit_summaries;
 use crate::time_bisect;
 use crate::timestamp::{self, Timestamp};
-use crate::transform::{
-    parse_line_transform, transform_views, validate_rm_vs_features, EmitScratch,
-};
+use crate::transform::{parse_line_transform, transform_views, validate_rm_vs_features};
 
 /// `-` in the file list is the Unix idiom for "read from stdin in position".
 #[inline]
@@ -46,13 +42,13 @@ pub(crate) struct TimeFilter {
 }
 
 impl TimeFilter {
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.from.is_none() && self.to.is_none()
     }
 
     /// Test the (already-parsed) timestamp against the bounds. `None` means
     /// the line had no parseable timestamp; with bounds set, that's a drop.
-    fn check(&self, ts: Option<Timestamp>) -> bool {
+    pub(crate) fn check(&self, ts: Option<Timestamp>) -> bool {
         if self.is_empty() {
             return true;
         }
@@ -199,15 +195,9 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
             let grace = (cli.window_secs as i64).saturating_mul(1_000_000_000);
             sinks.enable_streaming(grace);
         }
-        stream_unbounded(
-            &mut std::io::stdin().lock(),
-            &filter,
-            &TimeFilter::default(),
-            &mut output,
-            &mut sinks,
-            &add_view,
-            &remove_view,
-        )?;
+        let tf_default = TimeFilter::default();
+        let mut pipeline = Pipeline::new(&filter, &tf_default, &mut sinks, &add_view, &remove_view);
+        stream_unbounded(&mut std::io::stdin().lock(), &mut pipeline, &mut output)?;
         output.flush()?;
         flush_sort_buf(&mut sinks, &mut output)?;
         emit_summaries(&sinks, bare_count, &tz, &mut output)?;
@@ -389,7 +379,6 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
 /// Phase 2: open `plan.path`, seek to the planned start, stream the bounded
 /// byte range through filters and sinks, then optionally attach the follow
 /// loop.
-#[allow(clippy::too_many_arguments)]
 fn stream_plan<W: Write>(
     plan: FilePlan<'_>,
     cli: &Cli,
@@ -410,15 +399,8 @@ fn stream_plan<W: Write>(
     if is_stdin_path(path) {
         // No bisect, no follow loop. Per-line `tf` still applies (resolved
         // against the real files' span by the caller).
-        return stream_unbounded(
-            &mut std::io::stdin().lock(),
-            filter,
-            &tf,
-            output,
-            sinks,
-            add_pairs,
-            remove_keys,
-        );
+        let mut pipeline = Pipeline::new(filter, &tf, sinks, add_pairs, remove_keys);
+        return stream_unbounded(&mut std::io::stdin().lock(), &mut pipeline, output);
     }
 
     let mut file = File::open(path)?;
@@ -435,30 +417,28 @@ fn stream_plan<W: Write>(
     };
     let mut reader = BufReader::new(file);
 
-    stream_bounded(
-        &mut reader,
-        max_bytes,
-        filter,
-        &tf,
-        output,
-        sinks,
-        add_pairs,
-        remove_keys,
-    )?;
+    let mut pipeline = Pipeline::new(filter, &tf, sinks, add_pairs, remove_keys);
+    stream_bounded(&mut reader, max_bytes, &mut pipeline, output)?;
     output.flush()?;
 
     if let Some(handle) = file_for_reopen {
+        // Re-borrow check: the original `sinks.done()` call after stream_bounded
+        // is gated through the pipeline's borrow. Drop the pipeline so we can
+        // re-check `sinks.done()` and build a fresh one for the follow loop.
+        drop(pipeline);
         if !interrupted() && !sinks.done() {
+            // Follow mode ignores the per-file `tf` (newly arrived lines have
+            // no resolved time bound), matching the previous behavior where
+            // `follow_loop` passed `TimeFilter::default()`.
+            let tf_follow = TimeFilter::default();
+            let mut pipeline = Pipeline::new(filter, &tf_follow, sinks, add_pairs, remove_keys);
             follow_loop(
                 path,
                 handle,
                 reader,
                 cli.follow_reopen,
-                filter,
+                &mut pipeline,
                 output,
-                sinks,
-                add_pairs,
-                remove_keys,
             )?;
         }
     }
@@ -480,37 +460,22 @@ pub(crate) fn resolve_parallelism(cli: &Cli) -> usize {
 }
 
 /// Read a fixed byte budget from `reader`, write matching lines to `output`.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn stream_bounded<R: BufRead, W: Write + ?Sized>(
     reader: &mut R,
     max_bytes: u64,
-    filter: &Filter,
-    tf: &TimeFilter,
+    pipeline: &mut Pipeline<'_>,
     output: &mut W,
-    sinks: &mut Sinks,
-    add_pairs: &[(&str, &str)],
-    remove_keys: &[&str],
 ) -> anyhow::Result<()> {
-    let mut line_buf = Vec::new();
     let mut total_read: u64 = 0;
 
     while total_read < max_bytes && !interrupted() {
-        let n = reader.read_until(b'\n', &mut line_buf)?;
+        let n = reader.read_until(b'\n', &mut pipeline.line_buf)?;
         if n == 0 {
             break;
         }
         total_read += n as u64;
-        process_line(
-            &mut line_buf,
-            filter,
-            tf,
-            output,
-            sinks,
-            n,
-            add_pairs,
-            remove_keys,
-        )?;
-        if sinks.done() {
+        pipeline.process_line(n, output)?;
+        if pipeline.sinks.done() {
             break;
         }
     }
@@ -522,250 +487,37 @@ pub(crate) fn stream_bounded<R: BufRead, W: Write + ?Sized>(
 /// don't stall in the output BufWriter.
 fn stream_unbounded<R: Read, W: Write>(
     reader: &mut R,
-    filter: &Filter,
-    tf: &TimeFilter,
+    pipeline: &mut Pipeline<'_>,
     output: &mut W,
-    sinks: &mut Sinks,
-    add_pairs: &[(&str, &str)],
-    remove_keys: &[&str],
 ) -> anyhow::Result<()> {
     let mut reader = BufReader::new(reader);
-    let mut line_buf = Vec::new();
 
     while !interrupted() {
-        let n = reader.read_until(b'\n', &mut line_buf)?;
+        let n = reader.read_until(b'\n', &mut pipeline.line_buf)?;
         if n == 0 {
             break;
         }
-        process_line(
-            &mut line_buf,
-            filter,
-            tf,
-            output,
-            sinks,
-            n,
-            add_pairs,
-            remove_keys,
-        )?;
+        pipeline.process_line(n, output)?;
         output.flush()?;
-        if sinks.done() {
+        if pipeline.sinks.done() {
             break;
         }
     }
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn process_line<W: Write + ?Sized>(
-    line_buf: &mut Vec<u8>,
-    filter: &Filter,
-    tf: &TimeFilter,
-    output: &mut W,
-    sinks: &mut Sinks,
-    n_bytes: usize,
-    add_pairs: &[(&str, &str)],
-    remove_keys: &[&str],
-) -> anyhow::Result<()> {
-    // Preserve the original bytes for output; trim a trailing newline for parsing.
-    let raw_len = line_buf.len();
-    let mut parse_end = raw_len;
-    while parse_end > 0 && matches!(line_buf[parse_end - 1], b'\n' | b'\r') {
-        parse_end -= 1;
-    }
-
-    sinks.stats.bytes += n_bytes;
-    sinks.stats.total_lines += 1;
-
-    let parse_slice = &line_buf[..parse_end];
-    let line_str = match std::str::from_utf8(parse_slice) {
-        Ok(s) => s,
-        Err(_) => {
-            sinks.stats.invalid_utf += 1;
-            line_buf.clear();
-            return Ok(());
-        }
-    };
-
-    let mut pairs = logfmt::PairsBuffer::<256>::new();
-    let (parsed, overflow) = pairs.parse(line_str);
-
-    // Extract the timestamp at most once per line, only when something
-    // downstream actually needs it (time-window filter or grouping counter).
-    let ts = if !tf.is_empty() || sinks.counter.is_active() {
-        timestamp::extract_timestamp(parsed)
-    } else {
-        None
-    };
-
-    let matched = tf.check(ts)
-        && (filter.is_empty() || filter.matches(parsed))
-        && sinks.sampler.as_ref().is_none_or(|s| s.keep(parsed));
-
-    sinks.stats.pairs += parsed.len();
-    sinks.stats.overflow += overflow as usize;
-    if matched {
-        sinks.stats.matched_lines += 1;
-        sinks.counter.record(parsed, ts);
-        // Streaming mode (`-f`/`-F` + `--bucket`): emit any buckets that
-        // have passed the close threshold. Cheap when nothing is closeable;
-        // a no-op when streaming is off.
-        sinks
-            .counter
-            .flush_closed(output, &sinks.tz, matches!(sinks.line_mode, LineMode::Json))?;
-        sinks.keys.record(parsed);
-        sinks.values.record(parsed);
-        if let Some(sort_buf) = sinks.sort_buf.as_mut() {
-            // Aggregation modes without --raw-key produce no per-line bytes;
-            // skip the capture in that case (counters above already recorded).
-            if !sinks.suppress_lines || sinks.raw.raw_key.is_some() {
-                let raw = &mut sinks.raw;
-                let scratch = &mut sinks.emit_scratch;
-                let suppress = sinks.suppress_lines;
-                let mode = sinks.line_mode;
-                sort_buf.capture(parsed, |w| {
-                    emit_match(
-                        parsed,
-                        line_buf,
-                        raw_len,
-                        parse_end,
-                        raw,
-                        suppress,
-                        mode,
-                        add_pairs,
-                        remove_keys,
-                        scratch,
-                        w,
-                    )
-                })?;
-            }
-        } else {
-            emit_match(
-                parsed,
-                line_buf,
-                raw_len,
-                parse_end,
-                &mut sinks.raw,
-                sinks.suppress_lines,
-                sinks.line_mode,
-                add_pairs,
-                remove_keys,
-                &mut sinks.emit_scratch,
-                output,
-            )?;
-        }
-    }
-    line_buf.clear();
-    Ok(())
-}
-
-#[inline]
-fn append_reconstructed_plain_tail(
-    buf: &mut Vec<u8>,
-    line_buf: &[u8],
-    raw_len: usize,
-    parse_end: usize,
-) {
-    if raw_len == parse_end {
-        buf.push(b'\n');
-    } else {
-        buf.extend_from_slice(&line_buf[parse_end..raw_len]);
-    }
-}
-
-/// Emit one matched line to `out`: the `--raw-key` extraction (if any),
-/// followed by the full line in the configured `LineMode` unless line output
-/// is suppressed by an aggregation/raw-key mode.
-///
-/// `add_pairs` and `remove_keys` are pre-computed views over the run-wide
-/// `LineTransform`; they're empty when no `--add`/`--rm` is set. They live
-/// in the caller's frame for the whole stream, so per-line work is just two
-/// slice borrows.
-#[allow(clippy::too_many_arguments)]
-fn emit_match<W: Write + ?Sized>(
-    parsed: &[(&str, &str)],
-    line_buf: &[u8],
-    raw_len: usize,
-    parse_end: usize,
-    raw: &mut RawExtractor,
-    suppress_lines: bool,
-    mode: LineMode,
-    add_pairs: &[(&str, &str)],
-    remove_keys: &[&str],
-    scratch: &mut EmitScratch,
-    out: &mut W,
-) -> std::io::Result<()> {
-    raw.emit(parsed, out)?;
-
-    if suppress_lines {
-        return Ok(());
-    }
-
-    // Passthrough copies bytes verbatim — no trait dispatch needed (and the
-    // memcpy fast path is what makes this mode worth keeping separate).
-    if let LineMode::Passthrough = mode {
-        out.write_all(line_buf)?;
-        if raw_len == parse_end {
-            out.write_all(b"\n")?;
-        }
-        return Ok(());
-    }
-
-    let pairs: &[&[(&str, &str)]] = if add_pairs.is_empty() {
-        &[parsed]
-    } else {
-        &[parsed, add_pairs]
-    };
-
-    match mode {
-        LineMode::Passthrough => unreachable!("handled above"),
-        LineMode::Json => {
-            JsonlFormat::output_line(out, pairs, remove_keys, &JsonlOptions, &mut scratch.str_buf)
-        }
-        LineMode::Colored => {
-            let EmitScratch { buf, str_buf } = scratch;
-            buf.clear();
-            LogfmtFormat::output_line(
-                buf,
-                pairs,
-                remove_keys,
-                &LogfmtOptions { color: true },
-                str_buf,
-            )?;
-            out.write_all(buf)
-        }
-        LineMode::Plain => {
-            let EmitScratch { buf, str_buf } = scratch;
-            buf.clear();
-            LogfmtFormat::output_line(
-                buf,
-                pairs,
-                remove_keys,
-                &LogfmtOptions { color: false },
-                str_buf,
-            )?;
-            append_reconstructed_plain_tail(buf, line_buf, raw_len, parse_end);
-            out.write_all(buf)
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
 fn follow_loop<W: Write>(
     path: &Path,
     mut handle: File,
     mut reader: BufReader<File>,
     reopen: bool,
-    filter: &Filter,
+    pipeline: &mut Pipeline<'_>,
     output: &mut W,
-    sinks: &mut Sinks,
-    add_pairs: &[(&str, &str)],
-    remove_keys: &[&str],
 ) -> anyhow::Result<()> {
-    let mut line_buf = Vec::new();
     let mut pos = reader.stream_position()?;
 
     while !interrupted() {
-        let n = reader.read_until(b'\n', &mut line_buf)?;
+        let n = reader.read_until(b'\n', &mut pipeline.line_buf)?;
         if n == 0 {
             output.flush()?;
             if reopen {
@@ -777,30 +529,21 @@ fn follow_loop<W: Write>(
                     handle = new_handle;
                     reader = new_reader;
                     pos = 0;
-                    line_buf.clear();
+                    pipeline.line_buf.clear();
                     continue;
                 }
             }
             std::thread::sleep(FOLLOW_POLL);
             continue;
         }
-        if !line_buf.ends_with(b"\n") {
+        if !pipeline.line_buf.ends_with(b"\n") {
             // Partial line — wait for the rest.
             std::thread::sleep(FOLLOW_POLL);
             continue;
         }
         pos += n as u64;
-        process_line(
-            &mut line_buf,
-            filter,
-            &TimeFilter::default(),
-            output,
-            sinks,
-            n,
-            add_pairs,
-            remove_keys,
-        )?;
-        if sinks.done() {
+        pipeline.process_line(n, output)?;
+        if pipeline.sinks.done() {
             break;
         }
     }

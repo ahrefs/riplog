@@ -9,6 +9,7 @@ pub mod json;
 pub mod logfmt;
 pub mod output;
 pub mod parallel;
+pub mod pipeline;
 pub mod raw_extractor;
 pub mod run;
 pub mod sampler;

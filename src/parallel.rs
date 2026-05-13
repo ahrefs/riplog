@@ -13,6 +13,7 @@ use std::sync::Mutex;
 use crate::bucket::BucketSpec;
 use crate::cli::Cli;
 use crate::filter::Filter;
+use crate::pipeline::Pipeline;
 use crate::run::{stream_bounded, TimeFilter};
 use crate::sampler::Sampler;
 use crate::sinks::{make_sinks, LineMode, Sinks};
@@ -79,16 +80,8 @@ pub(crate) fn run(job: Job<'_>) -> anyhow::Result<()> {
         file.seek(SeekFrom::Start(start_byte))?;
         let mut reader = BufReader::new(file);
         let (add_view, remove_view) = transform_views(line_transform.as_ref());
-        return stream_bounded(
-            &mut reader,
-            max_bytes,
-            filter,
-            &tf,
-            output,
-            master,
-            &add_view,
-            &remove_view,
-        );
+        let mut pipeline = Pipeline::new(filter, &tf, master, &add_view, &remove_view);
+        return stream_bounded(&mut reader, max_bytes, &mut pipeline, output);
     }
 
     log::info!(
@@ -119,16 +112,11 @@ pub(crate) fn run(job: Job<'_>) -> anyhow::Result<()> {
                     file.seek(SeekFrom::Start(cs))?;
                     let mut reader = BufReader::new(file);
                     let mut sink = UnorderedSink::new(shared);
-                    stream_bounded(
-                        &mut reader,
-                        ce - cs,
-                        filter,
-                        &tf,
-                        &mut sink,
-                        &mut sinks,
-                        &add_view,
-                        &remove_view,
-                    )?;
+                    {
+                        let mut pipeline =
+                            Pipeline::new(filter, &tf, &mut sinks, &add_view, &remove_view);
+                        stream_bounded(&mut reader, ce - cs, &mut pipeline, &mut sink)?;
+                    }
                     sink.flush()?;
                     Ok(sinks)
                 })
