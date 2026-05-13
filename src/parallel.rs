@@ -13,7 +13,7 @@ use std::sync::Mutex;
 use crate::cli::Cli;
 use crate::filter::Filter;
 use crate::run::{make_sinks, stream_bounded, BucketSpec, LineMode, Sampler, Sinks, TimeFilter};
-use crate::transform::LineTransform;
+use crate::transform::{transform_views, LineTransform};
 
 /// Below this many bytes per worker, parallel mode falls back to sequential —
 /// the fixed per-thread overhead would dominate the per-byte work.
@@ -75,7 +75,17 @@ pub(crate) fn run(job: Job<'_>) -> anyhow::Result<()> {
         let mut file = File::open(path)?;
         file.seek(SeekFrom::Start(start_byte))?;
         let mut reader = BufReader::new(file);
-        return stream_bounded(&mut reader, max_bytes, filter, &tf, output, master);
+        let (add_view, remove_view) = transform_views(line_transform.as_ref());
+        return stream_bounded(
+            &mut reader,
+            max_bytes,
+            filter,
+            &tf,
+            output,
+            master,
+            &add_view,
+            &remove_view,
+        );
     }
 
     log::info!(
@@ -100,20 +110,22 @@ pub(crate) fn run(job: Job<'_>) -> anyhow::Result<()> {
                     // Workers don't call `enable_streaming`: rows must batch
                     // into per-worker `Sinks` and merge into the master, or
                     // multi-writer output interleaves on the shared sink.
-                    let mut sinks = make_sinks(
-                        cli,
-                        sampler,
-                        suppress_lines,
-                        line_mode,
-                        bucket,
-                        tz,
-                        worker_tf,
-                    );
+                    let mut sinks = make_sinks(cli, sampler, suppress_lines, line_mode, bucket, tz);
+                    let (add_view, remove_view) = transform_views(worker_tf.as_ref());
                     let mut file = File::open(path)?;
                     file.seek(SeekFrom::Start(cs))?;
                     let mut reader = BufReader::new(file);
                     let mut sink = UnorderedSink::new(shared);
-                    stream_bounded(&mut reader, ce - cs, filter, &tf, &mut sink, &mut sinks)?;
+                    stream_bounded(
+                        &mut reader,
+                        ce - cs,
+                        filter,
+                        &tf,
+                        &mut sink,
+                        &mut sinks,
+                        &add_view,
+                        &remove_view,
+                    )?;
                     sink.flush()?;
                     Ok(sinks)
                 })

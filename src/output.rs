@@ -1,15 +1,16 @@
-//! Line and aggregation-row emitters in both `logfmt` (the default) and JSON
-//! (`--json`) formats. Pure serialization — no parsing, no aggregation logic.
-//! Callers in `run::Sinks` / `Counter` pick the format based on `output_json`.
+//! Line and aggregation-row emitters. Logfmt-shaped writers (both colored
+//! and plain) live here; JSON-shaped writers live in `json.rs`. Hot-path
+//! per-line emission is dispatched through the [`OutputFormat`] trait so
+//! `run::emit_match` doesn't branch on `LineMode` outside of choosing the
+//! impl. Pure serialization — no parsing, no aggregation logic.
 
 use rapidhash::RapidHashSet;
 use smartstring::alias::String as SmartString;
 use std::io::{self, Write};
 
-use crate::json::{JsonArr, JsonObj};
+use crate::json;
 use crate::logfmt;
 use crate::timestamp::{self, Timestamp};
-use crate::transform::LineTransform;
 
 // -------- ANSI escapes (colored logfmt only) --------
 
@@ -23,52 +24,45 @@ const COL_QUOTE: &str = "\x1b[1;34m";
 // Bright white on red background — used for `critical`/`crit` so it really pops.
 const COL_CRIT: &str = "\x1b[97;41m";
 
-// -------- logfmt line output --------
+// -------- OutputFormat trait --------
 
-#[inline]
-fn plain_field_sep(buf: &mut Vec<u8>, first: &mut bool) {
-    if !*first {
-        buf.push(b' ');
-    }
-    *first = false;
+/// Per-line emitter, picked once per run by `run::emit_match`. Implementors
+/// serialise a parsed line (a sequence of `[(key, value)]` slices — outer
+/// slice is to fold in `--add` pairs without per-call concatenation) into
+/// `w`. Values are still in logfmt-escaped form; impls unescape if their
+/// wire format demands it (jsonl) or pass through (logfmt).
+pub trait OutputFormat {
+    type Options;
+
+    /// Write one line. `remove` lists keys to drop (`--rm`). `scratch` is a
+    /// reusable `String` owned by the caller; the impl is free to clear and
+    /// fill it as a working buffer (e.g. for logfmt unescape) and must not
+    /// rely on its prior contents.
+    fn output_line<W: Write + ?Sized>(
+        w: &mut W,
+        pairs: &[&[(&str, &str)]],
+        remove: &[&str],
+        opts: &Self::Options,
+        scratch: &mut String,
+    ) -> io::Result<()>;
 }
 
-/// Plain reconstruction: optional `--rm` / `--add`. Without a transform, copies
-/// original pair tokens verbatim (hot path when `transform` is `None`).
-pub(crate) fn write_plain_reconstructed(
-    buf: &mut Vec<u8>,
-    parsed: &[(&str, &str)],
-    transform: Option<&LineTransform>,
-) -> io::Result<()> {
-    let mut first = true;
-    match transform {
-        None => {
-            for (k, v) in parsed {
-                plain_field_sep(buf, &mut first);
-                buf.extend_from_slice(k.as_bytes());
-                buf.push(b'=');
-                buf.extend_from_slice(v.as_bytes());
-            }
-        }
-        Some(tf) => {
-            for (k, v) in parsed {
-                if tf.key_removed(k) {
-                    continue;
-                }
-                plain_field_sep(buf, &mut first);
-                buf.extend_from_slice(k.as_bytes());
-                buf.push(b'=');
-                buf.extend_from_slice(v.as_bytes());
-            }
-            for (k, v) in &tf.add {
-                plain_field_sep(buf, &mut first);
-                buf.extend_from_slice(k.as_bytes());
-                buf.push(b'=');
-                logfmt::write_logfmt_value(buf, v.as_str())?;
-            }
-        }
-    }
-    Ok(())
+#[inline]
+fn is_removed(remove: &[&str], k: &str) -> bool {
+    // Hot-path optimisation: when `--rm` is unused the slice is empty and we
+    // skip the linear scan entirely.
+    !remove.is_empty() && remove.contains(&k)
+}
+
+// -------- logfmt format (plain + colored, picked via `LogfmtOptions.color`) --------
+
+pub struct LogfmtFormat;
+
+#[derive(Debug, Clone, Copy)]
+pub struct LogfmtOptions {
+    /// When true, emit ANSI styling (bold keys, level-coloured values,
+    /// quoted-value highlighting). When false, emit raw logfmt bytes.
+    pub color: bool,
 }
 
 fn level_color(value: &str) -> &'static str {
@@ -111,83 +105,97 @@ fn write_value<W: Write + ?Sized>(out: &mut W, v: &str, color: &str, bold: bool)
     Ok(())
 }
 
-/// Colored logfmt line. With `transform`, skips `--rm` keys and appends `--add`
-/// pairs without ANSI styling.
-pub(crate) fn write_colored_line<W: Write + ?Sized>(
-    out: &mut W,
-    parsed: &[(&str, &str)],
-    transform: Option<&LineTransform>,
-) -> io::Result<()> {
-    let lvl_sgr = parsed
-        .iter()
-        .find_map(|(k, v)| {
-            if transform.is_some_and(|tf| tf.key_removed(k)) {
-                return None;
-            }
-            (*k == "level").then(|| level_color(v))
-        })
-        .unwrap_or("");
+impl OutputFormat for LogfmtFormat {
+    type Options = LogfmtOptions;
 
-    let mut first = true;
-    for (k, v) in parsed {
-        if transform.is_some_and(|tf| tf.key_removed(k)) {
-            continue;
-        }
-        if !first {
-            out.write_all(b" ")?;
-        }
-        first = false;
-        write!(out, "{BOLD}{k}{RESET}=")?;
-        let color: &str = match *k {
-            "time" | "ts" => COL_BLUE,
-            "level" => lvl_sgr,
-            _ => "",
+    fn output_line<W: Write + ?Sized>(
+        w: &mut W,
+        pairs: &[&[(&str, &str)]],
+        remove: &[&str],
+        opts: &Self::Options,
+        _scratch: &mut String,
+    ) -> io::Result<()> {
+        // For colored output, pick the level colour up front so the bold value
+        // styling matches the level value (matters when `level` appears mid-line).
+        let lvl_sgr = if opts.color {
+            pairs
+                .iter()
+                .flat_map(|s| s.iter())
+                .find_map(|(k, v)| {
+                    if is_removed(remove, k) {
+                        return None;
+                    }
+                    (*k == "level").then(|| level_color(v))
+                })
+                .unwrap_or("")
+        } else {
+            ""
         };
-        write_value(out, v, color, *k == "level")?;
-    }
-    if let Some(tf) = transform {
-        for (k, v) in &tf.add {
-            if !first {
-                out.write_all(b" ")?;
+
+        let mut first = true;
+        for slice in pairs {
+            for (k, v) in *slice {
+                if is_removed(remove, k) {
+                    continue;
+                }
+                if !first {
+                    w.write_all(b" ")?;
+                }
+                first = false;
+                if opts.color {
+                    write!(w, "{BOLD}{k}{RESET}=")?;
+                    let color: &str = match *k {
+                        "time" | "ts" => COL_BLUE,
+                        "level" => lvl_sgr,
+                        _ => "",
+                    };
+                    write_value(w, v, color, *k == "level")?;
+                } else {
+                    w.write_all(k.as_bytes())?;
+                    w.write_all(b"=")?;
+                    w.write_all(v.as_bytes())?;
+                }
             }
-            first = false;
-            write!(out, "{k}=")?;
-            logfmt::write_logfmt_value(out, v.as_str())?;
         }
+        if opts.color {
+            w.write_all(b"\n")?;
+        }
+        Ok(())
     }
-    out.write_all(b"\n")?;
-    Ok(())
 }
 
-// -------- JSON line output --------
+// -------- jsonl format --------
 
-/// One matched line as a JSON object, in logfmt parse order. Logfmt values are
-/// unescaped into `scratch` then re-emitted as JSON strings. `--rm` keys are
-/// dropped; `--add` pairs are appended.
-pub(crate) fn write_json_line<W: Write + ?Sized>(
-    out: &mut W,
-    parsed: &[(&str, &str)],
-    transform: Option<&LineTransform>,
-    scratch: &mut String,
-) -> io::Result<()> {
-    let mut obj = JsonObj::open(out)?;
-    for (k, v) in parsed {
-        if transform.is_some_and(|tf| tf.key_removed(k)) {
-            continue;
+pub struct JsonlFormat;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct JsonlOptions;
+
+impl OutputFormat for JsonlFormat {
+    type Options = JsonlOptions;
+
+    fn output_line<W: Write + ?Sized>(
+        w: &mut W,
+        pairs: &[&[(&str, &str)]],
+        remove: &[&str],
+        _opts: &Self::Options,
+        scratch: &mut String,
+    ) -> io::Result<()> {
+        let mut obj = json::JsonObj::open(w)?;
+        for slice in pairs {
+            for (k, v) in *slice {
+                if is_removed(remove, k) {
+                    continue;
+                }
+                obj.entry_logfmt_value(k, v, scratch)?;
+            }
         }
-        obj.entry_logfmt_value(k, v, scratch)?;
+        obj.finish()?;
+        w.write_all(b"\n")
     }
-    if let Some(tf) = transform {
-        for (k, v) in &tf.add {
-            // `--add` values are plaintext (not raw logfmt), so emit directly.
-            obj.entry_str(k.as_str(), v.as_str())?;
-        }
-    }
-    obj.finish()?;
-    out.write_all(b"\n")
 }
 
-// -------- aggregation row output --------
+// -------- aggregation row output (logfmt only; JSON variant in `json.rs`) --------
 
 /// Logfmt aggregation row: `count=N key.<k>=… [bucket.start=… bucket.end=…]
 /// [time.start=… time.end=…]`.
@@ -220,47 +228,6 @@ pub(crate) fn write_agg_row_logfmt<W: Write + ?Sized>(
     writeln!(out)
 }
 
-/// JSON aggregation row: `{"count": N, "keys": {"<k>": "...", ...}, ...}`.
-/// The `keys` field is omitted entirely when there are no grouping keys.
-pub(crate) fn write_agg_row_json<W: Write + ?Sized>(
-    out: &mut W,
-    count: u64,
-    keys: &[SmartString],
-    combo: &[SmartString],
-    bucket: Option<(Timestamp, Timestamp)>,
-    time_range: Option<(Timestamp, Timestamp)>,
-    tz: &jiff::tz::TimeZone,
-) -> io::Result<()> {
-    let mut obj = JsonObj::open(out)?;
-    obj.entry_u64("count", count)?;
-    if !keys.is_empty() {
-        let mut k_obj = obj.start_obj("keys")?;
-        for (k, v) in keys.iter().zip(combo.iter()) {
-            k_obj.entry_str(k.as_str(), v.as_str())?;
-        }
-        k_obj.finish()?;
-    }
-    if let Some((start, end)) = bucket {
-        obj.entry_str("bucket.start", &timestamp::format_rfc3339(start, tz))?;
-        obj.entry_str("bucket.end", &timestamp::format_rfc3339(end, tz))?;
-    }
-    if let Some((a, b)) = time_range {
-        obj.entry_str("time.start", &timestamp::format_rfc3339(a, tz))?;
-        obj.entry_str("time.end", &timestamp::format_rfc3339(b, tz))?;
-    }
-    obj.finish()?;
-    out.write_all(b"\n")
-}
-
-/// One-shot `{"count": N}\n` line. Used for the bare `--count` summary
-/// under `--json`.
-pub(crate) fn write_count_json<W: Write + ?Sized>(out: &mut W, count: u64) -> io::Result<()> {
-    let mut obj = JsonObj::open(out)?;
-    obj.entry_u64("count", count)?;
-    obj.finish()?;
-    out.write_all(b"\n")
-}
-
 // -------- summary outputs (`--list-keys`, `--list-values-for`) --------
 
 fn sorted(set: &RapidHashSet<SmartString>) -> Vec<&SmartString> {
@@ -280,19 +247,6 @@ pub(crate) fn write_string_set_logfmt<W: Write + ?Sized>(
     Ok(())
 }
 
-/// `--list-keys` JSON: one JSON array on a single line, sorted.
-pub(crate) fn write_string_set_json<W: Write + ?Sized>(
-    out: &mut W,
-    set: &RapidHashSet<SmartString>,
-) -> io::Result<()> {
-    let mut arr = JsonArr::open(out)?;
-    for v in sorted(set) {
-        arr.push_str(v.as_str())?;
-    }
-    arr.finish()?;
-    out.write_all(b"\n")
-}
-
 /// `--list-values-for` logfmt: multi-key prefixes each block with `# <key>`.
 pub(crate) fn write_values_summary_logfmt<W: Write + ?Sized>(
     out: &mut W,
@@ -307,28 +261,4 @@ pub(crate) fn write_values_summary_logfmt<W: Write + ?Sized>(
         write_string_set_logfmt(out, set)?;
     }
     Ok(())
-}
-
-/// `--list-values-for` JSON. Single key → array of strings; multiple keys →
-/// array of `{"key": K, "value": V}` objects. One line either way.
-pub(crate) fn write_values_summary_json<W: Write + ?Sized>(
-    out: &mut W,
-    keys: &[SmartString],
-    values: &[RapidHashSet<SmartString>],
-) -> io::Result<()> {
-    if keys.len() == 1 {
-        write_string_set_json(out, &values[0])?;
-        return Ok(());
-    }
-    let mut arr = JsonArr::open(out)?;
-    for (key, set) in keys.iter().zip(values.iter()) {
-        for v in sorted(set) {
-            let mut o = arr.start_obj()?;
-            o.entry_str("key", key.as_str())?;
-            o.entry_str("value", v.as_str())?;
-            o.finish()?;
-        }
-    }
-    arr.finish()?;
-    out.write_all(b"\n")
 }

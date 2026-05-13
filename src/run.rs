@@ -18,12 +18,16 @@ use std::{
 
 use crate::cli::{Cli, ColorMode};
 use crate::filter::Filter;
+use crate::json;
 use crate::logfmt;
 use crate::output;
+use crate::output::{JsonlFormat, JsonlOptions, LogfmtFormat, LogfmtOptions, OutputFormat};
 use crate::sort::SortBuffer;
 use crate::time_bisect::{self, Side};
 use crate::timestamp::{self, Timestamp};
-use crate::transform::{parse_line_transform, validate_rm_vs_features, EmitScratch, LineTransform};
+use crate::transform::{
+    parse_line_transform, transform_views, validate_rm_vs_features, EmitScratch,
+};
 
 /// Set by the SIGINT handler; checked in tight loops so we can exit cleanly
 /// and still emit `--count` / `--list-keys` / `--count-by` summaries.
@@ -72,7 +76,7 @@ impl KeyGather {
             return Ok(());
         }
         if json {
-            output::write_string_set_json(out, &self.keys)
+            crate::json::write_string_set_json(out, &self.keys)
         } else {
             output::write_string_set_logfmt(out, &self.keys)
         }
@@ -173,7 +177,7 @@ impl ValueGather {
             return Ok(());
         }
         if json {
-            output::write_values_summary_json(out, &self.keys, &self.values)
+            crate::json::write_values_summary_json(out, &self.keys, &self.values)
         } else {
             output::write_values_summary_logfmt(out, &self.keys, &self.values)
         }
@@ -401,7 +405,7 @@ impl Counter {
         };
         let count = stats.count as u64;
         if self.output_json {
-            output::write_agg_row_json(out, count, &self.keys, combo, bucket, time_range, tz)
+            crate::json::write_agg_row_json(out, count, &self.keys, combo, bucket, time_range, tz)
         } else {
             output::write_agg_row_logfmt(out, count, &self.keys, combo, bucket, time_range, tz)
         }
@@ -603,6 +607,11 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
     if let Some(ref t) = line_transform {
         validate_rm_vs_features(cli, &t.remove)?;
     }
+    // Borrow once into `&str` slices for the per-line emit hot path; built
+    // here so `process_line`/`emit_match` don't re-walk `SmartString`s per
+    // matched line. Lifetime is tied to `line_transform`, which outlives all
+    // uses below.
+    let (add_view, remove_view) = transform_views(line_transform.as_ref());
     let following = cli.follow || cli.follow_reopen;
 
     if following && cli.n_buckets.is_some() {
@@ -701,7 +710,6 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
             line_mode,
             bucket,
             tz.clone(),
-            line_transform.clone(),
         );
         if bucket.is_some() {
             let grace = (cli.window_secs as i64).saturating_mul(1_000_000_000);
@@ -713,6 +721,8 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
             &TimeFilter::default(),
             &mut output,
             &mut sinks,
+            &add_view,
+            &remove_view,
         )?;
         output.flush()?;
         flush_sort_buf(&mut sinks, &mut output)?;
@@ -813,7 +823,6 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
         line_mode,
         bucket,
         tz.clone(),
-        line_transform.clone(),
     );
     // Master streams under follow or when stdin (`-`) is in the file list;
     // workers always batch (their output would interleave on the shared
@@ -874,7 +883,15 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
             })?;
             output.flush()?;
         } else {
-            stream_plan(plan, cli, &filter, &mut output, &mut sinks)?;
+            stream_plan(
+                plan,
+                cli,
+                &filter,
+                &mut output,
+                &mut sinks,
+                &add_view,
+                &remove_view,
+            )?;
         }
     }
 
@@ -991,12 +1008,15 @@ fn plan_file<'a>(
 /// Phase 2: open `plan.path`, seek to the planned start, stream the bounded
 /// byte range through filters and sinks, then optionally attach the follow
 /// loop.
+#[allow(clippy::too_many_arguments)]
 fn stream_plan<W: Write>(
     plan: FilePlan<'_>,
     cli: &Cli,
     filter: &Filter,
     output: &mut W,
     sinks: &mut Sinks,
+    add_pairs: &[(&str, &str)],
+    remove_keys: &[&str],
 ) -> anyhow::Result<()> {
     let FilePlan {
         path,
@@ -1009,7 +1029,15 @@ fn stream_plan<W: Write>(
     if is_stdin_path(path) {
         // No bisect, no follow loop. Per-line `tf` still applies (resolved
         // against the real files' span by the caller).
-        return stream_unbounded(&mut std::io::stdin().lock(), filter, &tf, output, sinks);
+        return stream_unbounded(
+            &mut std::io::stdin().lock(),
+            filter,
+            &tf,
+            output,
+            sinks,
+            add_pairs,
+            remove_keys,
+        );
     }
 
     let mut file = File::open(path)?;
@@ -1026,7 +1054,16 @@ fn stream_plan<W: Write>(
     };
     let mut reader = BufReader::new(file);
 
-    stream_bounded(&mut reader, max_bytes, filter, &tf, output, sinks)?;
+    stream_bounded(
+        &mut reader,
+        max_bytes,
+        filter,
+        &tf,
+        output,
+        sinks,
+        add_pairs,
+        remove_keys,
+    )?;
     output.flush()?;
 
     if let Some(handle) = file_for_reopen {
@@ -1039,6 +1076,8 @@ fn stream_plan<W: Write>(
                 filter,
                 output,
                 sinks,
+                add_pairs,
+                remove_keys,
             )?;
         }
     }
@@ -1063,7 +1102,7 @@ fn emit_summaries<W: Write>(
     sinks.values.report(output, json)?;
     if count_only {
         if json {
-            output::write_count_json(output, sinks.stats.matched_lines as u64)?;
+            json::write_count_json(output, sinks.stats.matched_lines as u64)?;
         } else {
             writeln!(output, "{}", sinks.stats.matched_lines)?;
         }
@@ -1145,8 +1184,6 @@ pub(crate) struct Sinks {
     /// Display timezone, used by the streaming bucket flush to format
     /// `bucket.start` / `bucket.end` / `time.start` / `time.end` on the fly.
     tz: jiff::tz::TimeZone,
-    /// When set, `--rm` / `--add` mutate emitted lines (not used for `--if`).
-    transform: Option<LineTransform>,
     emit_scratch: EmitScratch,
 }
 
@@ -1268,7 +1305,6 @@ pub(crate) fn make_sinks(
     line_mode: LineMode,
     bucket: Option<BucketSpec>,
     tz: jiff::tz::TimeZone,
-    transform: Option<LineTransform>,
 ) -> Sinks {
     let counter = Counter::new(
         cli.group_by.iter().map(SmartString::from).collect(),
@@ -1287,12 +1323,12 @@ pub(crate) fn make_sinks(
         line_mode,
         limit: cli.limit,
         tz,
-        transform,
         emit_scratch: EmitScratch::default(),
     }
 }
 
 /// Read a fixed byte budget from `reader`, write matching lines to `output`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn stream_bounded<R: BufRead, W: Write + ?Sized>(
     reader: &mut R,
     max_bytes: u64,
@@ -1300,6 +1336,8 @@ pub(crate) fn stream_bounded<R: BufRead, W: Write + ?Sized>(
     tf: &TimeFilter,
     output: &mut W,
     sinks: &mut Sinks,
+    add_pairs: &[(&str, &str)],
+    remove_keys: &[&str],
 ) -> anyhow::Result<()> {
     let mut line_buf = Vec::new();
     let mut total_read: u64 = 0;
@@ -1310,7 +1348,16 @@ pub(crate) fn stream_bounded<R: BufRead, W: Write + ?Sized>(
             break;
         }
         total_read += n as u64;
-        process_line(&mut line_buf, filter, tf, output, sinks, n)?;
+        process_line(
+            &mut line_buf,
+            filter,
+            tf,
+            output,
+            sinks,
+            n,
+            add_pairs,
+            remove_keys,
+        )?;
         if sinks.done() {
             break;
         }
@@ -1327,6 +1374,8 @@ fn stream_unbounded<R: Read, W: Write>(
     tf: &TimeFilter,
     output: &mut W,
     sinks: &mut Sinks,
+    add_pairs: &[(&str, &str)],
+    remove_keys: &[&str],
 ) -> anyhow::Result<()> {
     let mut reader = BufReader::new(reader);
     let mut line_buf = Vec::new();
@@ -1336,7 +1385,16 @@ fn stream_unbounded<R: Read, W: Write>(
         if n == 0 {
             break;
         }
-        process_line(&mut line_buf, filter, tf, output, sinks, n)?;
+        process_line(
+            &mut line_buf,
+            filter,
+            tf,
+            output,
+            sinks,
+            n,
+            add_pairs,
+            remove_keys,
+        )?;
         output.flush()?;
         if sinks.done() {
             break;
@@ -1345,6 +1403,7 @@ fn stream_unbounded<R: Read, W: Write>(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_line<W: Write + ?Sized>(
     line_buf: &mut Vec<u8>,
     filter: &Filter,
@@ -1352,6 +1411,8 @@ fn process_line<W: Write + ?Sized>(
     output: &mut W,
     sinks: &mut Sinks,
     n_bytes: usize,
+    add_pairs: &[(&str, &str)],
+    remove_keys: &[&str],
 ) -> anyhow::Result<()> {
     // Preserve the original bytes for output; trim a trailing newline for parsing.
     let raw_len = line_buf.len();
@@ -1399,7 +1460,6 @@ fn process_line<W: Write + ?Sized>(
         sinks.counter.flush_closed(output, &sinks.tz)?;
         sinks.keys.record(parsed);
         sinks.values.record(parsed);
-        let line_tf = sinks.transform.as_ref();
         if let Some(sort_buf) = sinks.sort_buf.as_mut() {
             // Aggregation modes without --raw-key produce no per-line bytes;
             // skip the capture in that case (counters above already recorded).
@@ -1410,8 +1470,17 @@ fn process_line<W: Write + ?Sized>(
                 let mode = sinks.line_mode;
                 sort_buf.capture(parsed, |w| {
                     emit_match(
-                        parsed, line_buf, raw_len, parse_end, raw, suppress, mode, line_tf,
-                        scratch, w,
+                        parsed,
+                        line_buf,
+                        raw_len,
+                        parse_end,
+                        raw,
+                        suppress,
+                        mode,
+                        add_pairs,
+                        remove_keys,
+                        scratch,
+                        w,
                     )
                 })?;
             }
@@ -1424,7 +1493,8 @@ fn process_line<W: Write + ?Sized>(
                 &mut sinks.raw,
                 sinks.suppress_lines,
                 sinks.line_mode,
-                line_tf,
+                add_pairs,
+                remove_keys,
                 &mut sinks.emit_scratch,
                 output,
             )?;
@@ -1451,6 +1521,11 @@ fn append_reconstructed_plain_tail(
 /// Emit one matched line to `out`: the `--raw-key` extraction (if any),
 /// followed by the full line in the configured `LineMode` unless line output
 /// is suppressed by an aggregation/raw-key mode.
+///
+/// `add_pairs` and `remove_keys` are pre-computed views over the run-wide
+/// `LineTransform`; they're empty when no `--add`/`--rm` is set. They live
+/// in the caller's frame for the whole stream, so per-line work is just two
+/// slice borrows.
 #[allow(clippy::too_many_arguments)]
 fn emit_match<W: Write + ?Sized>(
     parsed: &[(&str, &str)],
@@ -1460,7 +1535,8 @@ fn emit_match<W: Write + ?Sized>(
     raw: &mut RawExtractor,
     suppress_lines: bool,
     mode: LineMode,
-    transform: Option<&LineTransform>,
+    add_pairs: &[(&str, &str)],
+    remove_keys: &[&str],
     scratch: &mut EmitScratch,
     out: &mut W,
 ) -> std::io::Result<()> {
@@ -1470,23 +1546,52 @@ fn emit_match<W: Write + ?Sized>(
         return Ok(());
     }
 
-    match mode {
-        LineMode::Passthrough => {
-            out.write_all(line_buf)?;
-            if raw_len == parse_end {
-                out.write_all(b"\n")?;
-            }
-            Ok(())
+    // Passthrough copies bytes verbatim — no trait dispatch needed (and the
+    // memcpy fast path is what makes this mode worth keeping separate).
+    if let LineMode::Passthrough = mode {
+        out.write_all(line_buf)?;
+        if raw_len == parse_end {
+            out.write_all(b"\n")?;
         }
-        LineMode::Json => output::write_json_line(out, parsed, transform, &mut scratch.str_buf),
-        LineMode::Colored => scratch.write_slow(out, |buf| {
-            output::write_colored_line(buf, parsed, transform)
-        }),
-        LineMode::Plain => scratch.write_slow(out, |buf| {
-            output::write_plain_reconstructed(buf, parsed, transform)?;
+        return Ok(());
+    }
+
+    let pairs: &[&[(&str, &str)]] = if add_pairs.is_empty() {
+        &[parsed]
+    } else {
+        &[parsed, add_pairs]
+    };
+
+    match mode {
+        LineMode::Passthrough => unreachable!("handled above"),
+        LineMode::Json => {
+            JsonlFormat::output_line(out, pairs, remove_keys, &JsonlOptions, &mut scratch.str_buf)
+        }
+        LineMode::Colored => {
+            let EmitScratch { buf, str_buf } = scratch;
+            buf.clear();
+            LogfmtFormat::output_line(
+                buf,
+                pairs,
+                remove_keys,
+                &LogfmtOptions { color: true },
+                str_buf,
+            )?;
+            out.write_all(buf)
+        }
+        LineMode::Plain => {
+            let EmitScratch { buf, str_buf } = scratch;
+            buf.clear();
+            LogfmtFormat::output_line(
+                buf,
+                pairs,
+                remove_keys,
+                &LogfmtOptions { color: false },
+                str_buf,
+            )?;
             append_reconstructed_plain_tail(buf, line_buf, raw_len, parse_end);
-            Ok(())
-        }),
+            out.write_all(buf)
+        }
     }
 }
 
@@ -1499,6 +1604,8 @@ fn follow_loop<W: Write>(
     filter: &Filter,
     output: &mut W,
     sinks: &mut Sinks,
+    add_pairs: &[(&str, &str)],
+    remove_keys: &[&str],
 ) -> anyhow::Result<()> {
     let mut line_buf = Vec::new();
     let mut pos = reader.stream_position()?;
@@ -1536,6 +1643,8 @@ fn follow_loop<W: Write>(
             output,
             sinks,
             n,
+            add_pairs,
+            remove_keys,
         )?;
         if sinks.done() {
             break;
