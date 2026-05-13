@@ -118,7 +118,7 @@ impl Predicate {
 #[derive(Debug)]
 enum Expr {
     Pred(Predicate),
-    Exists(SmartString),
+    HasKey(SmartString),
     And(Vec<Expr>),
     Or(Vec<Expr>),
     Not(Box<Expr>),
@@ -128,7 +128,7 @@ impl Expr {
     fn matches(&self, pairs: &[(&str, &str)]) -> bool {
         match self {
             Self::Pred(p) => p.matches(pairs),
-            Self::Exists(key) => pairs.iter().any(|(k, _)| *k == key.as_str()),
+            Self::HasKey(key) => pairs.iter().any(|(k, _)| *k == key.as_str()),
             Self::And(xs) => xs.iter().all(|x| x.matches(pairs)),
             Self::Or(xs) => xs.iter().any(|x| x.matches(pairs)),
             Self::Not(x) => !x.matches(pairs),
@@ -199,7 +199,7 @@ enum Token {
     And,
     Or,
     Not,
-    Exists,
+    HasKey,
     Op(Op),
     Word(String),
 }
@@ -310,7 +310,7 @@ fn tokenize(input: &str) -> anyhow::Result<Vec<Token>> {
                     "and" => Token::And,
                     "or" => Token::Or,
                     "not" => Token::Not,
-                    "exists" => Token::Exists,
+                    "exists" => Token::HasKey,
                     _ => Token::Word(word.to_string()),
                 };
                 out.push(tok);
@@ -323,22 +323,29 @@ fn tokenize(input: &str) -> anyhow::Result<Vec<Token>> {
 // ─── recursive-descent parser ───────────────────────────────────────────
 
 struct ParserState {
-    iter: std::iter::Peekable<std::vec::IntoIter<Token>>,
+    tokens: Vec<Token>,
+    index: usize,
 }
 
 impl ParserState {
-    fn new(toks: Vec<Token>) -> Self {
-        Self {
-            iter: toks.into_iter().peekable(),
-        }
+    fn new(tokens: Vec<Token>) -> Self {
+        Self { tokens, index: 0 }
     }
 
-    fn peek(&mut self) -> Option<&Token> {
-        self.iter.peek()
+    fn peek(&self) -> Option<&Token> {
+        self.tokens.get(self.index)
     }
 
     fn advance(&mut self) -> Option<Token> {
-        self.iter.next()
+        if self.index < self.tokens.len() {
+            // Own the token by replacing it with a cheap sentinel; we never
+            // revisit prior indices, so the sentinel is harmless.
+            let tok = std::mem::replace(&mut self.tokens[self.index], Token::And);
+            self.index += 1;
+            Some(tok)
+        } else {
+            None
+        }
     }
 
     fn parse_or(&mut self) -> anyhow::Result<Expr> {
@@ -391,10 +398,10 @@ impl ParserState {
                     _ => anyhow::bail!("expected `)`"),
                 }
             }
-            Some(Token::Exists) => {
+            Some(Token::HasKey) => {
                 self.advance();
                 match self.advance() {
-                    Some(Token::Word(k)) => Ok(Expr::Exists(SmartString::from(k))),
+                    Some(Token::Word(k)) => Ok(Expr::HasKey(SmartString::from(k))),
                     Some(t) => anyhow::bail!("expected key after `exists`, got {t:?}"),
                     None => anyhow::bail!("expected key after `exists`"),
                 }

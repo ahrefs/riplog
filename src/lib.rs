@@ -1,6 +1,5 @@
 #![deny(unsafe_code)]
 
-pub mod bisect;
 pub mod cli;
 pub mod filter;
 pub mod json;
@@ -9,6 +8,7 @@ pub mod output;
 pub mod parallel;
 pub mod run;
 pub mod sort;
+pub mod time_bisect;
 pub mod timestamp;
 pub mod transform;
 

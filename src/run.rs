@@ -16,12 +16,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::bisect::{self, Side};
 use crate::cli::{Cli, ColorMode};
 use crate::filter::Filter;
 use crate::logfmt;
 use crate::output;
 use crate::sort::SortBuffer;
+use crate::time_bisect::{self, Side};
 use crate::timestamp::{self, Timestamp};
 use crate::transform::{parse_line_transform, validate_rm_vs_features, EmitScratch, LineTransform};
 
@@ -736,7 +736,7 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
         for path in &cli.files {
             let mut file = File::open(path)?;
             let t0 = Instant::now();
-            let (first, last) = bisect::time_range(&mut file)?;
+            let (first, last) = time_bisect::time_range(&mut file)?;
             log::info!(
                 "time-range {}: {} .. {} in {:.3}s",
                 path.display(),
@@ -837,7 +837,13 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
         .enumerate()
         .map(|(i, path)| {
             let last = i == last_idx;
-            plan_file(path, cli, tf, following && last, following && last && single_file)
+            plan_file(
+                path,
+                cli,
+                tf,
+                following && last,
+                following && last && single_file,
+            )
         })
         .collect::<anyhow::Result<_>>()?;
 
@@ -914,10 +920,10 @@ fn peek_global_window(
             continue;
         }
         let mut file = File::open(path)?;
-        if let Some(t) = bisect::peek_first_timestamp(&mut file)? {
+        if let Some(t) = time_bisect::peek_first_timestamp(&mut file)? {
             first = Some(first.map_or(t, |cur| cur.min(t)));
         }
-        if let Some(t) = bisect::peek_last_timestamp(&mut file)? {
+        if let Some(t) = time_bisect::peek_last_timestamp(&mut file)? {
             last = Some(last.map_or(t, |cur| cur.max(t)));
         }
     }
@@ -952,12 +958,12 @@ fn plan_file<'a>(
 
     let t_bisect = Instant::now();
     let start_byte: u64 = match tf.from {
-        Some(t1) => bisect::bisect(&mut file, t1, window, Side::Lower)?,
+        Some(t1) => time_bisect::bisect(&mut file, t1, window, Side::Lower)?,
         None if tail_from_eof => file_len, // `tail -F`-style start at EOF
         None => 0,
     };
     let end_byte: u64 = match tf.to {
-        Some(t2) if !follow_this_file => bisect::bisect(&mut file, t2, window, Side::Upper)?,
+        Some(t2) if !follow_this_file => time_bisect::bisect(&mut file, t2, window, Side::Upper)?,
         _ => file_len,
     };
 
