@@ -78,7 +78,7 @@ pub(crate) fn plan_file<'a>(
     }
     let mut file = File::open(path)?;
     let file_len = file.seek(SeekFrom::End(0))?;
-    let window = (cli.window_secs as i64).saturating_mul(1_000_000_000);
+    let window = cli.window_nanos();
 
     let t_bisect = Instant::now();
     let start_byte: u64 = match tf.from {

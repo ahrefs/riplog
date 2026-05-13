@@ -71,6 +71,155 @@ impl TimeFilter {
 
 const FOLLOW_POLL: Duration = Duration::from_millis(200);
 
+/// What to do once CLI parsing and validation are done. Classified by
+/// `ExecutionMode::classify` from a `(Cli, …)`-shaped input; the dispatch in
+/// `run()` matches on this once and runs the corresponding arm.
+enum ExecutionMode<'a> {
+    /// `--time-range`: probe per-file head+tail, print the union span, exit.
+    /// No filter pipeline, no sinks.
+    TimeRange,
+    /// No file arguments: stream stdin to the chosen output. `bucket` carries
+    /// the epoch-aligned `--bucket=DURATION` config, or `None` when not set.
+    StdinOnly { bucket: Option<BucketSpec> },
+    /// One or more file arguments (possibly including `-` as stdin). Phase 1
+    /// has already produced one `FilePlan` per file; phase 2 streams each in
+    /// order. `bucket` here may be `--bucket=DURATION` *or* `--n-buckets=N`
+    /// resolved against the global window.
+    Files {
+        plans: Vec<FilePlan<'a>>,
+        bucket: Option<BucketSpec>,
+        /// True when `-` appears in `cli.files` (at most once).
+        has_stdin: bool,
+    },
+}
+
+impl<'a> ExecutionMode<'a> {
+    /// Tag for `log::debug!` so a `RUST_LOG=debug` run shows the chosen path
+    /// at a glance without dragging in `Debug` impls for `FilePlan`/etc.
+    fn tag(&self) -> &'static str {
+        match self {
+            ExecutionMode::TimeRange => "time-range",
+            ExecutionMode::StdinOnly { bucket: None } => "stdin",
+            ExecutionMode::StdinOnly { bucket: Some(_) } => "stdin+bucket",
+            ExecutionMode::Files { .. } => "files",
+        }
+    }
+}
+
+/// Classify the run into one of the `ExecutionMode` arms. All CLI validations
+/// that don't depend on output state happen here (and in the same order they
+/// did pre-refactor), so the error messages and short-circuit behaviour are
+/// preserved.
+///
+/// For `Files`, this also performs phase 1 (`peek_global_window` + `plan_file`
+/// over every input) so the dispatch arm in `run()` is purely phase 2.
+fn classify<'a>(cli: &'a Cli, following: bool) -> anyhow::Result<ExecutionMode<'a>> {
+    let need_seek = cli.from.is_some() || cli.to.is_some() || following || cli.time_range;
+
+    if cli.files.is_empty() {
+        if need_seek {
+            anyhow::bail!("`-f`, `-F`, `--from`, `--to`, `--time-range` require a file argument");
+        }
+        if cli.n_buckets.is_some() {
+            anyhow::bail!(
+                "`--n-buckets` requires a file argument: the bucket width is derived \
+                 from the file's time range"
+            );
+        }
+        // Epoch-aligned grid for `--bucket=DURATION` on stdin.
+        let bucket = cli
+            .bucket
+            .as_deref()
+            .map(timestamp::parse_duration_nanos)
+            .transpose()?
+            .map(|nanos| BucketSpec {
+                nanos,
+                origin: 0,
+                n_buckets: None,
+            });
+        return Ok(ExecutionMode::StdinOnly { bucket });
+    }
+
+    let n_stdin = cli.files.iter().filter(|p| is_stdin_path(p)).count();
+    if n_stdin > 1 {
+        anyhow::bail!("`-` (stdin) cannot appear more than once in the file list");
+    }
+    let has_stdin = n_stdin == 1;
+    if has_stdin && (following || cli.time_range) {
+        anyhow::bail!("`-` (stdin) cannot be combined with `-f`, `-F`, or `--time-range`");
+    }
+
+    if cli.time_range {
+        return Ok(ExecutionMode::TimeRange);
+    }
+
+    // Resolve `--from`/`--to` once against the union of all files' time
+    // windows. Symbolic anchors (`start`, `end`, `start+1h`, etc.) refer to
+    // the *global* span, not each file's local one — so with two log files
+    // around a rotation, `--from start+1h --to start+2h` is one contiguous
+    // absolute window applied across both files, not two disjoint slices.
+    let need_global = cli.from.is_some() || cli.to.is_some() || cli.n_buckets.is_some();
+    let (global_first, global_last) = if need_global {
+        peek_global_window(&cli.files)?
+    } else {
+        (None, None)
+    };
+    let mut tf = TimeFilter::default();
+    if let Some(s) = cli.from.as_deref() {
+        tf.from = Some(timestamp::resolve_bound(
+            s,
+            global_first,
+            global_last,
+            global_first,
+        )?);
+    }
+    if let Some(s) = cli.to.as_deref() {
+        tf.to = Some(timestamp::resolve_bound(
+            s,
+            global_first,
+            global_last,
+            global_last,
+        )?);
+    }
+
+    // Resolve the bucket spec now that the time window is known. Two forms:
+    // - `--bucket=DURATION`: epoch-aligned grid (origin = 0).
+    // - `--n-buckets=N`: divide the *active* window into N equal-width slices
+    //   aligned to the window start, so the output has exactly N rows per
+    //   group (no edge-alignment off-by-one).
+    let bucket = resolve_bucket_spec(cli, &tf, global_first, global_last)?;
+
+    // Phase 1: bisect every file up front against the resolved absolute
+    // window. Output is suppressed during planning — only summaries and
+    // matched lines are written, in file order, in phase 2.
+    let last_idx = cli.files.len() - 1;
+    // `tail -F`-style start-at-EOF only applies to the classic single-file
+    // case. With multiple files (e.g. `foo.log.1 foo.log -F`), the last
+    // file is read fully — completing the rotated → current → tail story.
+    let single_file = cli.files.len() == 1;
+    let plans: Vec<FilePlan<'a>> = cli
+        .files
+        .iter()
+        .enumerate()
+        .map(|(i, path)| {
+            let last = i == last_idx;
+            plan_file(
+                path,
+                cli,
+                tf,
+                following && last,
+                following && last && single_file,
+            )
+        })
+        .collect::<anyhow::Result<_>>()?;
+
+    Ok(ExecutionMode::Files {
+        plans,
+        bucket,
+        has_stdin,
+    })
+}
+
 pub fn run(cli: &Cli) -> anyhow::Result<()> {
     install_signal_handler();
 
@@ -156,222 +305,140 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
         None => Box::new(BufWriter::new(std::io::stdout())),
     };
 
-    let need_seek = cli.from.is_some() || cli.to.is_some() || following || cli.time_range;
-    if cli.files.is_empty() {
-        if need_seek {
-            anyhow::bail!("`-f`, `-F`, `--from`, `--to`, `--time-range` require a file argument");
-        }
-        if cli.n_buckets.is_some() {
-            anyhow::bail!(
-                "`--n-buckets` requires a file argument: the bucket width is derived \
-                 from the file's time range"
-            );
-        }
-        // Epoch-aligned grid for `--bucket=DURATION` on stdin.
-        let bucket = cli
-            .bucket
-            .as_deref()
-            .map(timestamp::parse_duration_nanos)
-            .transpose()?
-            .map(|nanos| BucketSpec {
-                nanos,
-                origin: 0,
-                n_buckets: None,
-            });
-        // stdin can't follow (rejected earlier), but `--bucket` still
-        // enables streaming output: the per-line `flush_closed` hook in
-        // `process_line` emits closed buckets in time order as we go,
-        // without any seek (pipes can't seek). At EOF, `emit_summaries`
-        // calls `flush_remaining` for the still-open buckets.
-        let mut sinks = make_sinks(
-            cli,
-            sampler.clone(),
-            suppress_lines,
-            line_mode,
-            bucket,
-            tz.clone(),
-        );
-        if bucket.is_some() {
-            let grace = (cli.window_secs as i64).saturating_mul(1_000_000_000);
-            sinks.enable_streaming(grace);
-        }
-        let tf_default = TimeFilter::default();
-        let mut pipeline = Pipeline::new(&filter, &tf_default, &mut sinks, &add_view, &remove_view);
-        stream_unbounded(&mut std::io::stdin().lock(), &mut pipeline, &mut output)?;
-        output.flush()?;
-        flush_sort_buf(&mut sinks, &mut output)?;
-        emit_summaries(&sinks, bare_count, &tz, &mut output)?;
-        return Ok(());
-    }
+    let mode = classify(cli, following)?;
+    log::debug!("execution mode: {}", mode.tag());
 
-    let n_stdin = cli.files.iter().filter(|p| is_stdin_path(p)).count();
-    if n_stdin > 1 {
-        anyhow::bail!("`-` (stdin) cannot appear more than once in the file list");
-    }
-    let has_stdin = n_stdin == 1;
-    if has_stdin && (following || cli.time_range) {
-        anyhow::bail!("`-` (stdin) cannot be combined with `-f`, `-F`, or `--time-range`");
-    }
-
-    if cli.time_range {
-        // Min of per-file firsts, max of per-file lasts — the union span.
-        let mut overall_first: Option<Timestamp> = None;
-        let mut overall_last: Option<Timestamp> = None;
-        for path in &cli.files {
-            let mut file = File::open(path)?;
-            let t0 = Instant::now();
-            let (first, last) = time_bisect::time_range(&mut file)?;
-            log::info!(
-                "time-range {}: {} .. {} in {:.3}s",
-                path.display(),
-                first
-                    .map(|t| timestamp::format_rfc3339(t, &tz))
-                    .as_deref()
-                    .unwrap_or("-"),
-                last.map(|t| timestamp::format_rfc3339(t, &tz))
-                    .as_deref()
-                    .unwrap_or("-"),
-                t0.elapsed().as_secs_f64(),
-            );
-            if let Some(t) = first {
-                overall_first = Some(overall_first.map_or(t, |cur| cur.min(t)));
+    match mode {
+        ExecutionMode::TimeRange => {
+            // Min of per-file firsts, max of per-file lasts — the union span.
+            let mut overall_first: Option<Timestamp> = None;
+            let mut overall_last: Option<Timestamp> = None;
+            for path in &cli.files {
+                let mut file = File::open(path)?;
+                let t0 = Instant::now();
+                let (first, last) = time_bisect::time_range(&mut file)?;
+                log::info!(
+                    "time-range {}: {} .. {} in {:.3}s",
+                    path.display(),
+                    first
+                        .map(|t| timestamp::format_rfc3339(t, &tz))
+                        .as_deref()
+                        .unwrap_or("-"),
+                    last.map(|t| timestamp::format_rfc3339(t, &tz))
+                        .as_deref()
+                        .unwrap_or("-"),
+                    t0.elapsed().as_secs_f64(),
+                );
+                if let Some(t) = first {
+                    overall_first = Some(overall_first.map_or(t, |cur| cur.min(t)));
+                }
+                if let Some(t) = last {
+                    overall_last = Some(overall_last.map_or(t, |cur| cur.max(t)));
+                }
             }
-            if let Some(t) = last {
-                overall_last = Some(overall_last.map_or(t, |cur| cur.max(t)));
+            match (overall_first, overall_last) {
+                (Some(a), Some(b)) => writeln!(
+                    output,
+                    "{} .. {}  ({})",
+                    timestamp::format_rfc3339(a, &tz),
+                    timestamp::format_rfc3339(b, &tz),
+                    timestamp::format_duration(b - a),
+                )?,
+                _ => writeln!(output, "no parseable timestamps in file")?,
             }
+            output.flush()?;
         }
-        match (overall_first, overall_last) {
-            (Some(a), Some(b)) => writeln!(
-                output,
-                "{} .. {}  ({})",
-                timestamp::format_rfc3339(a, &tz),
-                timestamp::format_rfc3339(b, &tz),
-                timestamp::format_duration(b - a),
-            )?,
-            _ => writeln!(output, "no parseable timestamps in file")?,
-        }
-        output.flush()?;
-        return Ok(());
-    }
 
-    // Resolve `--from`/`--to` once against the union of all files' time
-    // windows. Symbolic anchors (`start`, `end`, `start+1h`, etc.) refer to
-    // the *global* span, not each file's local one — so with two log files
-    // around a rotation, `--from start+1h --to start+2h` is one contiguous
-    // absolute window applied across both files, not two disjoint slices.
-    let need_global = cli.from.is_some() || cli.to.is_some() || cli.n_buckets.is_some();
-    let (global_first, global_last) = if need_global {
-        peek_global_window(&cli.files)?
-    } else {
-        (None, None)
-    };
-    let mut tf = TimeFilter::default();
-    if let Some(s) = cli.from.as_deref() {
-        tf.from = Some(timestamp::resolve_bound(
-            s,
-            global_first,
-            global_last,
-            global_first,
-        )?);
-    }
-    if let Some(s) = cli.to.as_deref() {
-        tf.to = Some(timestamp::resolve_bound(
-            s,
-            global_first,
-            global_last,
-            global_last,
-        )?);
-    }
-
-    // Resolve the bucket spec now that the time window is known. Two forms:
-    // - `--bucket=DURATION`: epoch-aligned grid (origin = 0).
-    // - `--n-buckets=N`: divide the *active* window into N equal-width slices
-    //   aligned to the window start, so the output has exactly N rows per
-    //   group (no edge-alignment off-by-one).
-    let bucket = resolve_bucket_spec(cli, &tf, global_first, global_last)?;
-
-    let mut sinks = make_sinks(
-        cli,
-        sampler.clone(),
-        suppress_lines,
-        line_mode,
-        bucket,
-        tz.clone(),
-    );
-    // Master streams under follow or when stdin (`-`) is in the file list;
-    // workers always batch (their output would interleave on the shared
-    // writer otherwise) and merge into the master.
-    if cli.bucket.is_some() && (following || has_stdin) {
-        let grace = (cli.window_secs as i64).saturating_mul(1_000_000_000);
-        sinks.enable_streaming(grace);
-    }
-
-    // Phase 1: bisect every file up front against the resolved absolute
-    // window. Output is suppressed during planning — only summaries and
-    // matched lines are written, in file order, in phase 2.
-    let last_idx = cli.files.len() - 1;
-    // `tail -F`-style start-at-EOF only applies to the classic single-file
-    // case. With multiple files (e.g. `foo.log.1 foo.log -F`), the last
-    // file is read fully — completing the rotated → current → tail story.
-    let single_file = cli.files.len() == 1;
-    let plans: Vec<FilePlan<'_>> = cli
-        .files
-        .iter()
-        .enumerate()
-        .map(|(i, path)| {
-            let last = i == last_idx;
-            plan_file(
-                path,
+        ExecutionMode::StdinOnly { bucket } => {
+            // stdin can't follow (rejected earlier), but `--bucket` still
+            // enables streaming output: the per-line `flush_closed` hook in
+            // `process_line` emits closed buckets in time order as we go,
+            // without any seek (pipes can't seek). At EOF, `emit_summaries`
+            // calls `flush_remaining` for the still-open buckets.
+            let mut sinks = make_sinks(
                 cli,
-                tf,
-                following && last,
-                following && last && single_file,
-            )
-        })
-        .collect::<anyhow::Result<_>>()?;
-
-    // Phase 2: stream each planned range in order. Only the last file may
-    // attach the follow loop (set during planning).
-    let n_workers = resolve_parallelism(cli);
-    for plan in plans {
-        if interrupted() || sinks.done() {
-            break;
-        }
-        if n_workers > 1 && !plan.follow_this_file && !is_stdin_path(plan.path) {
-            crate::parallel::run(crate::parallel::Job {
-                path: plan.path,
-                start_byte: plan.start_byte,
-                max_bytes: plan.max_bytes,
-                tf: plan.tf,
-                n_workers,
-                cli,
-                filter: &filter,
-                sampler: sampler.clone(),
+                sampler.clone(),
                 suppress_lines,
                 line_mode,
                 bucket,
-                tz: tz.clone(),
-                output: &mut *output,
-                master: &mut sinks,
-                line_transform: line_transform.clone(),
-            })?;
+                tz.clone(),
+            );
+            if bucket.is_some() {
+                sinks.enable_streaming(cli.window_nanos());
+            }
+            let tf_default = TimeFilter::default();
+            let mut pipeline =
+                Pipeline::new(&filter, &tf_default, &mut sinks, &add_view, &remove_view);
+            stream_unbounded(&mut std::io::stdin().lock(), &mut pipeline, &mut output)?;
             output.flush()?;
-        } else {
-            stream_plan(
-                plan,
+            flush_sort_buf(&mut sinks, &mut output)?;
+            emit_summaries(&sinks, bare_count, &tz, &mut output)?;
+        }
+
+        ExecutionMode::Files {
+            plans,
+            bucket,
+            has_stdin,
+        } => {
+            let mut sinks = make_sinks(
                 cli,
-                &filter,
-                &mut output,
-                &mut sinks,
-                &add_view,
-                &remove_view,
-            )?;
+                sampler.clone(),
+                suppress_lines,
+                line_mode,
+                bucket,
+                tz.clone(),
+            );
+            // Master streams under follow or when stdin (`-`) is in the file list;
+            // workers always batch (their output would interleave on the shared
+            // writer otherwise) and merge into the master.
+            if cli.bucket.is_some() && (following || has_stdin) {
+                sinks.enable_streaming(cli.window_nanos());
+            }
+
+            // Phase 2: stream each planned range in order. Only the last file
+            // may attach the follow loop (set during planning).
+            let n_workers = resolve_parallelism(cli);
+            for plan in plans {
+                if interrupted() || sinks.done() {
+                    break;
+                }
+                if n_workers > 1 && !plan.follow_this_file && !is_stdin_path(plan.path) {
+                    crate::parallel::run(crate::parallel::Job {
+                        path: plan.path,
+                        start_byte: plan.start_byte,
+                        max_bytes: plan.max_bytes,
+                        tf: plan.tf,
+                        n_workers,
+                        cli,
+                        filter: &filter,
+                        sampler: sampler.clone(),
+                        suppress_lines,
+                        line_mode,
+                        bucket,
+                        tz: tz.clone(),
+                        output: &mut *output,
+                        master: &mut sinks,
+                        line_transform: line_transform.clone(),
+                    })?;
+                    output.flush()?;
+                } else {
+                    stream_plan(
+                        plan,
+                        cli,
+                        &filter,
+                        &mut output,
+                        &mut sinks,
+                        &add_view,
+                        &remove_view,
+                    )?;
+                }
+            }
+
+            output.flush()?;
+            flush_sort_buf(&mut sinks, &mut output)?;
+            emit_summaries(&sinks, bare_count, &tz, &mut output)?;
         }
     }
-
-    output.flush()?;
-    flush_sort_buf(&mut sinks, &mut output)?;
-    emit_summaries(&sinks, bare_count, &tz, &mut output)?;
 
     Ok(())
 }
