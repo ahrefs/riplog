@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::bucket::{resolve_bucket_spec, BucketSpec};
+use crate::bucket::{self, BucketSpec, ResolvedBucket};
 use crate::cli::{Cli, ColorMode};
 use crate::file_plan::{peek_global_window, plan_file, FilePlan};
 use crate::filter::Filter;
@@ -80,14 +80,14 @@ enum ExecutionMode<'a> {
     TimeRange,
     /// No file arguments: stream stdin to the chosen output. `bucket` carries
     /// the epoch-aligned `--bucket=DURATION` config, or `None` when not set.
-    StdinOnly { bucket: Option<BucketSpec> },
+    StdinOnly { bucket: Option<ResolvedBucket> },
     /// One or more file arguments (possibly including `-` as stdin). Phase 1
     /// has already produced one `FilePlan` per file; phase 2 streams each in
     /// order. `bucket` here may be `--bucket=DURATION` *or* `--n-buckets=N`
     /// resolved against the global window.
     Files {
         plans: Vec<FilePlan<'a>>,
-        bucket: Option<BucketSpec>,
+        bucket: Option<ResolvedBucket>,
         /// True when `-` appears in `cli.files` (at most once).
         has_stdin: bool,
     },
@@ -126,15 +126,17 @@ fn classify<'a>(cli: &'a Cli, following: bool) -> anyhow::Result<ExecutionMode<'
                  from the file's time range"
             );
         }
-        // Epoch-aligned grid for `--bucket=DURATION` on stdin.
+        // Epoch-aligned grid for `--bucket=DURATION` on stdin. Stdin can't
+        // use `--n-buckets` (rejected just above), so inline-build the
+        // resolved form rather than going through `BucketSpec::from_cli`.
         let bucket = cli
             .bucket
             .as_deref()
             .map(timestamp::parse_duration_nanos)
             .transpose()?
-            .map(|nanos| BucketSpec {
-                nanos,
-                origin: 0,
+            .map(|nanos| ResolvedBucket {
+                start_nanos: 0,
+                dur_nanos: nanos,
                 n_buckets: None,
             });
         return Ok(ExecutionMode::StdinOnly { bucket });
@@ -187,7 +189,10 @@ fn classify<'a>(cli: &'a Cli, following: bool) -> anyhow::Result<ExecutionMode<'
     // - `--n-buckets=N`: divide the *active* window into N equal-width slices
     //   aligned to the window start, so the output has exactly N rows per
     //   group (no edge-alignment off-by-one).
-    let bucket = resolve_bucket_spec(cli, &tf, global_first, global_last)?;
+    let bucket = match BucketSpec::from_cli(cli)? {
+        Some(spec) => Some(bucket::resolve(spec, &tf, global_first, global_last)?),
+        None => None,
+    };
 
     // Phase 1: bisect every file up front against the resolved absolute
     // window. Output is suppressed during planning — only summaries and

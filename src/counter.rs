@@ -9,7 +9,7 @@ use smartstring::alias::String as SmartString;
 use std::collections::BTreeMap;
 use std::io::Write;
 
-use crate::bucket::BucketSpec;
+use crate::bucket::ResolvedBucket;
 use crate::output;
 use crate::raw_extractor::unescape_for_key;
 use crate::timestamp::Timestamp;
@@ -61,7 +61,7 @@ impl GroupStats {
 #[derive(Default)]
 pub(crate) struct Counter {
     keys: Vec<SmartString>,
-    bucket: Option<BucketSpec>,
+    bucket: Option<ResolvedBucket>,
     counts: BTreeMap<Option<Timestamp>, RapidHashMap<Combo, GroupStats>>,
     scratch: String,
     /// In streaming mode, track the highest timestamp observed across all
@@ -78,7 +78,7 @@ pub(crate) struct Counter {
 }
 
 impl Counter {
-    pub(crate) fn new(keys: Vec<SmartString>, bucket: Option<BucketSpec>) -> Self {
+    pub(crate) fn new(keys: Vec<SmartString>, bucket: Option<ResolvedBucket>) -> Self {
         Self {
             keys,
             bucket,
@@ -149,7 +149,7 @@ impl Counter {
         json: bool,
     ) -> std::io::Result<()> {
         let bucket = match (self.bucket, bucket_ts) {
-            (Some(bspec), Some(start)) => Some((start, start + bspec.nanos)),
+            (Some(bspec), Some(start)) => Some((start, start + bspec.dur_nanos)),
             _ => None,
         };
         let time_range = match (stats.min_ts, stats.max_ts) {
@@ -212,7 +212,7 @@ impl Counter {
             return Ok(());
         };
 
-        let close_threshold = seen - bspec.nanos - self.close_grace_nanos;
+        let close_threshold = seen - bspec.dur_nanos - self.close_grace_nanos;
 
         let mut open_buckets = self.counts.split_off(&Some(close_threshold));
         if let Some(none_groups) = self.counts.remove(&None) {

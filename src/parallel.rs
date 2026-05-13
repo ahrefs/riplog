@@ -10,7 +10,7 @@ use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::Mutex;
 
-use crate::bucket::BucketSpec;
+use crate::bucket::ResolvedBucket;
 use crate::cli::Cli;
 use crate::filter::Filter;
 use crate::pipeline::Pipeline;
@@ -40,7 +40,7 @@ pub(crate) struct Job<'a> {
     pub sampler: Option<Sampler>,
     pub suppress_lines: bool,
     pub line_mode: LineMode,
-    pub bucket: Option<BucketSpec>,
+    pub bucket: Option<ResolvedBucket>,
     pub tz: jiff::tz::TimeZone,
     pub output: &'a mut (dyn Write + Send),
     pub master: &'a mut Sinks,

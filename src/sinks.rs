@@ -6,7 +6,7 @@
 use smartstring::alias::String as SmartString;
 use std::io::Write;
 
-use crate::bucket::BucketSpec;
+use crate::bucket::ResolvedBucket;
 use crate::cli::Cli;
 use crate::counter::Counter;
 use crate::raw_extractor::RawExtractor;
@@ -86,7 +86,7 @@ pub(crate) fn make_sinks(
     sampler: Option<Sampler>,
     suppress_lines: bool,
     line_mode: LineMode,
-    bucket: Option<BucketSpec>,
+    bucket: Option<ResolvedBucket>,
     tz: jiff::tz::TimeZone,
 ) -> Sinks {
     let counter = Counter::new(cli.group_by.iter().map(SmartString::from).collect(), bucket);
