@@ -39,32 +39,48 @@ enum Op {
 }
 
 #[derive(Debug)]
+enum Rhs {
+    /// Plain string. Used for `=`/`!=` always, and for ordering ops when
+    /// the rhs is neither a level keyword nor numerically parseable.
+    Str(SmartString),
+    /// Numeric rhs for ordering ops. Carries the original text for the
+    /// lexical fallback used when the value-side isn't parseable as f64.
+    Num { n: f64, text: SmartString },
+    /// Log-level rhs for ordering ops. Carries the original text for the
+    /// lexical fallback used when the value-side isn't a known level.
+    Level { rank: u8, text: SmartString },
+    /// Compiled regex for `=~`.
+    Regex(Regex),
+}
+
+#[derive(Debug)]
 struct Predicate {
     key: SmartString,
     op: Op,
-    rhs: SmartString,
-    rhs_num: Option<f64>,
-    rhs_level: Option<u8>,
-    re: Option<Regex>,
+    rhs: Rhs,
 }
 
 impl Predicate {
     fn new(key: SmartString, op: Op, rhs: SmartString) -> anyhow::Result<Self> {
-        let rhs_num = rhs.parse::<f64>().ok();
-        let rhs_level = level_rank(&rhs);
-        let re = if matches!(op, Op::ReMatch) {
-            Some(Regex::new(&rhs).map_err(|e| anyhow::anyhow!("invalid regex `{rhs}`: {e}"))?)
-        } else {
-            None
+        // Pick the Rhs variant up-front based on the operator and the
+        // parse-ability of `rhs`. For ordering ops we prefer level > numeric
+        // > lexical, matching the precedence the old per-eval code used.
+        let rhs = match op {
+            Op::ReMatch => Rhs::Regex(
+                Regex::new(&rhs).map_err(|e| anyhow::anyhow!("invalid regex `{rhs}`: {e}"))?,
+            ),
+            Op::Eq | Op::Ne => Rhs::Str(rhs),
+            Op::Lt | Op::Le | Op::Gt | Op::Ge => {
+                if let Some(rank) = level_rank(&rhs) {
+                    Rhs::Level { rank, text: rhs }
+                } else if let Ok(n) = rhs.parse::<f64>() {
+                    Rhs::Num { n, text: rhs }
+                } else {
+                    Rhs::Str(rhs)
+                }
+            }
         };
-        Ok(Predicate {
-            key,
-            op,
-            rhs,
-            rhs_num,
-            rhs_level,
-            re,
-        })
+        Ok(Predicate { key, op, rhs })
     }
 
     fn matches(&self, pairs: &[(&str, &str)]) -> bool {
@@ -87,29 +103,48 @@ impl Predicate {
     }
 
     fn eval(&self, value: &str) -> bool {
-        match self.op {
-            Op::Eq => value == self.rhs,
-            Op::Ne => value != self.rhs,
-            Op::ReMatch => self.re.as_ref().is_some_and(|re| re.is_match(value)),
-            Op::Lt | Op::Le | Op::Gt | Op::Ge => {
-                use std::cmp::Ordering;
-                // Discriminate on the parse-time-known rhs first so we don't
-                // do per-line value-side work that's guaranteed to be unused
-                // (e.g. lowercase-into-buffer for `dur>=100`).
-                let cmp = match (self.rhs_level, level_rank(value)) {
-                    (Some(b), Some(a)) => a.cmp(&b),
-                    _ => match (self.rhs_num, value.parse::<f64>()) {
-                        (Some(b), Ok(a)) => a.partial_cmp(&b).unwrap_or(Ordering::Equal),
-                        _ => value.cmp(self.rhs.as_str()),
+        use std::cmp::Ordering;
+        match (self.op, &self.rhs) {
+            // Equality / inequality always compare as strings.
+            (Op::Eq, Rhs::Str(s)) => value == s.as_str(),
+            (Op::Ne, Rhs::Str(s)) => value != s.as_str(),
+            // Regex match.
+            (Op::ReMatch, Rhs::Regex(re)) => re.is_match(value),
+            // Ordering ops: dispatch on the construction-time-chosen Rhs
+            // shape. Discriminating on rhs first avoids per-line value-side
+            // work that would be guaranteed unused (e.g. level_rank for a
+            // numeric rhs like `dur>=100`).
+            (op @ (Op::Lt | Op::Le | Op::Gt | Op::Ge), rhs) => {
+                let cmp = match rhs {
+                    Rhs::Level { rank, text } => match level_rank(value) {
+                        Some(a) => a.cmp(rank),
+                        None => value.cmp(text.as_str()),
                     },
+                    Rhs::Num { n, text } => match value.parse::<f64>() {
+                        Ok(a) => a.partial_cmp(n).unwrap_or(Ordering::Equal),
+                        Err(_) => value.cmp(text.as_str()),
+                    },
+                    Rhs::Str(s) => value.cmp(s.as_str()),
+                    Rhs::Regex(_) => {
+                        unreachable!("regex rhs only pairs with Op::ReMatch")
+                    }
                 };
-                match self.op {
+                match op {
                     Op::Lt => cmp == Ordering::Less,
                     Op::Le => cmp != Ordering::Greater,
                     Op::Gt => cmp == Ordering::Greater,
                     Op::Ge => cmp != Ordering::Less,
-                    _ => unreachable!(),
+                    Op::Eq | Op::Ne | Op::ReMatch => {
+                        unreachable!("guarded by outer match")
+                    }
                 }
+            }
+            // Remaining (Op, Rhs) combinations are made impossible by the
+            // constructor: eq/ne always pair with Rhs::Str, regex with
+            // Rhs::Regex, and ordering ops with Str/Num/Level.
+            (Op::Eq | Op::Ne, Rhs::Num { .. } | Rhs::Level { .. } | Rhs::Regex(_))
+            | (Op::ReMatch, Rhs::Str(_) | Rhs::Num { .. } | Rhs::Level { .. }) => {
+                unreachable!("Predicate::new pairs Op with the right Rhs variant")
             }
         }
     }
