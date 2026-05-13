@@ -408,23 +408,46 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
                     break;
                 }
                 if n_workers > 1 && !plan.follow_this_file && !is_stdin_path(plan.path) {
-                    crate::parallel::run(crate::parallel::Job {
-                        path: plan.path,
-                        start_byte: plan.start_byte,
-                        max_bytes: plan.max_bytes,
-                        tf: plan.tf,
-                        n_workers,
-                        cli,
-                        filter: &filter,
-                        sampler: sampler.clone(),
-                        suppress_lines,
-                        line_mode,
-                        bucket,
-                        tz: tz.clone(),
-                        output: &mut *output,
-                        master: &mut sinks,
-                        line_transform: line_transform.clone(),
-                    })?;
+                    let plan_tf = plan.tf;
+                    let filter_ref = &filter;
+                    let sampler_ref = &sampler;
+                    let line_transform_ref = &line_transform;
+                    let tz_ref = &tz;
+                    let worker_sinks = crate::parallel::run(
+                        crate::parallel::Job {
+                            path: plan.path,
+                            start_byte: plan.start_byte,
+                            max_bytes: plan.max_bytes,
+                            n_workers,
+                        },
+                        &mut *output,
+                        |mut reader, byte_budget, sink| {
+                            let mut worker_sinks = make_sinks(
+                                cli,
+                                sampler_ref.clone(),
+                                suppress_lines,
+                                line_mode,
+                                bucket,
+                                tz_ref.clone(),
+                            );
+                            let worker_tf = line_transform_ref.clone();
+                            let (add_view, remove_view) = transform_views(worker_tf.as_ref());
+                            {
+                                let mut pipeline = Pipeline::new(
+                                    filter_ref,
+                                    &plan_tf,
+                                    &mut worker_sinks,
+                                    &add_view,
+                                    &remove_view,
+                                );
+                                stream_bounded(&mut reader, byte_budget, &mut pipeline, sink)?;
+                            }
+                            Ok(worker_sinks)
+                        },
+                    )?;
+                    for s in worker_sinks {
+                        sinks.merge(s);
+                    }
                     output.flush()?;
                 } else {
                     stream_plan(
