@@ -4,88 +4,30 @@
 
 use anyhow::Context as _;
 use humanize_bytes::humanize_bytes_binary;
-use rapidhash::{RapidHashMap, RapidHashSet};
-use smallvec::SmallVec;
 use smartstring::alias::String as SmartString;
 use std::{
     fs::File,
     io::{BufRead, BufReader, BufWriter, IsTerminal, Read, Seek, SeekFrom, Write},
     path::Path,
-    sync::atomic::{AtomicBool, Ordering},
-    sync::Arc,
     time::{Duration, Instant},
 };
 
+use crate::bucket::{resolve_bucket_spec, BucketSpec};
 use crate::cli::{Cli, ColorMode};
+use crate::counter::Counter;
 use crate::filter::Filter;
-use crate::json;
 use crate::logfmt;
-use crate::output;
 use crate::output::{JsonlFormat, JsonlOptions, LogfmtFormat, LogfmtOptions, OutputFormat};
+use crate::raw_extractor::RawExtractor;
+use crate::sampler::{build_sampler, Sampler};
+use crate::signal_handling::{install_signal_handler, interrupted};
 use crate::sort::SortBuffer;
+use crate::stats::{emit_summaries, KeyGather, Stats, ValueGather};
 use crate::time_bisect::{self, Side};
 use crate::timestamp::{self, Timestamp};
 use crate::transform::{
     parse_line_transform, transform_views, validate_rm_vs_features, EmitScratch,
 };
-
-/// Set by the SIGINT handler; checked in tight loops so we can exit cleanly
-/// and still emit `--count` / `--list-keys` / `--count-by` summaries.
-static INTERRUPTED: AtomicBool = AtomicBool::new(false);
-
-fn install_signal_handler() {
-    // Idempotent — `set_handler` errors if called twice. Ignore that path so
-    // the binary stays usable when run as a library.
-    let _ = ctrlc::set_handler(|| INTERRUPTED.store(true, Ordering::SeqCst));
-}
-
-#[inline]
-fn interrupted() -> bool {
-    INTERRUPTED.load(Ordering::Relaxed)
-}
-
-type Combo = SmallVec<[SmartString; 3]>;
-
-/// Collects every distinct key seen on matched lines. Active only when
-/// `--list-keys` is set; in that mode line output is suppressed.
-#[derive(Default)]
-struct KeyGather {
-    enabled: bool,
-    keys: RapidHashSet<SmartString>,
-}
-
-impl KeyGather {
-    fn new(enabled: bool) -> Self {
-        Self {
-            enabled,
-            keys: RapidHashSet::default(),
-        }
-    }
-
-    fn record(&mut self, pairs: &[(&str, &str)]) {
-        if !self.enabled {
-            return;
-        }
-        for (k, _) in pairs {
-            intern_into_set(&mut self.keys, k);
-        }
-    }
-
-    fn report<W: Write>(&self, out: &mut W, json: bool) -> std::io::Result<()> {
-        if !self.enabled {
-            return Ok(());
-        }
-        if json {
-            crate::json::write_string_set_json(out, &self.keys)
-        } else {
-            output::write_string_set_logfmt(out, &self.keys)
-        }
-    }
-
-    fn merge(&mut self, other: Self) {
-        self.keys.extend(other.keys);
-    }
-}
 
 /// `-` in the file list is the Unix idiom for "read from stdin in position".
 #[inline]
@@ -108,447 +50,6 @@ pub(crate) enum LineMode {
     Plain,
 }
 
-/// Find the first pair with key `key`, unescape its value into `scratch`,
-/// and return a borrow of the unescaped string. Returns `None` if no pair
-/// matches; in that case `scratch` is unspecified.
-pub(crate) fn unescape_for_key<'s>(
-    pairs: &[(&str, &str)],
-    key: &str,
-    scratch: &'s mut String,
-) -> Option<&'s str> {
-    for (pk, pv) in pairs {
-        if *pk == key {
-            scratch.clear();
-            logfmt::unescape_value(pv.as_bytes(), scratch);
-            return Some(scratch.as_str());
-        }
-    }
-    None
-}
-
-/// Insert `s` into `set` only if not already present, allocating a
-/// `SmartString` lazily.
-fn intern_into_set(set: &mut RapidHashSet<SmartString>, s: &str) {
-    if !set.contains(s) {
-        let mut x = SmartString::new_const();
-        x.push_str(s);
-        set.insert(x);
-    }
-}
-
-/// Collects every distinct value seen for each requested key, on matched
-/// lines. Active when at least one `--list-values-for=<key>` is given;
-/// suppresses line output.
-#[derive(Default)]
-struct ValueGather {
-    keys: Vec<SmartString>,
-    values: Vec<RapidHashSet<SmartString>>,
-    scratch: String,
-}
-
-impl ValueGather {
-    fn new(keys: Vec<SmartString>) -> Self {
-        let n = keys.len();
-        Self {
-            keys,
-            values: (0..n).map(|_| RapidHashSet::default()).collect(),
-            scratch: String::new(),
-        }
-    }
-
-    #[inline]
-    fn is_active(&self) -> bool {
-        !self.keys.is_empty()
-    }
-
-    fn record(&mut self, pairs: &[(&str, &str)]) {
-        if !self.is_active() {
-            return;
-        }
-        for (i, key) in self.keys.iter().enumerate() {
-            if unescape_for_key(pairs, key, &mut self.scratch).is_some() {
-                intern_into_set(&mut self.values[i], &self.scratch);
-            }
-        }
-    }
-
-    fn report<W: Write>(&self, out: &mut W, json: bool) -> std::io::Result<()> {
-        if !self.is_active() {
-            return Ok(());
-        }
-        if json {
-            crate::json::write_values_summary_json(out, &self.keys, &self.values)
-        } else {
-            output::write_values_summary_logfmt(out, &self.keys, &self.values)
-        }
-    }
-
-    fn merge(&mut self, other: Self) {
-        debug_assert_eq!(self.values.len(), other.values.len());
-        for (a, b) in self.values.iter_mut().zip(other.values) {
-            a.extend(b);
-        }
-    }
-}
-
-/// Per-line value extractor: for each matched line, emit the unquoted,
-/// unescaped value of `key`. Active when `--raw-key=<key>` is given;
-/// suppresses the normal full-line output. Lines lacking the key are
-/// silently skipped.
-struct RawExtractor {
-    raw_key: Option<SmartString>,
-    scratch: String,
-}
-
-impl RawExtractor {
-    fn new(raw_key: Option<&str>) -> Self {
-        Self {
-            raw_key: raw_key.map(SmartString::from),
-            scratch: String::new(),
-        }
-    }
-
-    fn emit<W: Write + ?Sized>(
-        &mut self,
-        pairs: &[(&str, &str)],
-        out: &mut W,
-    ) -> std::io::Result<()> {
-        let Some(key) = self.raw_key.as_deref() else {
-            return Ok(());
-        };
-        if let Some(v) = unescape_for_key(pairs, key, &mut self.scratch) {
-            out.write_all(v.as_bytes())?;
-            out.write_all(b"\n")?;
-        }
-        Ok(())
-    }
-}
-
-/// Aggregated stats for a single (group-keys [, bucket]) combination.
-#[derive(Default)]
-struct GroupStats {
-    count: usize,
-    min_ts: Option<Timestamp>,
-    max_ts: Option<Timestamp>,
-}
-
-#[inline]
-fn fold_min(slot: &mut Option<Timestamp>, t: Timestamp) {
-    *slot = Some(slot.map_or(t, |cur| cur.min(t)));
-}
-
-#[inline]
-fn fold_max(slot: &mut Option<Timestamp>, t: Timestamp) {
-    *slot = Some(slot.map_or(t, |cur| cur.max(t)));
-}
-
-impl GroupStats {
-    fn record(&mut self, ts: Option<Timestamp>) {
-        self.count += 1;
-        if let Some(t) = ts {
-            fold_min(&mut self.min_ts, t);
-            fold_max(&mut self.max_ts, t);
-        }
-    }
-
-    fn merge(&mut self, other: GroupStats) {
-        self.count += other.count;
-        if let Some(t) = other.min_ts {
-            fold_min(&mut self.min_ts, t);
-        }
-        if let Some(t) = other.max_ts {
-            fold_max(&mut self.max_ts, t);
-        }
-    }
-}
-
-/// Time bucketing config: width in nanoseconds, plus the origin the bucket
-/// grid is aligned to. `--bucket=DURATION` uses origin=0 (epoch-aligned, so
-/// 5-minute buckets fall on `:00`, `:05`, ...). `--n-buckets=N` uses
-/// origin=window-start *and* `n_buckets=Some(N)`, which clamps the bucket
-/// index to `[0, N-1]` so a line at the inclusive `end` boundary lands in
-/// the last bucket instead of overflowing into an N+1-th one.
-#[derive(Clone, Copy)]
-pub(crate) struct BucketSpec {
-    nanos: i64,
-    origin: i64,
-    /// When set, clamps the bucket index to `[0, n_buckets-1]`.
-    n_buckets: Option<usize>,
-}
-
-impl BucketSpec {
-    #[inline]
-    fn floor(&self, ts: Timestamp) -> i64 {
-        let mut idx = (ts - self.origin).div_euclid(self.nanos);
-        if let Some(n) = self.n_buckets {
-            let max = (n as i64) - 1;
-            if idx < 0 {
-                idx = 0;
-            } else if idx > max {
-                idx = max;
-            }
-        }
-        self.origin + idx * self.nanos
-    }
-}
-
-/// Map key for one group. The user-keys combo and the bucket boundary are
-/// kept as separate typed fields rather than smushed into a single
-/// `SmallVec<SmartString>`, which avoids a per-line `format!` + reverse
-/// `parse::<i64>()` round-trip on the hot path.
-use std::collections::BTreeMap;
-
-/// Groups matched lines by the value tuple of `keys` (and optionally a time
-/// bucket) and records per-group count + observed timestamp range. Missing
-/// user keys produce an empty value slot (rendered as `key.<k>=""` in the
-/// logfmt report).
-#[derive(Default)]
-struct Counter {
-    keys: Vec<SmartString>,
-    bucket: Option<BucketSpec>,
-    counts: BTreeMap<Option<Timestamp>, RapidHashMap<Combo, GroupStats>>,
-    scratch: String,
-    /// In streaming mode, track the highest timestamp observed across all
-    /// matched lines. Used to decide which buckets are past the close
-    /// threshold (`bucket.end + close_grace_nanos`).
-    max_ts_seen: Option<Timestamp>,
-    /// Reorder grace; mirrors `--window-secs`. Bucket B is closed (and
-    /// streamed out) once `max_ts_seen > B.end + close_grace_nanos`.
-    close_grace_nanos: i64,
-    /// Set in follow mode when `--bucket` is active. When `false`, the
-    /// streaming flush methods are no-ops and end-of-process output goes
-    /// through `report` (today's count-desc, single-emission behaviour).
-    streaming: bool,
-    /// `--json` mode: row emission goes through the JSON serializer instead
-    /// of logfmt.
-    output_json: bool,
-}
-
-impl Counter {
-    fn new(keys: Vec<SmartString>, bucket: Option<BucketSpec>, output_json: bool) -> Self {
-        Self {
-            keys,
-            bucket,
-            counts: BTreeMap::default(),
-            scratch: String::new(),
-            max_ts_seen: None,
-            close_grace_nanos: 0,
-            streaming: false,
-            output_json,
-        }
-    }
-
-    /// Enable streaming output: per-bucket rows emit as soon as
-    /// `max_ts_seen > bucket.end + close_grace_nanos`. No-op unless
-    /// `bucket` is also set (streaming an unbucketed group has no
-    /// completion signal).
-    fn enable_streaming(&mut self, close_grace_nanos: i64) {
-        if self.bucket.is_some() {
-            self.streaming = true;
-            self.close_grace_nanos = close_grace_nanos;
-        }
-    }
-
-    #[inline]
-    fn is_active(&self) -> bool {
-        !self.keys.is_empty() || self.bucket.is_some()
-    }
-
-    fn record(&mut self, pairs: &[(&str, &str)], ts: Option<Timestamp>) {
-        if !self.is_active() {
-            return;
-        }
-        let bucket_ts = match (self.bucket, ts) {
-            (Some(b), Some(t)) => Some(b.floor(t)),
-            // Bucketing on but the line has no timestamp — can't place it.
-            (Some(_), None) => return,
-            (None, _) => None,
-        };
-
-        if self.streaming {
-            if let Some(t) = ts {
-                fold_max(&mut self.max_ts_seen, t);
-            }
-        }
-
-        let mut combo: Combo = SmallVec::with_capacity(self.keys.len());
-        for k in &self.keys {
-            let mut value = SmartString::new_const();
-            if let Some(v) = unescape_for_key(pairs, k, &mut self.scratch) {
-                value.push_str(v);
-            }
-            combo.push(value);
-        }
-        self.counts
-            .entry(bucket_ts)
-            .or_default()
-            .entry(combo)
-            .or_default()
-            .record(ts);
-    }
-
-    fn write_row<W: Write + ?Sized>(
-        &self,
-        out: &mut W,
-        combo: &Combo,
-        bucket_ts: Option<Timestamp>,
-        stats: &GroupStats,
-        tz: &jiff::tz::TimeZone,
-    ) -> std::io::Result<()> {
-        let bucket = match (self.bucket, bucket_ts) {
-            (Some(bspec), Some(start)) => Some((start, start + bspec.nanos)),
-            _ => None,
-        };
-        let time_range = match (stats.min_ts, stats.max_ts) {
-            (Some(a), Some(b)) => Some((a, b)),
-            _ => None,
-        };
-        let count = stats.count as u64;
-        if self.output_json {
-            crate::json::write_agg_row_json(out, count, &self.keys, combo, bucket, time_range, tz)
-        } else {
-            output::write_agg_row_logfmt(out, count, &self.keys, combo, bucket, time_range, tz)
-        }
-    }
-
-    /// Batch-mode end-of-run report: count desc, ties broken by key.
-    fn report<W: Write>(&self, out: &mut W, tz: &jiff::tz::TimeZone) -> std::io::Result<()> {
-        if !self.is_active() || self.counts.is_empty() {
-            return Ok(());
-        }
-        let mut entries = Vec::new();
-        for (bucket_ts, groups) in &self.counts {
-            for (combo, stats) in groups {
-                entries.push((combo, *bucket_ts, stats));
-            }
-        }
-        entries.sort_unstable_by(|a, b| {
-            b.2.count
-                .cmp(&a.2.count)
-                .then_with(|| a.0.cmp(b.0))
-                .then_with(|| a.1.cmp(&b.1))
-        });
-        for (combo, bucket_ts, stats) in entries {
-            self.write_row(out, combo, bucket_ts, stats, tz)?;
-        }
-        Ok(())
-    }
-
-    /// Streaming flush: emit and remove every group whose bucket has
-    /// passed the close threshold (`bucket.end + close_grace_nanos <
-    /// max_ts_seen`). Rows go out in (bucket.start asc, count desc, combo
-    /// asc) order. No-op when `streaming` is false.
-    fn flush_closed<W: Write + ?Sized>(
-        &mut self,
-        out: &mut W,
-        tz: &jiff::tz::TimeZone,
-    ) -> std::io::Result<()> {
-        if !self.streaming {
-            return Ok(());
-        }
-        let Some(bspec) = self.bucket else {
-            return Ok(());
-        };
-        let Some(seen) = self.max_ts_seen else {
-            return Ok(());
-        };
-
-        let close_threshold = seen - bspec.nanos - self.close_grace_nanos;
-
-        let mut open_buckets = self.counts.split_off(&Some(close_threshold));
-        if let Some(none_groups) = self.counts.remove(&None) {
-            open_buckets.insert(None, none_groups);
-        }
-
-        if self.counts.is_empty() {
-            self.counts = open_buckets;
-            return Ok(());
-        }
-
-        let mut to_close = Vec::new();
-        let closing_counts = std::mem::replace(&mut self.counts, open_buckets);
-        for (bucket_ts, groups) in closing_counts.into_iter() {
-            for (combo, stats) in groups {
-                to_close.push((combo, bucket_ts, stats));
-            }
-        }
-
-        // Since we extracted them in bucket order, and split_off splits at bucket level,
-        // we can just sort to_close as needed.
-        // stream_order is: bucket_ts asc, count desc, combo asc.
-        to_close.sort_unstable_by(|a, b| {
-            a.1.cmp(&b.1)
-                .then_with(|| b.2.count.cmp(&a.2.count))
-                .then_with(|| a.0.cmp(&b.0))
-        });
-        for (combo, bucket_ts, stats) in &to_close {
-            self.write_row(out, combo, *bucket_ts, stats, tz)?;
-        }
-        out.flush()
-    }
-
-    /// End-of-stream flush: emit any still-open buckets in time order.
-    /// Used in place of `report` when streaming.
-    fn flush_remaining<W: Write>(
-        &self,
-        out: &mut W,
-        tz: &jiff::tz::TimeZone,
-    ) -> std::io::Result<()> {
-        if self.counts.is_empty() {
-            return Ok(());
-        }
-        let mut entries = Vec::new();
-        for (bucket_ts, groups) in &self.counts {
-            for (combo, stats) in groups {
-                entries.push((combo, *bucket_ts, stats));
-            }
-        }
-        entries.sort_unstable_by(|a, b| {
-            a.1.cmp(&b.1)
-                .then_with(|| b.2.count.cmp(&a.2.count))
-                .then_with(|| a.0.cmp(b.0))
-        });
-        for (combo, bucket_ts, stats) in entries {
-            self.write_row(out, combo, bucket_ts, stats, tz)?;
-        }
-        Ok(())
-    }
-
-    fn merge(&mut self, other: Self) {
-        if let Some(t) = other.max_ts_seen {
-            fold_max(&mut self.max_ts_seen, t);
-        }
-        for (bucket_ts, groups) in other.counts {
-            match self.counts.entry(bucket_ts) {
-                std::collections::btree_map::Entry::Vacant(e) => {
-                    e.insert(groups);
-                }
-                std::collections::btree_map::Entry::Occupied(mut e) => {
-                    let self_groups = e.get_mut();
-                    for (combo, stats) in groups {
-                        self_groups.entry(combo).or_default().merge(stats);
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Random per-line sampling. When `sample_if` is set, only lines matching it
-/// are subject to the dice roll; all other matched lines pass through.
-#[derive(Clone)]
-pub(crate) struct Sampler {
-    rate: f64,
-    sample_if: Option<Arc<Filter>>,
-}
-
-impl Sampler {
-    fn keep(&self, pairs: &[(&str, &str)]) -> bool {
-        let subject = self.sample_if.as_ref().is_none_or(|f| f.matches(pairs));
-        !subject || fastrand::f64() < self.rate
-    }
-}
-
 /// Strict timestamp filter applied per-line on top of the bisected byte range.
 /// The bisect is an over-approximation, so the byte range can include lines
 /// outside `[from, to]`; this filter drops them.
@@ -557,8 +58,8 @@ impl Sampler {
 /// (we can't prove they're in range).
 #[derive(Default, Clone, Copy)]
 pub(crate) struct TimeFilter {
-    from: Option<Timestamp>,
-    to: Option<Timestamp>,
+    pub(crate) from: Option<Timestamp>,
+    pub(crate) to: Option<Timestamp>,
 }
 
 impl TimeFilter {
@@ -1085,101 +586,19 @@ fn stream_plan<W: Write>(
     Ok(())
 }
 
-fn emit_summaries<W: Write>(
-    sinks: &Sinks,
-    count_only: bool,
-    tz: &jiff::tz::TimeZone,
-    output: &mut W,
-) -> anyhow::Result<()> {
-    sinks.stats.report();
-    let json = sinks.counter.output_json;
-    if sinks.counter.streaming {
-        sinks.counter.flush_remaining(output, tz)?;
-    } else {
-        sinks.counter.report(output, tz)?;
-    }
-    sinks.keys.report(output, json)?;
-    sinks.values.report(output, json)?;
-    if count_only {
-        if json {
-            json::write_count_json(output, sinks.stats.matched_lines as u64)?;
-        } else {
-            writeln!(output, "{}", sinks.stats.matched_lines)?;
-        }
-    }
-    output.flush()?;
-    Ok(())
-}
-
-struct Stats {
-    bytes: usize,
-    matched_lines: usize,
-    total_lines: usize,
-    invalid_utf: usize,
-    pairs: usize,
-    overflow: usize,
-    started: Instant,
-}
-
-impl Default for Stats {
-    fn default() -> Self {
-        Self {
-            bytes: 0,
-            matched_lines: 0,
-            total_lines: 0,
-            invalid_utf: 0,
-            pairs: 0,
-            overflow: 0,
-            started: Instant::now(),
-        }
-    }
-}
-
-impl Stats {
-    fn merge(&mut self, other: Self) {
-        self.bytes += other.bytes;
-        self.matched_lines += other.matched_lines;
-        self.total_lines += other.total_lines;
-        self.invalid_utf += other.invalid_utf;
-        self.pairs += other.pairs;
-        self.overflow += other.overflow;
-        // `started` stays as the master's earliest start time.
-    }
-
-    fn report(&self) {
-        let elapsed = self.started.elapsed().as_secs_f64();
-        let rate = if elapsed > 0.0 {
-            (self.bytes as f64 / elapsed) as u64
-        } else {
-            0
-        };
-        log::info!(
-            "{} read in {:.3}s, {}/{} lines matched ({} invalid utf8), {} pairs ({} overflow), {}/s",
-            humanize_bytes_binary!(self.bytes),
-            elapsed,
-            self.matched_lines,
-            self.total_lines,
-            self.invalid_utf,
-            self.pairs,
-            self.overflow,
-            humanize_bytes_binary!(rate),
-        );
-    }
-}
-
 /// Bundles per-line bookkeeping (stats + summarisers) so the streaming
 /// helpers don't drown in arguments.
 pub(crate) struct Sinks {
-    stats: Stats,
-    counter: Counter,
-    keys: KeyGather,
-    values: ValueGather,
+    pub(crate) stats: Stats,
+    pub(crate) counter: Counter,
+    pub(crate) keys: KeyGather,
+    pub(crate) values: ValueGather,
     raw: RawExtractor,
     sampler: Option<Sampler>,
     sort_buf: Option<SortBuffer>,
     suppress_lines: bool,
     /// Picks the line emitter (passthrough / json / colored / plain).
-    line_mode: LineMode,
+    pub(crate) line_mode: LineMode,
     limit: Option<usize>,
     /// Display timezone, used by the streaming bucket flush to format
     /// `bucket.start` / `bucket.end` / `time.start` / `time.end` on the fly.
@@ -1227,73 +646,6 @@ pub(crate) fn resolve_parallelism(cli: &Cli) -> usize {
     }
 }
 
-/// Parse the sampler config out of `--sample-rate` / `--sample-if`. Done
-/// once up front so workers can clone it cheaply (the inner `Filter` is
-/// shared via `Arc`).
-fn build_sampler(cli: &Cli) -> anyhow::Result<Option<Sampler>> {
-    match (cli.sample_rate, cli.sample_if.as_deref()) {
-        (None, Some(_)) => anyhow::bail!("--sample-if requires --sample-rate"),
-        (None, None) => Ok(None),
-        (Some(rate), _) if !(0.0..=1.0).contains(&rate) => {
-            anyhow::bail!("--sample-rate must be in [0, 1], got {rate}")
-        }
-        (Some(rate), sample_if) => Ok(Some(Sampler {
-            rate,
-            sample_if: sample_if.map(Filter::parse_one).transpose()?.map(Arc::new),
-        })),
-    }
-}
-
-/// Compute the bucket spec from `--bucket` / `--n-buckets`. Caller has
-/// already resolved `tf`; `global_first`/`global_last` are the file-side
-/// bounds returned by `peek_global_window` (or `None` if it wasn't run).
-/// Returns `None` when neither flag is set. Errors when `--n-buckets`
-/// cannot be sized (no resolvable window) or the resulting width is zero.
-fn resolve_bucket_spec(
-    cli: &Cli,
-    tf: &TimeFilter,
-    global_first: Option<Timestamp>,
-    global_last: Option<Timestamp>,
-) -> anyhow::Result<Option<BucketSpec>> {
-    if let Some(s) = cli.bucket.as_deref() {
-        let nanos = timestamp::parse_duration_nanos(s)?;
-        return Ok(Some(BucketSpec {
-            nanos,
-            origin: 0,
-            n_buckets: None,
-        }));
-    }
-    if let Some(n) = cli.n_buckets {
-        if n == 0 {
-            anyhow::bail!("--n-buckets must be > 0");
-        }
-        let start = tf.from.or(global_first).ok_or_else(|| {
-            anyhow::anyhow!(
-                "--n-buckets needs a window start: pass --from, or use a file with parseable timestamps"
-            )
-        })?;
-        let end = tf.to.or(global_last).ok_or_else(|| {
-            anyhow::anyhow!(
-                "--n-buckets needs a window end: pass --to, or use a file with parseable timestamps"
-            )
-        })?;
-        let span = end - start;
-        if span <= 0 {
-            anyhow::bail!("--n-buckets: time range is empty (end <= start)");
-        }
-        let nanos = span / n as i64;
-        if nanos == 0 {
-            anyhow::bail!("--n-buckets={n}: span {span}ns is too small to split into {n} buckets");
-        }
-        return Ok(Some(BucketSpec {
-            nanos,
-            origin: start,
-            n_buckets: Some(n),
-        }));
-    }
-    Ok(None)
-}
-
 /// Construct a fresh `Sinks` for the master or a worker. Configuration
 /// fields are derived from `cli`; the `sampler` template is cloned in (its
 /// inner `Arc<Filter>` is shared, so cloning is cheap). All collected
@@ -1306,11 +658,7 @@ pub(crate) fn make_sinks(
     bucket: Option<BucketSpec>,
     tz: jiff::tz::TimeZone,
 ) -> Sinks {
-    let counter = Counter::new(
-        cli.group_by.iter().map(SmartString::from).collect(),
-        bucket,
-        matches!(line_mode, LineMode::Json),
-    );
+    let counter = Counter::new(cli.group_by.iter().map(SmartString::from).collect(), bucket);
     Sinks {
         stats: Stats::default(),
         counter,
@@ -1457,7 +805,9 @@ fn process_line<W: Write + ?Sized>(
         // Streaming mode (`-f`/`-F` + `--bucket`): emit any buckets that
         // have passed the close threshold. Cheap when nothing is closeable;
         // a no-op when streaming is off.
-        sinks.counter.flush_closed(output, &sinks.tz)?;
+        sinks
+            .counter
+            .flush_closed(output, &sinks.tz, matches!(sinks.line_mode, LineMode::Json))?;
         sinks.keys.record(parsed);
         sinks.values.record(parsed);
         if let Some(sort_buf) = sinks.sort_buf.as_mut() {

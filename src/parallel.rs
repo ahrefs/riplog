@@ -10,9 +10,11 @@ use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::Mutex;
 
+use crate::bucket::BucketSpec;
 use crate::cli::Cli;
 use crate::filter::Filter;
-use crate::run::{make_sinks, stream_bounded, BucketSpec, LineMode, Sampler, Sinks, TimeFilter};
+use crate::run::{make_sinks, stream_bounded, LineMode, Sinks, TimeFilter};
+use crate::sampler::Sampler;
 use crate::transform::{transform_views, LineTransform};
 
 /// Below this many bytes per worker, parallel mode falls back to sequential —

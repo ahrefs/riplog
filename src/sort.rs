@@ -5,7 +5,7 @@
 use smartstring::alias::String as SmartString;
 use std::io::Write;
 
-use crate::run::unescape_for_key;
+use crate::raw_extractor::unescape_for_key;
 
 pub struct SortBuffer {
     key: SmartString,
