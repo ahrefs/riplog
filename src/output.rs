@@ -220,7 +220,8 @@ pub(crate) fn write_agg_row_logfmt<W: Write + ?Sized>(
     writeln!(out)
 }
 
-/// JSON aggregation row, flat keys: `{"count": N, "key.<k>": "...", ...}`.
+/// JSON aggregation row: `{"count": N, "keys": {"<k>": "...", ...}, ...}`.
+/// The `keys` field is omitted entirely when there are no grouping keys.
 pub(crate) fn write_agg_row_json<W: Write + ?Sized>(
     out: &mut W,
     count: u64,
@@ -232,8 +233,12 @@ pub(crate) fn write_agg_row_json<W: Write + ?Sized>(
 ) -> io::Result<()> {
     let mut obj = JsonObj::open(out)?;
     obj.entry_u64("count", count)?;
-    for (k, v) in keys.iter().zip(combo.iter()) {
-        obj.entry_str(&format!("key.{k}"), v.as_str())?;
+    if !keys.is_empty() {
+        let mut k_obj = obj.start_obj("keys")?;
+        for (k, v) in keys.iter().zip(combo.iter()) {
+            k_obj.entry_str(k.as_str(), v.as_str())?;
+        }
+        k_obj.finish()?;
     }
     if let Some((start, end)) = bucket {
         obj.entry_str("bucket.start", &timestamp::format_rfc3339(start, tz))?;

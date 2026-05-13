@@ -1308,20 +1308,35 @@ fn json_bare_count_is_object() {
 }
 
 #[test]
-fn json_aggregation_row_flat_keys() {
+fn json_aggregation_row_nests_keys() {
     let path = fixture_path().to_str().unwrap();
     let out = run(&["--json", "--count", "--group-by=level", path]);
     let text = String::from_utf8(out.stdout).unwrap();
     let mut total = 0u64;
     for line in text.lines() {
         let v: serde_json::Value = serde_json::from_str(line).unwrap();
-        // `count` must be a JSON number.
         let c = v["count"].as_u64().expect("count is u64");
         total += c;
-        // Flat key prefixing.
-        assert!(v["key.level"].is_string(), "key.level missing on: {line}");
+        assert!(v["keys"].is_object(), "keys object missing on: {line}");
+        assert!(
+            v["keys"]["level"].is_string(),
+            "keys.level missing on: {line}"
+        );
+        assert!(v["key.level"].is_null(), "stray key.level on: {line}");
     }
     assert_eq!(total, COUNT as u64);
+}
+
+#[test]
+fn json_bare_count_has_no_keys_field() {
+    let path = fixture_path().to_str().unwrap();
+    let out = run(&["--json", "--count", path]);
+    let line = String::from_utf8(out.stdout).unwrap();
+    let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+    assert!(
+        v.get("keys").is_none(),
+        "keys field should be omitted when no --group-by: {line}"
+    );
 }
 
 #[test]

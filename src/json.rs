@@ -91,6 +91,13 @@ impl<'w, W: Write + ?Sized> JsonObj<'w, W> {
         write_json_decoded_logfmt_value(self.out, raw, scratch)
     }
 
+    /// Begin a nested object value for key `k`. Caller drives it through
+    /// the returned `JsonObj` and calls `.finish()` when done.
+    pub fn start_obj<'a>(&'a mut self, k: &str) -> io::Result<JsonObj<'a, W>> {
+        self.write_key(k)?;
+        JsonObj::open(self.out)
+    }
+
     pub fn finish(self) -> io::Result<()> {
         self.out.write_all(b"}")
     }
@@ -226,6 +233,21 @@ mod tests {
             o.finish()
         });
         assert_eq!(got, r#"{"n":"18446744073709551615"}"#);
+    }
+
+    #[test]
+    fn obj_nested() {
+        let got = s(|b| {
+            let mut o = JsonObj::open(b)?;
+            o.entry_u64("a", 1)?;
+            {
+                let mut sub = o.start_obj("sub")?;
+                sub.entry_str("x", "y")?;
+                sub.finish()?;
+            }
+            o.finish()
+        });
+        assert_eq!(got, r#"{"a":1,"sub":{"x":"y"}}"#);
     }
 
     #[test]
