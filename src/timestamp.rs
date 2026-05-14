@@ -41,7 +41,7 @@ pub fn parse_rfc3339_nanos(s: &str) -> Option<Timestamp> {
     let second = parse_uint(&b[17..19])?;
 
     if !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
+        || !valid_day(year, month, day)
         || hour > 23
         || minute > 59
         || second > 60
@@ -213,6 +213,34 @@ fn parse_time_of_day(s: &str) -> Option<i64> {
         return None;
     }
     Some(nanos + parse_frac_nanos(&b[9..])?)
+}
+
+/// True iff `day` is a valid day-of-month for `(year, month)`. Caller has
+/// already checked `month ∈ 1..=12`; this catches the silent rollover cases
+/// in `days_from_civil` (e.g. `2026-02-30` would otherwise become March 2).
+#[inline]
+fn valid_day(year: i32, month: u32, day: u32) -> bool {
+    if day == 0 {
+        return false;
+    }
+    let max = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if is_leap_year(year) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => return false,
+    };
+    day <= max
+}
+
+#[inline]
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
 }
 
 /// Parse 1..=9 ASCII-digit bytes as a fractional second, scaled to
@@ -544,6 +572,31 @@ mod tests {
         assert_eq!(parse_rfc3339_nanos("1970-01-01T00:00:00.1234567890Z"), None);
         assert_eq!(parse_rfc3339_nanos("1970-01-01T00:00:00+25:00"), None);
         assert_eq!(parse_rfc3339_nanos("1970-01-01T00:00:00Zextra"), None);
+    }
+
+    #[test]
+    fn rejects_invalid_calendar_dates() {
+        // day=0 is never valid.
+        assert_eq!(parse_rfc3339_nanos("2026-01-00T00:00:00Z"), None);
+        // 30-day months reject day 31.
+        assert_eq!(parse_rfc3339_nanos("2026-04-31T00:00:00Z"), None);
+        assert_eq!(parse_rfc3339_nanos("2026-06-31T00:00:00Z"), None);
+        // February in a non-leap year tops out at 28.
+        assert_eq!(parse_rfc3339_nanos("2026-02-29T00:00:00Z"), None);
+        assert_eq!(parse_rfc3339_nanos("2026-02-30T00:00:00Z"), None);
+        // Year divisible by 100 but not 400 is not a leap year.
+        assert_eq!(parse_rfc3339_nanos("1900-02-29T00:00:00Z"), None);
+    }
+
+    #[test]
+    fn accepts_leap_day() {
+        // Feb 29 only valid in leap years.
+        assert!(parse_rfc3339_nanos("2024-02-29T00:00:00Z").is_some());
+        // Year divisible by 400 is a leap year.
+        assert!(parse_rfc3339_nanos("2000-02-29T00:00:00Z").is_some());
+        // 31 January, 30 April, etc. are valid.
+        assert!(parse_rfc3339_nanos("2026-01-31T00:00:00Z").is_some());
+        assert!(parse_rfc3339_nanos("2026-04-30T00:00:00Z").is_some());
     }
 
     #[test]

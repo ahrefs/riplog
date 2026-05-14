@@ -213,3 +213,11 @@ pub struct Cli {
           require_equals = true)]
     pub parallel: Option<usize>,
 }
+
+impl Cli {
+    /// `--window-secs` as i64 nanoseconds. Used both as the bisect overshoot
+    /// in `plan_file` and as the bucket-close grace in streaming-bucket mode.
+    pub fn window_nanos(&self) -> i64 {
+        (self.window_secs as i64).saturating_mul(1_000_000_000)
+    }
+}

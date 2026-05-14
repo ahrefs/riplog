@@ -1,19 +1,14 @@
 //! Single-file parallel search. Splits a byte range across N worker threads
-//! via `std::thread::scope`; each worker runs the same `stream_bounded`
-//! core as sequential, into a thread-local `Sinks`. Output is **unordered**:
-//! workers append to a per-thread buffer that flushes to the shared writer
-//! through a `Mutex`. After join the master folds each worker's `Sinks`
-//! into its own.
+//! via `std::thread::scope`; each worker invokes the caller-supplied `work`
+//! closure against a positioned reader, a byte budget, and a per-worker
+//! writer. Output is **unordered**: workers append to a per-thread buffer
+//! that flushes to the shared writer through a `Mutex`. The caller folds
+//! the per-worker states returned from `run` into its own master state.
 
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::Mutex;
-
-use crate::cli::Cli;
-use crate::filter::Filter;
-use crate::run::{make_sinks, stream_bounded, BucketSpec, LineMode, Sampler, Sinks, TimeFilter};
-use crate::transform::LineTransform;
 
 /// Below this many bytes per worker, parallel mode falls back to sequential —
 /// the fixed per-thread overhead would dominate the per-byte work.
@@ -22,47 +17,39 @@ pub(crate) const MIN_BYTES_PER_WORKER: u64 = 4 * 1024 * 1024;
 /// Per-worker batch size before a flush to the shared writer.
 const FLUSH_BYTES: usize = 64 * 1024;
 
-/// Inputs for one parallel search invocation. All references share a single
-/// lifetime since the call site (the file-plan loop in `run::run`) borrows
-/// each from the same scope.
+/// Where to split the work. `path` is the only borrow; everything else is
+/// plain data.
 pub(crate) struct Job<'a> {
     pub path: &'a Path,
     pub start_byte: u64,
     pub max_bytes: u64,
-    pub tf: TimeFilter,
     pub n_workers: usize,
-    pub cli: &'a Cli,
-    pub filter: &'a Filter,
-    pub sampler: Option<Sampler>,
-    pub suppress_lines: bool,
-    pub line_mode: LineMode,
-    pub bucket: Option<BucketSpec>,
-    pub tz: jiff::tz::TimeZone,
-    pub output: &'a mut (dyn Write + Send),
-    pub master: &'a mut Sinks,
-    pub line_transform: Option<LineTransform>,
 }
 
 /// Spawn `job.n_workers` threads searching disjoint chunks of `job.path`
-/// over `[start_byte, start_byte + max_bytes)`. Falls back to a single
-/// sequential pass on `job.master` if the range is too small to split.
-pub(crate) fn run(job: Job<'_>) -> anyhow::Result<()> {
+/// over `[start_byte, start_byte + max_bytes)`. The `work` closure is
+/// invoked once per chunk with a positioned `BufReader`, the chunk's byte
+/// budget, and a per-worker `Write` sink. Returns the vector of per-worker
+/// states produced by `work` so the caller can merge them.
+///
+/// When the byte range is too small to split, falls back to a single
+/// in-line invocation of `work` writing directly to `output` (no
+/// `UnorderedSink` wrapper). The returned vector then contains exactly one
+/// state. Callers can merge unconditionally.
+pub(crate) fn run<S, F>(
+    job: Job<'_>,
+    output: &mut (dyn Write + Send),
+    work: F,
+) -> anyhow::Result<Vec<S>>
+where
+    F: Fn(BufReader<File>, u64, &mut dyn Write) -> anyhow::Result<S> + Send + Sync,
+    S: Send,
+{
     let Job {
         path,
         start_byte,
         max_bytes,
-        tf,
         n_workers,
-        cli,
-        filter,
-        sampler,
-        suppress_lines,
-        line_mode,
-        bucket,
-        tz,
-        output,
-        master,
-        line_transform,
     } = job;
 
     let end_byte = start_byte.saturating_add(max_bytes);
@@ -74,8 +61,9 @@ pub(crate) fn run(job: Job<'_>) -> anyhow::Result<()> {
     if chunks.len() <= 1 {
         let mut file = File::open(path)?;
         file.seek(SeekFrom::Start(start_byte))?;
-        let mut reader = BufReader::new(file);
-        return stream_bounded(&mut reader, max_bytes, filter, &tf, output, master);
+        let reader = BufReader::with_capacity(crate::run::STREAM_BUF_CAP, file);
+        let state = work(reader, max_bytes, output)?;
+        return Ok(vec![state]);
     }
 
     log::info!(
@@ -88,34 +76,20 @@ pub(crate) fn run(job: Job<'_>) -> anyhow::Result<()> {
     );
 
     let shared_out: Mutex<&mut (dyn Write + Send)> = Mutex::new(output);
-    let worker_sinks: Vec<Sinks> = std::thread::scope(|s| -> anyhow::Result<Vec<Sinks>> {
+    let work_ref = &work;
+    let worker_states: Vec<S> = std::thread::scope(|s| -> anyhow::Result<Vec<S>> {
         let handles: Vec<_> = chunks
             .iter()
             .map(|&(cs, ce)| {
-                let sampler = sampler.clone();
                 let shared = &shared_out;
-                let tz = tz.clone();
-                let worker_tf = line_transform.clone();
-                s.spawn(move || -> anyhow::Result<Sinks> {
-                    // Workers don't call `enable_streaming`: rows must batch
-                    // into per-worker `Sinks` and merge into the master, or
-                    // multi-writer output interleaves on the shared sink.
-                    let mut sinks = make_sinks(
-                        cli,
-                        sampler,
-                        suppress_lines,
-                        line_mode,
-                        bucket,
-                        tz,
-                        worker_tf,
-                    );
+                s.spawn(move || -> anyhow::Result<S> {
                     let mut file = File::open(path)?;
                     file.seek(SeekFrom::Start(cs))?;
-                    let mut reader = BufReader::new(file);
+                    let reader = BufReader::with_capacity(crate::run::STREAM_BUF_CAP, file);
                     let mut sink = UnorderedSink::new(shared);
-                    stream_bounded(&mut reader, ce - cs, filter, &tf, &mut sink, &mut sinks)?;
+                    let state = work_ref(reader, ce - cs, &mut sink)?;
                     sink.flush()?;
-                    Ok(sinks)
+                    Ok(state)
                 })
             })
             .collect();
@@ -126,10 +100,7 @@ pub(crate) fn run(job: Job<'_>) -> anyhow::Result<()> {
         Ok(all)
     })?;
 
-    for s in worker_sinks {
-        master.merge(s);
-    }
-    Ok(())
+    Ok(worker_states)
 }
 
 /// Compute up to `n` non-overlapping byte ranges over `[start, end)` whose

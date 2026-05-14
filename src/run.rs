@@ -3,546 +3,30 @@
 //! follow.
 
 use anyhow::Context as _;
-use humanize_bytes::humanize_bytes_binary;
-use rapidhash::{RapidHashMap, RapidHashSet};
-use smallvec::SmallVec;
-use smartstring::alias::String as SmartString;
 use std::{
     fs::File,
     io::{BufRead, BufReader, BufWriter, IsTerminal, Read, Seek, SeekFrom, Write},
     path::Path,
-    sync::atomic::{AtomicBool, Ordering},
-    sync::Arc,
     time::{Duration, Instant},
 };
 
-use crate::bisect::{self, Side};
+use crate::bucket::{self, BucketSpec, ResolvedBucket};
 use crate::cli::{Cli, ColorMode};
+use crate::file_plan::{peek_global_window, plan_file, FilePlan};
 use crate::filter::Filter;
-use crate::logfmt;
-use crate::output;
-use crate::sort::SortBuffer;
+use crate::pipeline::Pipeline;
+use crate::sampler::build_sampler;
+use crate::signal_handling::{install_signal_handler, interrupted};
+use crate::sinks::{flush_sort_buf, make_sinks, LineMode, Sinks};
+use crate::stats::emit_summaries;
+use crate::time_bisect;
 use crate::timestamp::{self, Timestamp};
-use crate::transform::{parse_line_transform, validate_rm_vs_features, EmitScratch, LineTransform};
-
-/// Set by the SIGINT handler; checked in tight loops so we can exit cleanly
-/// and still emit `--count` / `--list-keys` / `--count-by` summaries.
-static INTERRUPTED: AtomicBool = AtomicBool::new(false);
-
-fn install_signal_handler() {
-    // Idempotent — `set_handler` errors if called twice. Ignore that path so
-    // the binary stays usable when run as a library.
-    let _ = ctrlc::set_handler(|| INTERRUPTED.store(true, Ordering::SeqCst));
-}
-
-#[inline]
-fn interrupted() -> bool {
-    INTERRUPTED.load(Ordering::Relaxed)
-}
-
-type Combo = SmallVec<[SmartString; 3]>;
-
-/// Collects every distinct key seen on matched lines. Active only when
-/// `--list-keys` is set; in that mode line output is suppressed.
-#[derive(Default)]
-struct KeyGather {
-    enabled: bool,
-    keys: RapidHashSet<SmartString>,
-}
-
-impl KeyGather {
-    fn new(enabled: bool) -> Self {
-        Self {
-            enabled,
-            keys: RapidHashSet::default(),
-        }
-    }
-
-    fn record(&mut self, pairs: &[(&str, &str)]) {
-        if !self.enabled {
-            return;
-        }
-        for (k, _) in pairs {
-            intern_into_set(&mut self.keys, k);
-        }
-    }
-
-    fn report<W: Write>(&self, out: &mut W, json: bool) -> std::io::Result<()> {
-        if !self.enabled {
-            return Ok(());
-        }
-        if json {
-            output::write_string_set_json(out, &self.keys)
-        } else {
-            output::write_string_set_logfmt(out, &self.keys)
-        }
-    }
-
-    fn merge(&mut self, other: Self) {
-        self.keys.extend(other.keys);
-    }
-}
+use crate::transform::{parse_line_transform, transform_views, validate_rm_vs_features};
 
 /// `-` in the file list is the Unix idiom for "read from stdin in position".
 #[inline]
 pub(crate) fn is_stdin_path(p: &Path) -> bool {
     p == Path::new("-")
-}
-
-/// How matched lines are emitted. Exactly one branch is active for a given
-/// run, decided once in `run::run` from `--color`, `--json`, and whether
-/// the memcpy fast path is eligible (no filter, no `--rm`/`--add`).
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum LineMode {
-    /// Copy the input bytes verbatim — the fast path.
-    Passthrough,
-    /// JSONL: one JSON object per line.
-    Json,
-    /// ANSI-colored logfmt reconstruction.
-    Colored,
-    /// Plain logfmt reconstruction (no color).
-    Plain,
-}
-
-/// Find the first pair with key `key`, unescape its value into `scratch`,
-/// and return a borrow of the unescaped string. Returns `None` if no pair
-/// matches; in that case `scratch` is unspecified.
-pub(crate) fn unescape_for_key<'s>(
-    pairs: &[(&str, &str)],
-    key: &str,
-    scratch: &'s mut String,
-) -> Option<&'s str> {
-    for (pk, pv) in pairs {
-        if *pk == key {
-            scratch.clear();
-            logfmt::unescape_value(pv.as_bytes(), scratch);
-            return Some(scratch.as_str());
-        }
-    }
-    None
-}
-
-/// Insert `s` into `set` only if not already present, allocating a
-/// `SmartString` lazily.
-fn intern_into_set(set: &mut RapidHashSet<SmartString>, s: &str) {
-    if !set.contains(s) {
-        let mut x = SmartString::new_const();
-        x.push_str(s);
-        set.insert(x);
-    }
-}
-
-/// Collects every distinct value seen for each requested key, on matched
-/// lines. Active when at least one `--list-values-for=<key>` is given;
-/// suppresses line output.
-#[derive(Default)]
-struct ValueGather {
-    keys: Vec<SmartString>,
-    values: Vec<RapidHashSet<SmartString>>,
-    scratch: String,
-}
-
-impl ValueGather {
-    fn new(keys: Vec<SmartString>) -> Self {
-        let n = keys.len();
-        Self {
-            keys,
-            values: (0..n).map(|_| RapidHashSet::default()).collect(),
-            scratch: String::new(),
-        }
-    }
-
-    #[inline]
-    fn is_active(&self) -> bool {
-        !self.keys.is_empty()
-    }
-
-    fn record(&mut self, pairs: &[(&str, &str)]) {
-        if !self.is_active() {
-            return;
-        }
-        for (i, key) in self.keys.iter().enumerate() {
-            if unescape_for_key(pairs, key, &mut self.scratch).is_some() {
-                intern_into_set(&mut self.values[i], &self.scratch);
-            }
-        }
-    }
-
-    fn report<W: Write>(&self, out: &mut W, json: bool) -> std::io::Result<()> {
-        if !self.is_active() {
-            return Ok(());
-        }
-        if json {
-            output::write_values_summary_json(out, &self.keys, &self.values)
-        } else {
-            output::write_values_summary_logfmt(out, &self.keys, &self.values)
-        }
-    }
-
-    fn merge(&mut self, other: Self) {
-        debug_assert_eq!(self.values.len(), other.values.len());
-        for (a, b) in self.values.iter_mut().zip(other.values) {
-            a.extend(b);
-        }
-    }
-}
-
-/// Per-line value extractor: for each matched line, emit the unquoted,
-/// unescaped value of `key`. Active when `--raw-key=<key>` is given;
-/// suppresses the normal full-line output. Lines lacking the key are
-/// silently skipped.
-struct RawExtractor {
-    raw_key: Option<SmartString>,
-    scratch: String,
-}
-
-impl RawExtractor {
-    fn new(raw_key: Option<&str>) -> Self {
-        Self {
-            raw_key: raw_key.map(SmartString::from),
-            scratch: String::new(),
-        }
-    }
-
-    fn emit<W: Write + ?Sized>(
-        &mut self,
-        pairs: &[(&str, &str)],
-        out: &mut W,
-    ) -> std::io::Result<()> {
-        let Some(key) = self.raw_key.as_deref() else {
-            return Ok(());
-        };
-        if let Some(v) = unescape_for_key(pairs, key, &mut self.scratch) {
-            out.write_all(v.as_bytes())?;
-            out.write_all(b"\n")?;
-        }
-        Ok(())
-    }
-}
-
-/// Aggregated stats for a single (group-keys [, bucket]) combination.
-#[derive(Default)]
-struct GroupStats {
-    count: usize,
-    min_ts: Option<Timestamp>,
-    max_ts: Option<Timestamp>,
-}
-
-#[inline]
-fn fold_min(slot: &mut Option<Timestamp>, t: Timestamp) {
-    *slot = Some(slot.map_or(t, |cur| cur.min(t)));
-}
-
-#[inline]
-fn fold_max(slot: &mut Option<Timestamp>, t: Timestamp) {
-    *slot = Some(slot.map_or(t, |cur| cur.max(t)));
-}
-
-impl GroupStats {
-    fn record(&mut self, ts: Option<Timestamp>) {
-        self.count += 1;
-        if let Some(t) = ts {
-            fold_min(&mut self.min_ts, t);
-            fold_max(&mut self.max_ts, t);
-        }
-    }
-
-    fn merge(&mut self, other: GroupStats) {
-        self.count += other.count;
-        if let Some(t) = other.min_ts {
-            fold_min(&mut self.min_ts, t);
-        }
-        if let Some(t) = other.max_ts {
-            fold_max(&mut self.max_ts, t);
-        }
-    }
-}
-
-/// Time bucketing config: width in nanoseconds, plus the origin the bucket
-/// grid is aligned to. `--bucket=DURATION` uses origin=0 (epoch-aligned, so
-/// 5-minute buckets fall on `:00`, `:05`, ...). `--n-buckets=N` uses
-/// origin=window-start *and* `n_buckets=Some(N)`, which clamps the bucket
-/// index to `[0, N-1]` so a line at the inclusive `end` boundary lands in
-/// the last bucket instead of overflowing into an N+1-th one.
-#[derive(Clone, Copy)]
-pub(crate) struct BucketSpec {
-    nanos: i64,
-    origin: i64,
-    /// When set, clamps the bucket index to `[0, n_buckets-1]`.
-    n_buckets: Option<usize>,
-}
-
-impl BucketSpec {
-    #[inline]
-    fn floor(&self, ts: Timestamp) -> i64 {
-        let mut idx = (ts - self.origin).div_euclid(self.nanos);
-        if let Some(n) = self.n_buckets {
-            let max = (n as i64) - 1;
-            if idx < 0 {
-                idx = 0;
-            } else if idx > max {
-                idx = max;
-            }
-        }
-        self.origin + idx * self.nanos
-    }
-}
-
-/// Map key for one group. The user-keys combo and the bucket boundary are
-/// kept as separate typed fields rather than smushed into a single
-/// `SmallVec<SmartString>`, which avoids a per-line `format!` + reverse
-/// `parse::<i64>()` round-trip on the hot path.
-use std::collections::BTreeMap;
-
-/// Groups matched lines by the value tuple of `keys` (and optionally a time
-/// bucket) and records per-group count + observed timestamp range. Missing
-/// user keys produce an empty value slot (rendered as `key.<k>=""` in the
-/// logfmt report).
-#[derive(Default)]
-struct Counter {
-    keys: Vec<SmartString>,
-    bucket: Option<BucketSpec>,
-    counts: BTreeMap<Option<Timestamp>, RapidHashMap<Combo, GroupStats>>,
-    scratch: String,
-    /// In streaming mode, track the highest timestamp observed across all
-    /// matched lines. Used to decide which buckets are past the close
-    /// threshold (`bucket.end + close_grace_nanos`).
-    max_ts_seen: Option<Timestamp>,
-    /// Reorder grace; mirrors `--window-secs`. Bucket B is closed (and
-    /// streamed out) once `max_ts_seen > B.end + close_grace_nanos`.
-    close_grace_nanos: i64,
-    /// Set in follow mode when `--bucket` is active. When `false`, the
-    /// streaming flush methods are no-ops and end-of-process output goes
-    /// through `report` (today's count-desc, single-emission behaviour).
-    streaming: bool,
-    /// `--json` mode: row emission goes through the JSON serializer instead
-    /// of logfmt.
-    output_json: bool,
-}
-
-impl Counter {
-    fn new(keys: Vec<SmartString>, bucket: Option<BucketSpec>, output_json: bool) -> Self {
-        Self {
-            keys,
-            bucket,
-            counts: BTreeMap::default(),
-            scratch: String::new(),
-            max_ts_seen: None,
-            close_grace_nanos: 0,
-            streaming: false,
-            output_json,
-        }
-    }
-
-    /// Enable streaming output: per-bucket rows emit as soon as
-    /// `max_ts_seen > bucket.end + close_grace_nanos`. No-op unless
-    /// `bucket` is also set (streaming an unbucketed group has no
-    /// completion signal).
-    fn enable_streaming(&mut self, close_grace_nanos: i64) {
-        if self.bucket.is_some() {
-            self.streaming = true;
-            self.close_grace_nanos = close_grace_nanos;
-        }
-    }
-
-    #[inline]
-    fn is_active(&self) -> bool {
-        !self.keys.is_empty() || self.bucket.is_some()
-    }
-
-    fn record(&mut self, pairs: &[(&str, &str)], ts: Option<Timestamp>) {
-        if !self.is_active() {
-            return;
-        }
-        let bucket_ts = match (self.bucket, ts) {
-            (Some(b), Some(t)) => Some(b.floor(t)),
-            // Bucketing on but the line has no timestamp — can't place it.
-            (Some(_), None) => return,
-            (None, _) => None,
-        };
-
-        if self.streaming {
-            if let Some(t) = ts {
-                fold_max(&mut self.max_ts_seen, t);
-            }
-        }
-
-        let mut combo: Combo = SmallVec::with_capacity(self.keys.len());
-        for k in &self.keys {
-            let mut value = SmartString::new_const();
-            if let Some(v) = unescape_for_key(pairs, k, &mut self.scratch) {
-                value.push_str(v);
-            }
-            combo.push(value);
-        }
-        self.counts
-            .entry(bucket_ts)
-            .or_default()
-            .entry(combo)
-            .or_default()
-            .record(ts);
-    }
-
-    fn write_row<W: Write + ?Sized>(
-        &self,
-        out: &mut W,
-        combo: &Combo,
-        bucket_ts: Option<Timestamp>,
-        stats: &GroupStats,
-        tz: &jiff::tz::TimeZone,
-    ) -> std::io::Result<()> {
-        let bucket = match (self.bucket, bucket_ts) {
-            (Some(bspec), Some(start)) => Some((start, start + bspec.nanos)),
-            _ => None,
-        };
-        let time_range = match (stats.min_ts, stats.max_ts) {
-            (Some(a), Some(b)) => Some((a, b)),
-            _ => None,
-        };
-        let count = stats.count as u64;
-        if self.output_json {
-            output::write_agg_row_json(out, count, &self.keys, combo, bucket, time_range, tz)
-        } else {
-            output::write_agg_row_logfmt(out, count, &self.keys, combo, bucket, time_range, tz)
-        }
-    }
-
-    /// Batch-mode end-of-run report: count desc, ties broken by key.
-    fn report<W: Write>(&self, out: &mut W, tz: &jiff::tz::TimeZone) -> std::io::Result<()> {
-        if !self.is_active() || self.counts.is_empty() {
-            return Ok(());
-        }
-        let mut entries = Vec::new();
-        for (bucket_ts, groups) in &self.counts {
-            for (combo, stats) in groups {
-                entries.push((combo, *bucket_ts, stats));
-            }
-        }
-        entries.sort_unstable_by(|a, b| {
-            b.2.count
-                .cmp(&a.2.count)
-                .then_with(|| a.0.cmp(b.0))
-                .then_with(|| a.1.cmp(&b.1))
-        });
-        for (combo, bucket_ts, stats) in entries {
-            self.write_row(out, combo, bucket_ts, stats, tz)?;
-        }
-        Ok(())
-    }
-
-    /// Streaming flush: emit and remove every group whose bucket has
-    /// passed the close threshold (`bucket.end + close_grace_nanos <
-    /// max_ts_seen`). Rows go out in (bucket.start asc, count desc, combo
-    /// asc) order. No-op when `streaming` is false.
-    fn flush_closed<W: Write + ?Sized>(
-        &mut self,
-        out: &mut W,
-        tz: &jiff::tz::TimeZone,
-    ) -> std::io::Result<()> {
-        if !self.streaming {
-            return Ok(());
-        }
-        let Some(bspec) = self.bucket else {
-            return Ok(());
-        };
-        let Some(seen) = self.max_ts_seen else {
-            return Ok(());
-        };
-
-        let close_threshold = seen - bspec.nanos - self.close_grace_nanos;
-
-        let mut open_buckets = self.counts.split_off(&Some(close_threshold));
-        if let Some(none_groups) = self.counts.remove(&None) {
-            open_buckets.insert(None, none_groups);
-        }
-
-        if self.counts.is_empty() {
-            self.counts = open_buckets;
-            return Ok(());
-        }
-
-        let mut to_close = Vec::new();
-        let closing_counts = std::mem::replace(&mut self.counts, open_buckets);
-        for (bucket_ts, groups) in closing_counts.into_iter() {
-            for (combo, stats) in groups {
-                to_close.push((combo, bucket_ts, stats));
-            }
-        }
-
-        // Since we extracted them in bucket order, and split_off splits at bucket level,
-        // we can just sort to_close as needed.
-        // stream_order is: bucket_ts asc, count desc, combo asc.
-        to_close.sort_unstable_by(|a, b| {
-            a.1.cmp(&b.1)
-                .then_with(|| b.2.count.cmp(&a.2.count))
-                .then_with(|| a.0.cmp(&b.0))
-        });
-        for (combo, bucket_ts, stats) in &to_close {
-            self.write_row(out, combo, *bucket_ts, stats, tz)?;
-        }
-        out.flush()
-    }
-
-    /// End-of-stream flush: emit any still-open buckets in time order.
-    /// Used in place of `report` when streaming.
-    fn flush_remaining<W: Write>(
-        &self,
-        out: &mut W,
-        tz: &jiff::tz::TimeZone,
-    ) -> std::io::Result<()> {
-        if self.counts.is_empty() {
-            return Ok(());
-        }
-        let mut entries = Vec::new();
-        for (bucket_ts, groups) in &self.counts {
-            for (combo, stats) in groups {
-                entries.push((combo, *bucket_ts, stats));
-            }
-        }
-        entries.sort_unstable_by(|a, b| {
-            a.1.cmp(&b.1)
-                .then_with(|| b.2.count.cmp(&a.2.count))
-                .then_with(|| a.0.cmp(b.0))
-        });
-        for (combo, bucket_ts, stats) in entries {
-            self.write_row(out, combo, bucket_ts, stats, tz)?;
-        }
-        Ok(())
-    }
-
-    fn merge(&mut self, other: Self) {
-        if let Some(t) = other.max_ts_seen {
-            fold_max(&mut self.max_ts_seen, t);
-        }
-        for (bucket_ts, groups) in other.counts {
-            match self.counts.entry(bucket_ts) {
-                std::collections::btree_map::Entry::Vacant(e) => {
-                    e.insert(groups);
-                }
-                std::collections::btree_map::Entry::Occupied(mut e) => {
-                    let self_groups = e.get_mut();
-                    for (combo, stats) in groups {
-                        self_groups.entry(combo).or_default().merge(stats);
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Random per-line sampling. When `sample_if` is set, only lines matching it
-/// are subject to the dice roll; all other matched lines pass through.
-#[derive(Clone)]
-pub(crate) struct Sampler {
-    rate: f64,
-    sample_if: Option<Arc<Filter>>,
-}
-
-impl Sampler {
-    fn keep(&self, pairs: &[(&str, &str)]) -> bool {
-        let subject = self.sample_if.as_ref().is_none_or(|f| f.matches(pairs));
-        !subject || fastrand::f64() < self.rate
-    }
 }
 
 /// Strict timestamp filter applied per-line on top of the bisected byte range.
@@ -553,18 +37,18 @@ impl Sampler {
 /// (we can't prove they're in range).
 #[derive(Default, Clone, Copy)]
 pub(crate) struct TimeFilter {
-    from: Option<Timestamp>,
-    to: Option<Timestamp>,
+    pub(crate) from: Option<Timestamp>,
+    pub(crate) to: Option<Timestamp>,
 }
 
 impl TimeFilter {
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.from.is_none() && self.to.is_none()
     }
 
     /// Test the (already-parsed) timestamp against the bounds. `None` means
     /// the line had no parseable timestamp; with bounds set, that's a drop.
-    fn check(&self, ts: Option<Timestamp>) -> bool {
+    pub(crate) fn check(&self, ts: Option<Timestamp>) -> bool {
         if self.is_empty() {
             return true;
         }
@@ -587,6 +71,160 @@ impl TimeFilter {
 
 const FOLLOW_POLL: Duration = Duration::from_millis(200);
 
+/// What to do once CLI parsing and validation are done. Classified by
+/// `ExecutionMode::classify` from a `(Cli, …)`-shaped input; the dispatch in
+/// `run()` matches on this once and runs the corresponding arm.
+enum ExecutionMode<'a> {
+    /// `--time-range`: probe per-file head+tail, print the union span, exit.
+    /// No filter pipeline, no sinks.
+    TimeRange,
+    /// No file arguments: stream stdin to the chosen output. `bucket` carries
+    /// the epoch-aligned `--bucket=DURATION` config, or `None` when not set.
+    StdinOnly { bucket: Option<ResolvedBucket> },
+    /// One or more file arguments (possibly including `-` as stdin). Phase 1
+    /// has already produced one `FilePlan` per file; phase 2 streams each in
+    /// order. `bucket` here may be `--bucket=DURATION` *or* `--n-buckets=N`
+    /// resolved against the global window.
+    Files {
+        plans: Vec<FilePlan<'a>>,
+        bucket: Option<ResolvedBucket>,
+        /// True when `-` appears in `cli.files` (at most once).
+        has_stdin: bool,
+    },
+}
+
+impl<'a> ExecutionMode<'a> {
+    /// Tag for `log::debug!` so a `RUST_LOG=debug` run shows the chosen path
+    /// at a glance without dragging in `Debug` impls for `FilePlan`/etc.
+    fn tag(&self) -> &'static str {
+        match self {
+            ExecutionMode::TimeRange => "time-range",
+            ExecutionMode::StdinOnly { bucket: None } => "stdin",
+            ExecutionMode::StdinOnly { bucket: Some(_) } => "stdin+bucket",
+            ExecutionMode::Files { .. } => "files",
+        }
+    }
+}
+
+/// Classify the run into one of the `ExecutionMode` arms. All CLI validations
+/// that don't depend on output state happen here (and in the same order they
+/// did pre-refactor), so the error messages and short-circuit behaviour are
+/// preserved.
+///
+/// For `Files`, this also performs phase 1 (`peek_global_window` + `plan_file`
+/// over every input) so the dispatch arm in `run()` is purely phase 2.
+fn classify<'a>(cli: &'a Cli, following: bool) -> anyhow::Result<ExecutionMode<'a>> {
+    let need_seek = cli.from.is_some() || cli.to.is_some() || following || cli.time_range;
+
+    if cli.files.is_empty() {
+        if need_seek {
+            anyhow::bail!("`-f`, `-F`, `--from`, `--to`, `--time-range` require a file argument");
+        }
+        if cli.n_buckets.is_some() {
+            anyhow::bail!(
+                "`--n-buckets` requires a file argument: the bucket width is derived \
+                 from the file's time range"
+            );
+        }
+        // Epoch-aligned grid for `--bucket=DURATION` on stdin. Stdin can't
+        // use `--n-buckets` (rejected just above), so inline-build the
+        // resolved form rather than going through `BucketSpec::from_cli`.
+        let bucket = cli
+            .bucket
+            .as_deref()
+            .map(timestamp::parse_duration_nanos)
+            .transpose()?
+            .map(|nanos| ResolvedBucket {
+                start_nanos: 0,
+                dur_nanos: nanos,
+                n_buckets: None,
+            });
+        return Ok(ExecutionMode::StdinOnly { bucket });
+    }
+
+    let n_stdin = cli.files.iter().filter(|p| is_stdin_path(p)).count();
+    if n_stdin > 1 {
+        anyhow::bail!("`-` (stdin) cannot appear more than once in the file list");
+    }
+    let has_stdin = n_stdin == 1;
+    if has_stdin && (following || cli.time_range) {
+        anyhow::bail!("`-` (stdin) cannot be combined with `-f`, `-F`, or `--time-range`");
+    }
+
+    if cli.time_range {
+        return Ok(ExecutionMode::TimeRange);
+    }
+
+    // Resolve `--from`/`--to` once against the union of all files' time
+    // windows. Symbolic anchors (`start`, `end`, `start+1h`, etc.) refer to
+    // the *global* span, not each file's local one — so with two log files
+    // around a rotation, `--from start+1h --to start+2h` is one contiguous
+    // absolute window applied across both files, not two disjoint slices.
+    let need_global = cli.from.is_some() || cli.to.is_some() || cli.n_buckets.is_some();
+    let (global_first, global_last) = if need_global {
+        peek_global_window(&cli.files)?
+    } else {
+        (None, None)
+    };
+    let mut tf = TimeFilter::default();
+    if let Some(s) = cli.from.as_deref() {
+        tf.from = Some(timestamp::resolve_bound(
+            s,
+            global_first,
+            global_last,
+            global_first,
+        )?);
+    }
+    if let Some(s) = cli.to.as_deref() {
+        tf.to = Some(timestamp::resolve_bound(
+            s,
+            global_first,
+            global_last,
+            global_last,
+        )?);
+    }
+
+    // Resolve the bucket spec now that the time window is known. Two forms:
+    // - `--bucket=DURATION`: epoch-aligned grid (origin = 0).
+    // - `--n-buckets=N`: divide the *active* window into N equal-width slices
+    //   aligned to the window start, so the output has exactly N rows per
+    //   group (no edge-alignment off-by-one).
+    let bucket = match BucketSpec::from_cli(cli)? {
+        Some(spec) => Some(bucket::resolve(spec, &tf, global_first, global_last)?),
+        None => None,
+    };
+
+    // Phase 1: bisect every file up front against the resolved absolute
+    // window. Output is suppressed during planning — only summaries and
+    // matched lines are written, in file order, in phase 2.
+    let last_idx = cli.files.len() - 1;
+    // `tail -F`-style start-at-EOF only applies to the classic single-file
+    // case. With multiple files (e.g. `foo.log.1 foo.log -F`), the last
+    // file is read fully — completing the rotated → current → tail story.
+    let single_file = cli.files.len() == 1;
+    let plans: Vec<FilePlan<'a>> = cli
+        .files
+        .iter()
+        .enumerate()
+        .map(|(i, path)| {
+            let last = i == last_idx;
+            plan_file(
+                path,
+                cli,
+                tf,
+                following && last,
+                following && last && single_file,
+            )
+        })
+        .collect::<anyhow::Result<_>>()?;
+
+    Ok(ExecutionMode::Files {
+        plans,
+        bucket,
+        has_stdin,
+    })
+}
+
 pub fn run(cli: &Cli) -> anyhow::Result<()> {
     install_signal_handler();
 
@@ -603,6 +241,11 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
     if let Some(ref t) = line_transform {
         validate_rm_vs_features(cli, &t.remove)?;
     }
+    // Borrow once into `&str` slices for the per-line emit hot path; built
+    // here so `process_line`/`emit_match` don't re-walk `SmartString`s per
+    // matched line. Lifetime is tied to `line_transform`, which outlives all
+    // uses below.
+    let (add_view, remove_view) = transform_views(line_transform.as_ref());
     let following = cli.follow || cli.follow_reopen;
 
     if following && cli.n_buckets.is_some() {
@@ -667,319 +310,165 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
         None => Box::new(BufWriter::new(std::io::stdout())),
     };
 
-    let need_seek = cli.from.is_some() || cli.to.is_some() || following || cli.time_range;
-    if cli.files.is_empty() {
-        if need_seek {
-            anyhow::bail!("`-f`, `-F`, `--from`, `--to`, `--time-range` require a file argument");
-        }
-        if cli.n_buckets.is_some() {
-            anyhow::bail!(
-                "`--n-buckets` requires a file argument: the bucket width is derived \
-                 from the file's time range"
-            );
-        }
-        // Epoch-aligned grid for `--bucket=DURATION` on stdin.
-        let bucket = cli
-            .bucket
-            .as_deref()
-            .map(timestamp::parse_duration_nanos)
-            .transpose()?
-            .map(|nanos| BucketSpec {
-                nanos,
-                origin: 0,
-                n_buckets: None,
-            });
-        // stdin can't follow (rejected earlier), but `--bucket` still
-        // enables streaming output: the per-line `flush_closed` hook in
-        // `process_line` emits closed buckets in time order as we go,
-        // without any seek (pipes can't seek). At EOF, `emit_summaries`
-        // calls `flush_remaining` for the still-open buckets.
-        let mut sinks = make_sinks(
-            cli,
-            sampler.clone(),
-            suppress_lines,
-            line_mode,
-            bucket,
-            tz.clone(),
-            line_transform.clone(),
-        );
-        if bucket.is_some() {
-            let grace = (cli.window_secs as i64).saturating_mul(1_000_000_000);
-            sinks.enable_streaming(grace);
-        }
-        stream_unbounded(
-            &mut std::io::stdin().lock(),
-            &filter,
-            &TimeFilter::default(),
-            &mut output,
-            &mut sinks,
-        )?;
-        output.flush()?;
-        flush_sort_buf(&mut sinks, &mut output)?;
-        emit_summaries(&sinks, bare_count, &tz, &mut output)?;
-        return Ok(());
-    }
+    let mode = classify(cli, following)?;
+    log::debug!("execution mode: {}", mode.tag());
 
-    let n_stdin = cli.files.iter().filter(|p| is_stdin_path(p)).count();
-    if n_stdin > 1 {
-        anyhow::bail!("`-` (stdin) cannot appear more than once in the file list");
-    }
-    let has_stdin = n_stdin == 1;
-    if has_stdin && (following || cli.time_range) {
-        anyhow::bail!("`-` (stdin) cannot be combined with `-f`, `-F`, or `--time-range`");
-    }
-
-    if cli.time_range {
-        // Min of per-file firsts, max of per-file lasts — the union span.
-        let mut overall_first: Option<Timestamp> = None;
-        let mut overall_last: Option<Timestamp> = None;
-        for path in &cli.files {
-            let mut file = File::open(path)?;
-            let t0 = Instant::now();
-            let (first, last) = bisect::time_range(&mut file)?;
-            log::info!(
-                "time-range {}: {} .. {} in {:.3}s",
-                path.display(),
-                first
-                    .map(|t| timestamp::format_rfc3339(t, &tz))
-                    .as_deref()
-                    .unwrap_or("-"),
-                last.map(|t| timestamp::format_rfc3339(t, &tz))
-                    .as_deref()
-                    .unwrap_or("-"),
-                t0.elapsed().as_secs_f64(),
-            );
-            if let Some(t) = first {
-                overall_first = Some(overall_first.map_or(t, |cur| cur.min(t)));
+    match mode {
+        ExecutionMode::TimeRange => {
+            // Min of per-file firsts, max of per-file lasts — the union span.
+            let mut overall_first: Option<Timestamp> = None;
+            let mut overall_last: Option<Timestamp> = None;
+            for path in &cli.files {
+                let mut file = File::open(path)?;
+                let t0 = Instant::now();
+                let (first, last) = time_bisect::time_range(&mut file)?;
+                log::info!(
+                    "time-range {}: {} .. {} in {:.3}s",
+                    path.display(),
+                    first
+                        .map(|t| timestamp::format_rfc3339(t, &tz))
+                        .as_deref()
+                        .unwrap_or("-"),
+                    last.map(|t| timestamp::format_rfc3339(t, &tz))
+                        .as_deref()
+                        .unwrap_or("-"),
+                    t0.elapsed().as_secs_f64(),
+                );
+                if let Some(t) = first {
+                    overall_first = Some(overall_first.map_or(t, |cur| cur.min(t)));
+                }
+                if let Some(t) = last {
+                    overall_last = Some(overall_last.map_or(t, |cur| cur.max(t)));
+                }
             }
-            if let Some(t) = last {
-                overall_last = Some(overall_last.map_or(t, |cur| cur.max(t)));
+            match (overall_first, overall_last) {
+                (Some(a), Some(b)) => writeln!(
+                    output,
+                    "{} .. {}  ({})",
+                    timestamp::format_rfc3339(a, &tz),
+                    timestamp::format_rfc3339(b, &tz),
+                    timestamp::format_duration(b - a),
+                )?,
+                _ => writeln!(output, "no parseable timestamps in file")?,
             }
+            output.flush()?;
         }
-        match (overall_first, overall_last) {
-            (Some(a), Some(b)) => writeln!(
-                output,
-                "{} .. {}  ({})",
-                timestamp::format_rfc3339(a, &tz),
-                timestamp::format_rfc3339(b, &tz),
-                timestamp::format_duration(b - a),
-            )?,
-            _ => writeln!(output, "no parseable timestamps in file")?,
-        }
-        output.flush()?;
-        return Ok(());
-    }
 
-    // Resolve `--from`/`--to` once against the union of all files' time
-    // windows. Symbolic anchors (`start`, `end`, `start+1h`, etc.) refer to
-    // the *global* span, not each file's local one — so with two log files
-    // around a rotation, `--from start+1h --to start+2h` is one contiguous
-    // absolute window applied across both files, not two disjoint slices.
-    let need_global = cli.from.is_some() || cli.to.is_some() || cli.n_buckets.is_some();
-    let (global_first, global_last) = if need_global {
-        peek_global_window(&cli.files)?
-    } else {
-        (None, None)
-    };
-    let mut tf = TimeFilter::default();
-    if let Some(s) = cli.from.as_deref() {
-        tf.from = Some(timestamp::resolve_bound(
-            s,
-            global_first,
-            global_last,
-            global_first,
-        )?);
-    }
-    if let Some(s) = cli.to.as_deref() {
-        tf.to = Some(timestamp::resolve_bound(
-            s,
-            global_first,
-            global_last,
-            global_last,
-        )?);
-    }
-
-    // Resolve the bucket spec now that the time window is known. Two forms:
-    // - `--bucket=DURATION`: epoch-aligned grid (origin = 0).
-    // - `--n-buckets=N`: divide the *active* window into N equal-width slices
-    //   aligned to the window start, so the output has exactly N rows per
-    //   group (no edge-alignment off-by-one).
-    let bucket = resolve_bucket_spec(cli, &tf, global_first, global_last)?;
-
-    let mut sinks = make_sinks(
-        cli,
-        sampler.clone(),
-        suppress_lines,
-        line_mode,
-        bucket,
-        tz.clone(),
-        line_transform.clone(),
-    );
-    // Master streams under follow or when stdin (`-`) is in the file list;
-    // workers always batch (their output would interleave on the shared
-    // writer otherwise) and merge into the master.
-    if cli.bucket.is_some() && (following || has_stdin) {
-        let grace = (cli.window_secs as i64).saturating_mul(1_000_000_000);
-        sinks.enable_streaming(grace);
-    }
-
-    // Phase 1: bisect every file up front against the resolved absolute
-    // window. Output is suppressed during planning — only summaries and
-    // matched lines are written, in file order, in phase 2.
-    let last_idx = cli.files.len() - 1;
-    // `tail -F`-style start-at-EOF only applies to the classic single-file
-    // case. With multiple files (e.g. `foo.log.1 foo.log -F`), the last
-    // file is read fully — completing the rotated → current → tail story.
-    let single_file = cli.files.len() == 1;
-    let plans: Vec<FilePlan<'_>> = cli
-        .files
-        .iter()
-        .enumerate()
-        .map(|(i, path)| {
-            let last = i == last_idx;
-            plan_file(path, cli, tf, following && last, following && last && single_file)
-        })
-        .collect::<anyhow::Result<_>>()?;
-
-    // Phase 2: stream each planned range in order. Only the last file may
-    // attach the follow loop (set during planning).
-    let n_workers = resolve_parallelism(cli);
-    for plan in plans {
-        if interrupted() || sinks.done() {
-            break;
-        }
-        if n_workers > 1 && !plan.follow_this_file && !is_stdin_path(plan.path) {
-            crate::parallel::run(crate::parallel::Job {
-                path: plan.path,
-                start_byte: plan.start_byte,
-                max_bytes: plan.max_bytes,
-                tf: plan.tf,
-                n_workers,
+        ExecutionMode::StdinOnly { bucket } => {
+            // stdin can't follow (rejected earlier), but `--bucket` still
+            // enables streaming output: the per-line `flush_closed` hook in
+            // `process_line` emits closed buckets in time order as we go,
+            // without any seek (pipes can't seek). At EOF, `emit_summaries`
+            // calls `flush_remaining` for the still-open buckets.
+            let mut sinks = make_sinks(
                 cli,
-                filter: &filter,
-                sampler: sampler.clone(),
+                sampler.clone(),
                 suppress_lines,
                 line_mode,
                 bucket,
-                tz: tz.clone(),
-                output: &mut *output,
-                master: &mut sinks,
-                line_transform: line_transform.clone(),
-            })?;
+                tz.clone(),
+            );
+            if bucket.is_some() {
+                sinks.enable_streaming(cli.window_nanos());
+            }
+            let tf_default = TimeFilter::default();
+            let mut pipeline =
+                Pipeline::new(&filter, &tf_default, &mut sinks, &add_view, &remove_view);
+            stream_unbounded(&mut std::io::stdin().lock(), &mut pipeline, &mut output)?;
             output.flush()?;
-        } else {
-            stream_plan(plan, cli, &filter, &mut output, &mut sinks)?;
+            flush_sort_buf(&mut sinks, &mut output)?;
+            emit_summaries(&sinks, bare_count, &tz, &mut output)?;
+        }
+
+        ExecutionMode::Files {
+            plans,
+            bucket,
+            has_stdin,
+        } => {
+            let mut sinks = make_sinks(
+                cli,
+                sampler.clone(),
+                suppress_lines,
+                line_mode,
+                bucket,
+                tz.clone(),
+            );
+            // Master streams under follow or when stdin (`-`) is in the file list;
+            // workers always batch (their output would interleave on the shared
+            // writer otherwise) and merge into the master.
+            if cli.bucket.is_some() && (following || has_stdin) {
+                sinks.enable_streaming(cli.window_nanos());
+            }
+
+            // Phase 2: stream each planned range in order. Only the last file
+            // may attach the follow loop (set during planning).
+            let n_workers = resolve_parallelism(cli);
+            for plan in plans {
+                if interrupted() || sinks.done() {
+                    break;
+                }
+                if n_workers > 1 && !plan.follow_this_file && !is_stdin_path(plan.path) {
+                    let plan_tf = plan.tf;
+                    let filter_ref = &filter;
+                    let sampler_ref = &sampler;
+                    let line_transform_ref = &line_transform;
+                    let tz_ref = &tz;
+                    let worker_sinks = crate::parallel::run(
+                        crate::parallel::Job {
+                            path: plan.path,
+                            start_byte: plan.start_byte,
+                            max_bytes: plan.max_bytes,
+                            n_workers,
+                        },
+                        &mut *output,
+                        |mut reader, byte_budget, sink| {
+                            let mut worker_sinks = make_sinks(
+                                cli,
+                                sampler_ref.clone(),
+                                suppress_lines,
+                                line_mode,
+                                bucket,
+                                tz_ref.clone(),
+                            );
+                            let worker_tf = line_transform_ref.clone();
+                            let (add_view, remove_view) = transform_views(worker_tf.as_ref());
+                            {
+                                let mut pipeline = Pipeline::new(
+                                    filter_ref,
+                                    &plan_tf,
+                                    &mut worker_sinks,
+                                    &add_view,
+                                    &remove_view,
+                                );
+                                stream_bounded(&mut reader, byte_budget, &mut pipeline, sink)?;
+                            }
+                            Ok(worker_sinks)
+                        },
+                    )?;
+                    for s in worker_sinks {
+                        sinks.merge(s);
+                    }
+                    output.flush()?;
+                } else {
+                    stream_plan(
+                        plan,
+                        cli,
+                        &filter,
+                        &mut output,
+                        &mut sinks,
+                        &add_view,
+                        &remove_view,
+                    )?;
+                }
+            }
+
+            output.flush()?;
+            flush_sort_buf(&mut sinks, &mut output)?;
+            emit_summaries(&sinks, bare_count, &tz, &mut output)?;
         }
     }
-
-    output.flush()?;
-    flush_sort_buf(&mut sinks, &mut output)?;
-    emit_summaries(&sinks, bare_count, &tz, &mut output)?;
 
     Ok(())
-}
-
-fn flush_sort_buf<W: Write>(sinks: &mut Sinks, out: &mut W) -> std::io::Result<()> {
-    if let Some(sort_buf) = sinks.sort_buf.take() {
-        sort_buf.emit(out)?;
-        out.flush()?;
-    }
-    Ok(())
-}
-
-/// Resolved per-file plan produced by phase 1: a byte slice (start, len),
-/// the strict time-filter to apply on top of it, and whether this file
-/// should be followed after EOF. The file is reopened in phase 2 so phase 1
-/// doesn't hold N file descriptors simultaneously.
-struct FilePlan<'a> {
-    path: &'a Path,
-    start_byte: u64,
-    /// `end_byte - start_byte`. Phase 2 reads exactly this many bytes.
-    max_bytes: u64,
-    tf: TimeFilter,
-    follow_this_file: bool,
-}
-
-/// Compute the union span across all real files (min of per-file first
-/// timestamps, max of per-file lasts) used as the anchor for symbolic
-/// `--from`/`--to` bounds. One head + one tail seek per file. Stdin (`-`)
-/// entries are skipped — pipes can't be peeked at both ends.
-fn peek_global_window(
-    files: &[std::path::PathBuf],
-) -> anyhow::Result<(Option<Timestamp>, Option<Timestamp>)> {
-    let mut first: Option<Timestamp> = None;
-    let mut last: Option<Timestamp> = None;
-    for path in files {
-        if is_stdin_path(path) {
-            continue;
-        }
-        let mut file = File::open(path)?;
-        if let Some(t) = bisect::peek_first_timestamp(&mut file)? {
-            first = Some(first.map_or(t, |cur| cur.min(t)));
-        }
-        if let Some(t) = bisect::peek_last_timestamp(&mut file)? {
-            last = Some(last.map_or(t, |cur| cur.max(t)));
-        }
-    }
-    Ok((first, last))
-}
-
-/// Phase 1: open `path`, bisect to the absolute byte slice corresponding to
-/// `tf`, and return the resolved range. The file is dropped on return so
-/// phase 1 doesn't pin a file descriptor; phase 2 reopens it. Independent
-/// across files (so it parallelizes cleanly).
-fn plan_file<'a>(
-    path: &'a Path,
-    cli: &Cli,
-    tf: TimeFilter,
-    follow_this_file: bool,
-    tail_from_eof: bool,
-) -> anyhow::Result<FilePlan<'a>> {
-    // Stdin can't be bisected; phase 2 detects `-` and streams unbounded
-    // with the time filter applied per-line.
-    if is_stdin_path(path) {
-        return Ok(FilePlan {
-            path,
-            start_byte: 0,
-            max_bytes: 0,
-            tf,
-            follow_this_file: false,
-        });
-    }
-    let mut file = File::open(path)?;
-    let file_len = file.seek(SeekFrom::End(0))?;
-    let window = (cli.window_secs as i64).saturating_mul(1_000_000_000);
-
-    let t_bisect = Instant::now();
-    let start_byte: u64 = match tf.from {
-        Some(t1) => bisect::bisect(&mut file, t1, window, Side::Lower)?,
-        None if tail_from_eof => file_len, // `tail -F`-style start at EOF
-        None => 0,
-    };
-    let end_byte: u64 = match tf.to {
-        Some(t2) if !follow_this_file => bisect::bisect(&mut file, t2, window, Side::Upper)?,
-        _ => file_len,
-    };
-
-    if cli.from.is_some() || cli.to.is_some() {
-        log::info!(
-            "bisect {}: [{}, {}] window={}s -> bytes [{start_byte}, {end_byte}) ({}) in {:.3}s",
-            path.display(),
-            cli.from.as_deref().unwrap_or("-"),
-            cli.to.as_deref().unwrap_or("-"),
-            cli.window_secs,
-            humanize_bytes_binary!(end_byte.saturating_sub(start_byte)),
-            t_bisect.elapsed().as_secs_f64()
-        );
-    }
-
-    Ok(FilePlan {
-        path,
-        start_byte,
-        max_bytes: end_byte.saturating_sub(start_byte),
-        tf,
-        follow_this_file,
-    })
 }
 
 /// Phase 2: open `plan.path`, seek to the planned start, stream the bounded
@@ -991,6 +480,8 @@ fn stream_plan<W: Write>(
     filter: &Filter,
     output: &mut W,
     sinks: &mut Sinks,
+    add_pairs: &[(&str, &str)],
+    remove_keys: &[&str],
 ) -> anyhow::Result<()> {
     let FilePlan {
         path,
@@ -1003,7 +494,8 @@ fn stream_plan<W: Write>(
     if is_stdin_path(path) {
         // No bisect, no follow loop. Per-line `tf` still applies (resolved
         // against the real files' span by the caller).
-        return stream_unbounded(&mut std::io::stdin().lock(), filter, &tf, output, sinks);
+        let mut pipeline = Pipeline::new(filter, &tf, sinks, add_pairs, remove_keys);
+        return stream_unbounded(&mut std::io::stdin().lock(), &mut pipeline, output);
     }
 
     let mut file = File::open(path)?;
@@ -1018,157 +510,35 @@ fn stream_plan<W: Write>(
     } else {
         None
     };
-    let mut reader = BufReader::new(file);
+    let mut reader = BufReader::with_capacity(STREAM_BUF_CAP, file);
 
-    stream_bounded(&mut reader, max_bytes, filter, &tf, output, sinks)?;
+    let mut pipeline = Pipeline::new(filter, &tf, sinks, add_pairs, remove_keys);
+    stream_bounded(&mut reader, max_bytes, &mut pipeline, output)?;
     output.flush()?;
 
     if let Some(handle) = file_for_reopen {
+        // Re-borrow check: the original `sinks.done()` call after stream_bounded
+        // is gated through the pipeline's borrow. End the borrow so we can
+        // re-check `sinks.done()` and build a fresh pipeline for the follow loop.
+        let _ = pipeline;
         if !interrupted() && !sinks.done() {
+            // Follow mode ignores the per-file `tf` (newly arrived lines have
+            // no resolved time bound), matching the previous behavior where
+            // `follow_loop` passed `TimeFilter::default()`.
+            let tf_follow = TimeFilter::default();
+            let mut pipeline = Pipeline::new(filter, &tf_follow, sinks, add_pairs, remove_keys);
             follow_loop(
                 path,
                 handle,
                 reader,
                 cli.follow_reopen,
-                filter,
+                &mut pipeline,
                 output,
-                sinks,
             )?;
         }
     }
 
     Ok(())
-}
-
-fn emit_summaries<W: Write>(
-    sinks: &Sinks,
-    count_only: bool,
-    tz: &jiff::tz::TimeZone,
-    output: &mut W,
-) -> anyhow::Result<()> {
-    sinks.stats.report();
-    let json = sinks.counter.output_json;
-    if sinks.counter.streaming {
-        sinks.counter.flush_remaining(output, tz)?;
-    } else {
-        sinks.counter.report(output, tz)?;
-    }
-    sinks.keys.report(output, json)?;
-    sinks.values.report(output, json)?;
-    if count_only {
-        if json {
-            output::write_count_json(output, sinks.stats.matched_lines as u64)?;
-        } else {
-            writeln!(output, "{}", sinks.stats.matched_lines)?;
-        }
-    }
-    output.flush()?;
-    Ok(())
-}
-
-struct Stats {
-    bytes: usize,
-    matched_lines: usize,
-    total_lines: usize,
-    invalid_utf: usize,
-    pairs: usize,
-    overflow: usize,
-    started: Instant,
-}
-
-impl Default for Stats {
-    fn default() -> Self {
-        Self {
-            bytes: 0,
-            matched_lines: 0,
-            total_lines: 0,
-            invalid_utf: 0,
-            pairs: 0,
-            overflow: 0,
-            started: Instant::now(),
-        }
-    }
-}
-
-impl Stats {
-    fn merge(&mut self, other: Self) {
-        self.bytes += other.bytes;
-        self.matched_lines += other.matched_lines;
-        self.total_lines += other.total_lines;
-        self.invalid_utf += other.invalid_utf;
-        self.pairs += other.pairs;
-        self.overflow += other.overflow;
-        // `started` stays as the master's earliest start time.
-    }
-
-    fn report(&self) {
-        let elapsed = self.started.elapsed().as_secs_f64();
-        let rate = if elapsed > 0.0 {
-            (self.bytes as f64 / elapsed) as u64
-        } else {
-            0
-        };
-        log::info!(
-            "{} read in {:.3}s, {}/{} lines matched ({} invalid utf8), {} pairs ({} overflow), {}/s",
-            humanize_bytes_binary!(self.bytes),
-            elapsed,
-            self.matched_lines,
-            self.total_lines,
-            self.invalid_utf,
-            self.pairs,
-            self.overflow,
-            humanize_bytes_binary!(rate),
-        );
-    }
-}
-
-/// Bundles per-line bookkeeping (stats + summarisers) so the streaming
-/// helpers don't drown in arguments.
-pub(crate) struct Sinks {
-    stats: Stats,
-    counter: Counter,
-    keys: KeyGather,
-    values: ValueGather,
-    raw: RawExtractor,
-    sampler: Option<Sampler>,
-    sort_buf: Option<SortBuffer>,
-    suppress_lines: bool,
-    /// Picks the line emitter (passthrough / json / colored / plain).
-    line_mode: LineMode,
-    limit: Option<usize>,
-    /// Display timezone, used by the streaming bucket flush to format
-    /// `bucket.start` / `bucket.end` / `time.start` / `time.end` on the fly.
-    tz: jiff::tz::TimeZone,
-    /// When set, `--rm` / `--add` mutate emitted lines (not used for `--if`).
-    transform: Option<LineTransform>,
-    emit_scratch: EmitScratch,
-}
-
-impl Sinks {
-    #[inline]
-    fn done(&self) -> bool {
-        matches!(self.limit, Some(n) if self.stats.matched_lines >= n)
-    }
-
-    /// Activate streaming bucket emission on the underlying counter. Should
-    /// only be called on the *master* `Sinks` in follow mode — workers must
-    /// stay batched so their output can't interleave on the shared writer.
-    pub(crate) fn enable_streaming(&mut self, close_grace_nanos: i64) {
-        self.counter.enable_streaming(close_grace_nanos);
-    }
-
-    /// Fold per-worker collected state into `self`. `started` and the
-    /// configuration fields (`suppress_lines`, `colorize`, `limit`, ...)
-    /// are kept from `self`.
-    pub(crate) fn merge(&mut self, other: Self) {
-        self.stats.merge(other.stats);
-        self.counter.merge(other.counter);
-        self.keys.merge(other.keys);
-        self.values.merge(other.values);
-        if let (Some(a), Some(b)) = (self.sort_buf.as_mut(), other.sort_buf) {
-            a.merge(b);
-        }
-    }
 }
 
 /// Resolve `--parallel` to a worker count. `None` → 1 (sequential).
@@ -1184,324 +554,164 @@ pub(crate) fn resolve_parallelism(cli: &Cli) -> usize {
     }
 }
 
-/// Parse the sampler config out of `--sample-rate` / `--sample-if`. Done
-/// once up front so workers can clone it cheaply (the inner `Filter` is
-/// shared via `Arc`).
-fn build_sampler(cli: &Cli) -> anyhow::Result<Option<Sampler>> {
-    match (cli.sample_rate, cli.sample_if.as_deref()) {
-        (None, Some(_)) => anyhow::bail!("--sample-if requires --sample-rate"),
-        (None, None) => Ok(None),
-        (Some(rate), _) if !(0.0..=1.0).contains(&rate) => {
-            anyhow::bail!("--sample-rate must be in [0, 1], got {rate}")
-        }
-        (Some(rate), sample_if) => Ok(Some(Sampler {
-            rate,
-            sample_if: sample_if.map(Filter::parse_one).transpose()?.map(Arc::new),
-        })),
-    }
-}
+/// BufReader capacity for streaming reads. 128 KB is the sweet spot from a
+/// sweep on `foo.log` (2.8 GB): 8 KB is clearly bad, 32 KB recovers most of
+/// it, 128 KB wins marginally on aggregate/parallel modes, sizes above are
+/// noise. Big enough to fit pathologically long log lines without spilling
+/// into the carryover `tail`.
+pub(crate) const STREAM_BUF_CAP: usize = 128 * 1024;
 
-/// Compute the bucket spec from `--bucket` / `--n-buckets`. Caller has
-/// already resolved `tf`; `global_first`/`global_last` are the file-side
-/// bounds returned by `peek_global_window` (or `None` if it wasn't run).
-/// Returns `None` when neither flag is set. Errors when `--n-buckets`
-/// cannot be sized (no resolvable window) or the resulting width is zero.
-fn resolve_bucket_spec(
-    cli: &Cli,
-    tf: &TimeFilter,
-    global_first: Option<Timestamp>,
-    global_last: Option<Timestamp>,
-) -> anyhow::Result<Option<BucketSpec>> {
-    if let Some(s) = cli.bucket.as_deref() {
-        let nanos = timestamp::parse_duration_nanos(s)?;
-        return Ok(Some(BucketSpec {
-            nanos,
-            origin: 0,
-            n_buckets: None,
-        }));
-    }
-    if let Some(n) = cli.n_buckets {
-        if n == 0 {
-            anyhow::bail!("--n-buckets must be > 0");
-        }
-        let start = tf.from.or(global_first).ok_or_else(|| {
-            anyhow::anyhow!(
-                "--n-buckets needs a window start: pass --from, or use a file with parseable timestamps"
-            )
-        })?;
-        let end = tf.to.or(global_last).ok_or_else(|| {
-            anyhow::anyhow!(
-                "--n-buckets needs a window end: pass --to, or use a file with parseable timestamps"
-            )
-        })?;
-        let span = end - start;
-        if span <= 0 {
-            anyhow::bail!("--n-buckets: time range is empty (end <= start)");
-        }
-        let nanos = span / n as i64;
-        if nanos == 0 {
-            anyhow::bail!("--n-buckets={n}: span {span}ns is too small to split into {n} buckets");
-        }
-        return Ok(Some(BucketSpec {
-            nanos,
-            origin: start,
-            n_buckets: Some(n),
-        }));
-    }
-    Ok(None)
-}
-
-/// Construct a fresh `Sinks` for the master or a worker. Configuration
-/// fields are derived from `cli`; the `sampler` template is cloned in (its
-/// inner `Arc<Filter>` is shared, so cloning is cheap). All collected
-/// state (counts, gathers, sort buffer) starts empty.
-pub(crate) fn make_sinks(
-    cli: &Cli,
-    sampler: Option<Sampler>,
-    suppress_lines: bool,
-    line_mode: LineMode,
-    bucket: Option<BucketSpec>,
-    tz: jiff::tz::TimeZone,
-    transform: Option<LineTransform>,
-) -> Sinks {
-    let counter = Counter::new(
-        cli.group_by.iter().map(SmartString::from).collect(),
-        bucket,
-        matches!(line_mode, LineMode::Json),
-    );
-    Sinks {
-        stats: Stats::default(),
-        counter,
-        keys: KeyGather::new(cli.list_keys),
-        values: ValueGather::new(cli.list_values_for.iter().map(SmartString::from).collect()),
-        raw: RawExtractor::new(cli.raw_key.as_deref()),
-        sampler,
-        sort_buf: cli.sort_by.as_deref().map(SortBuffer::new),
-        suppress_lines,
-        line_mode,
-        limit: cli.limit,
-        tz,
-        transform,
-        emit_scratch: EmitScratch::default(),
-    }
+/// Run the per-chunk `Counter::flush_closed`. Borrow-split so the call site
+/// in the streaming loop doesn't have to.
+#[inline]
+fn flush_closed_chunk<W: Write + ?Sized>(
+    pipeline: &mut Pipeline<'_>,
+    output: &mut W,
+) -> std::io::Result<()> {
+    let json = matches!(pipeline.sinks.line_mode, LineMode::Json);
+    let sinks = &mut *pipeline.sinks;
+    sinks.counter.flush_closed(output, &sinks.tz, json)
 }
 
 /// Read a fixed byte budget from `reader`, write matching lines to `output`.
+///
+/// Uses `fill_buf` + `memchr::memchr_iter` so newline scanning is one SIMD
+/// pass per chunk and per-line bookkeeping (interrupt + `sinks.done`) only
+/// runs at chunk granularity, except for the `--limit` `done` check which
+/// still fires per matched line to stop mid-chunk.
 pub(crate) fn stream_bounded<R: BufRead, W: Write + ?Sized>(
     reader: &mut R,
     max_bytes: u64,
-    filter: &Filter,
-    tf: &TimeFilter,
+    pipeline: &mut Pipeline<'_>,
     output: &mut W,
-    sinks: &mut Sinks,
 ) -> anyhow::Result<()> {
-    let mut line_buf = Vec::new();
+    let mut tail: Vec<u8> = Vec::new();
     let mut total_read: u64 = 0;
 
-    while total_read < max_bytes && !interrupted() {
-        let n = reader.read_until(b'\n', &mut line_buf)?;
-        if n == 0 {
+    'outer: while total_read < max_bytes && !interrupted() {
+        let chunk = reader.fill_buf()?;
+        if chunk.is_empty() {
             break;
         }
-        total_read += n as u64;
-        process_line(&mut line_buf, filter, tf, output, sinks, n)?;
-        if sinks.done() {
-            break;
+        let remaining = (max_bytes - total_read) as usize;
+        let usable_len = chunk.len().min(remaining);
+        let usable = &chunk[..usable_len];
+
+        let mut start = 0;
+        let mut hit_limit_at: Option<usize> = None;
+        for nl in memchr::memchr_iter(b'\n', usable) {
+            if tail.is_empty() {
+                pipeline.process_line(&usable[start..=nl], output)?;
+            } else {
+                tail.extend_from_slice(&usable[start..=nl]);
+                pipeline.process_line(&tail, output)?;
+                tail.clear();
+            }
+            start = nl + 1;
+            if pipeline.sinks.done() {
+                hit_limit_at = Some(nl + 1);
+                break;
+            }
         }
+        if let Some(consumed) = hit_limit_at {
+            reader.consume(consumed);
+            // Final per-chunk flush for buckets that may have just closed.
+            flush_closed_chunk(pipeline, output)?;
+            break 'outer;
+        }
+        if start < usable_len {
+            tail.extend_from_slice(&usable[start..usable_len]);
+        }
+        reader.consume(usable_len);
+        total_read += usable_len as u64;
+        // Per-chunk streaming-bucket flush: no-op when streaming is off
+        // (the common case), real work only when `-f`/`-F` + `--bucket`.
+        flush_closed_chunk(pipeline, output)?;
+    }
+    // Trailing partial line at EOF (no newline). Process it if anything's there.
+    if !tail.is_empty() && !pipeline.sinks.done() {
+        pipeline.process_line(&tail, output)?;
+        flush_closed_chunk(pipeline, output)?;
     }
     Ok(())
 }
 
 /// Read until EOF (e.g. stdin), write matching lines to `output`.
-/// Flushes after every line so interactive pipelines (`tail -f | riplog`)
-/// don't stall in the output BufWriter.
 fn stream_unbounded<R: Read, W: Write>(
     reader: &mut R,
-    filter: &Filter,
-    tf: &TimeFilter,
+    pipeline: &mut Pipeline<'_>,
     output: &mut W,
-    sinks: &mut Sinks,
 ) -> anyhow::Result<()> {
-    let mut reader = BufReader::new(reader);
-    let mut line_buf = Vec::new();
+    let mut reader = BufReader::with_capacity(STREAM_BUF_CAP, reader);
+    let mut tail: Vec<u8> = Vec::new();
 
-    while !interrupted() {
-        let n = reader.read_until(b'\n', &mut line_buf)?;
-        if n == 0 {
+    // Per-chunk flush instead of per-line: interactive `tail -f | riplog`
+    // accepts batch-latency (bounded by chunk size ~64 KB) for higher
+    // throughput. If a user reports lag on interactive pipes, gate this on
+    // `stdout().is_terminal()` and revert to per-line flush in that case.
+    'outer: while !interrupted() {
+        let chunk = reader.fill_buf()?;
+        if chunk.is_empty() {
             break;
         }
-        process_line(&mut line_buf, filter, tf, output, sinks, n)?;
+        let usable_len = chunk.len();
+        let usable = &chunk[..usable_len];
+
+        let mut start = 0;
+        let mut hit_limit_at: Option<usize> = None;
+        for nl in memchr::memchr_iter(b'\n', usable) {
+            if tail.is_empty() {
+                pipeline.process_line(&usable[start..=nl], output)?;
+            } else {
+                tail.extend_from_slice(&usable[start..=nl]);
+                pipeline.process_line(&tail, output)?;
+                tail.clear();
+            }
+            start = nl + 1;
+            if pipeline.sinks.done() {
+                hit_limit_at = Some(nl + 1);
+                break;
+            }
+        }
+        if let Some(consumed) = hit_limit_at {
+            reader.consume(consumed);
+            flush_closed_chunk(pipeline, output)?;
+            output.flush()?;
+            break 'outer;
+        }
+        if start < usable_len {
+            tail.extend_from_slice(&usable[start..usable_len]);
+        }
+        reader.consume(usable_len);
+        flush_closed_chunk(pipeline, output)?;
         output.flush()?;
-        if sinks.done() {
-            break;
-        }
+    }
+    if !tail.is_empty() && !pipeline.sinks.done() {
+        pipeline.process_line(&tail, output)?;
+        flush_closed_chunk(pipeline, output)?;
+        output.flush()?;
     }
     Ok(())
 }
 
-fn process_line<W: Write + ?Sized>(
-    line_buf: &mut Vec<u8>,
-    filter: &Filter,
-    tf: &TimeFilter,
-    output: &mut W,
-    sinks: &mut Sinks,
-    n_bytes: usize,
-) -> anyhow::Result<()> {
-    // Preserve the original bytes for output; trim a trailing newline for parsing.
-    let raw_len = line_buf.len();
-    let mut parse_end = raw_len;
-    while parse_end > 0 && matches!(line_buf[parse_end - 1], b'\n' | b'\r') {
-        parse_end -= 1;
-    }
-
-    sinks.stats.bytes += n_bytes;
-    sinks.stats.total_lines += 1;
-
-    let parse_slice = &line_buf[..parse_end];
-    let line_str = match std::str::from_utf8(parse_slice) {
-        Ok(s) => s,
-        Err(_) => {
-            sinks.stats.invalid_utf += 1;
-            line_buf.clear();
-            return Ok(());
-        }
-    };
-
-    let mut pairs = logfmt::PairsBuffer::<256>::new();
-    let (parsed, overflow) = pairs.parse(line_str);
-
-    // Extract the timestamp at most once per line, only when something
-    // downstream actually needs it (time-window filter or grouping counter).
-    let ts = if !tf.is_empty() || sinks.counter.is_active() {
-        timestamp::extract_timestamp(parsed)
-    } else {
-        None
-    };
-
-    let matched = tf.check(ts)
-        && (filter.is_empty() || filter.matches(parsed))
-        && sinks.sampler.as_ref().is_none_or(|s| s.keep(parsed));
-
-    sinks.stats.pairs += parsed.len();
-    sinks.stats.overflow += overflow as usize;
-    if matched {
-        sinks.stats.matched_lines += 1;
-        sinks.counter.record(parsed, ts);
-        // Streaming mode (`-f`/`-F` + `--bucket`): emit any buckets that
-        // have passed the close threshold. Cheap when nothing is closeable;
-        // a no-op when streaming is off.
-        sinks.counter.flush_closed(output, &sinks.tz)?;
-        sinks.keys.record(parsed);
-        sinks.values.record(parsed);
-        let line_tf = sinks.transform.as_ref();
-        if let Some(sort_buf) = sinks.sort_buf.as_mut() {
-            // Aggregation modes without --raw-key produce no per-line bytes;
-            // skip the capture in that case (counters above already recorded).
-            if !sinks.suppress_lines || sinks.raw.raw_key.is_some() {
-                let raw = &mut sinks.raw;
-                let scratch = &mut sinks.emit_scratch;
-                let suppress = sinks.suppress_lines;
-                let mode = sinks.line_mode;
-                sort_buf.capture(parsed, |w| {
-                    emit_match(
-                        parsed, line_buf, raw_len, parse_end, raw, suppress, mode, line_tf,
-                        scratch, w,
-                    )
-                })?;
-            }
-        } else {
-            emit_match(
-                parsed,
-                line_buf,
-                raw_len,
-                parse_end,
-                &mut sinks.raw,
-                sinks.suppress_lines,
-                sinks.line_mode,
-                line_tf,
-                &mut sinks.emit_scratch,
-                output,
-            )?;
-        }
-    }
-    line_buf.clear();
-    Ok(())
-}
-
-#[inline]
-fn append_reconstructed_plain_tail(
-    buf: &mut Vec<u8>,
-    line_buf: &[u8],
-    raw_len: usize,
-    parse_end: usize,
-) {
-    if raw_len == parse_end {
-        buf.push(b'\n');
-    } else {
-        buf.extend_from_slice(&line_buf[parse_end..raw_len]);
-    }
-}
-
-/// Emit one matched line to `out`: the `--raw-key` extraction (if any),
-/// followed by the full line in the configured `LineMode` unless line output
-/// is suppressed by an aggregation/raw-key mode.
-#[allow(clippy::too_many_arguments)]
-fn emit_match<W: Write + ?Sized>(
-    parsed: &[(&str, &str)],
-    line_buf: &[u8],
-    raw_len: usize,
-    parse_end: usize,
-    raw: &mut RawExtractor,
-    suppress_lines: bool,
-    mode: LineMode,
-    transform: Option<&LineTransform>,
-    scratch: &mut EmitScratch,
-    out: &mut W,
-) -> std::io::Result<()> {
-    raw.emit(parsed, out)?;
-
-    if suppress_lines {
-        return Ok(());
-    }
-
-    match mode {
-        LineMode::Passthrough => {
-            out.write_all(line_buf)?;
-            if raw_len == parse_end {
-                out.write_all(b"\n")?;
-            }
-            Ok(())
-        }
-        LineMode::Json => output::write_json_line(out, parsed, transform, &mut scratch.str_buf),
-        LineMode::Colored => scratch.write_slow(out, |buf| {
-            output::write_colored_line(buf, parsed, transform)
-        }),
-        LineMode::Plain => scratch.write_slow(out, |buf| {
-            output::write_plain_reconstructed(buf, parsed, transform)?;
-            append_reconstructed_plain_tail(buf, line_buf, raw_len, parse_end);
-            Ok(())
-        }),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
 fn follow_loop<W: Write>(
     path: &Path,
     mut handle: File,
     mut reader: BufReader<File>,
     reopen: bool,
-    filter: &Filter,
+    pipeline: &mut Pipeline<'_>,
     output: &mut W,
-    sinks: &mut Sinks,
 ) -> anyhow::Result<()> {
-    let mut line_buf = Vec::new();
     let mut pos = reader.stream_position()?;
+    let mut tail: Vec<u8> = Vec::new();
 
     while !interrupted() {
-        let n = reader.read_until(b'\n', &mut line_buf)?;
-        if n == 0 {
+        let chunk = reader.fill_buf()?;
+        if chunk.is_empty() {
+            // No bytes available right now. If we have a buffered partial line,
+            // just wait — don't process it yet (more bytes may complete it).
             output.flush()?;
-            if reopen {
+            if tail.is_empty() && reopen {
                 if let Some((new_handle, new_reader)) = check_rotation(path, &handle, pos)? {
                     log::info!(
                         "follow: file rotated/truncated; reopening {}",
@@ -1510,30 +720,42 @@ fn follow_loop<W: Write>(
                     handle = new_handle;
                     reader = new_reader;
                     pos = 0;
-                    line_buf.clear();
                     continue;
                 }
             }
             std::thread::sleep(FOLLOW_POLL);
             continue;
         }
-        if !line_buf.ends_with(b"\n") {
-            // Partial line — wait for the rest.
-            std::thread::sleep(FOLLOW_POLL);
-            continue;
+        let usable_len = chunk.len();
+        let usable = &chunk[..usable_len];
+
+        let mut start = 0;
+        let mut hit_limit_at: Option<usize> = None;
+        for nl in memchr::memchr_iter(b'\n', usable) {
+            if tail.is_empty() {
+                pipeline.process_line(&usable[start..=nl], output)?;
+            } else {
+                tail.extend_from_slice(&usable[start..=nl]);
+                pipeline.process_line(&tail, output)?;
+                tail.clear();
+            }
+            start = nl + 1;
+            if pipeline.sinks.done() {
+                hit_limit_at = Some(nl + 1);
+                break;
+            }
         }
-        pos += n as u64;
-        process_line(
-            &mut line_buf,
-            filter,
-            &TimeFilter::default(),
-            output,
-            sinks,
-            n,
-        )?;
-        if sinks.done() {
+        if let Some(consumed) = hit_limit_at {
+            reader.consume(consumed);
+            flush_closed_chunk(pipeline, output)?;
             break;
         }
+        if start < usable_len {
+            tail.extend_from_slice(&usable[start..usable_len]);
+        }
+        reader.consume(usable_len);
+        pos += usable_len as u64;
+        flush_closed_chunk(pipeline, output)?;
     }
     Ok(())
 }
