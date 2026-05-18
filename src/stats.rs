@@ -180,25 +180,25 @@ impl Stats {
 /// optional bare `--count` number. Pulled out so the `run::run`
 /// happy-path doesn't have to thread `bare_count` through everywhere.
 pub(crate) fn emit_summaries<W: Write>(
-    sinks: &crate::sinks::Sinks,
+    recorders: &crate::sinks::Recorders,
+    cfg: &crate::sinks::RunConfig<'_>,
     count_only: bool,
-    tz: &jiff::tz::TimeZone,
     output: &mut W,
 ) -> anyhow::Result<()> {
-    sinks.stats.report();
-    let json = matches!(sinks.line_mode, crate::sinks::LineMode::Json);
-    if sinks.counter.streaming {
-        sinks.counter.flush_remaining(output, tz, json)?;
+    recorders.stats.report();
+    let json = matches!(cfg.line_mode, crate::sinks::LineMode::Json);
+    if recorders.counter.streaming {
+        recorders.counter.flush_remaining(output, &cfg.tz, json)?;
     } else {
-        sinks.counter.report(output, tz, json)?;
+        recorders.counter.report(output, &cfg.tz, json)?;
     }
-    sinks.keys.report(output, json)?;
-    sinks.values.report(output, json)?;
+    recorders.keys.report(output, json)?;
+    recorders.values.report(output, json)?;
     if count_only {
         if json {
-            crate::json::write_count_json(output, sinks.stats.matched_lines as u64)?;
+            crate::json::write_count_json(output, recorders.stats.matched_lines as u64)?;
         } else {
-            writeln!(output, "{}", sinks.stats.matched_lines)?;
+            writeln!(output, "{}", recorders.stats.matched_lines)?;
         }
     }
     output.flush()?;

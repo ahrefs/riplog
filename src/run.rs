@@ -17,7 +17,7 @@ use crate::filter::Filter;
 use crate::pipeline::Pipeline;
 use crate::sampler::build_sampler;
 use crate::signal_handling::{install_signal_handler, interrupted};
-use crate::sinks::{flush_sort_buf, make_sinks, LineMode, Sinks};
+use crate::sinks::{LineEmitter, LineMode, Recorders, RunConfig};
 use crate::stats::emit_summaries;
 use crate::time_bisect;
 use crate::timestamp::{self, Timestamp};
@@ -360,24 +360,27 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
             // `process_line` emits closed buckets in time order as we go,
             // without any seek (pipes can't seek). At EOF, `emit_summaries`
             // calls `flush_remaining` for the still-open buckets.
-            let mut sinks = make_sinks(
-                cli,
-                sampler.clone(),
-                suppress_lines,
+            let cfg = RunConfig {
                 line_mode,
-                bucket,
-                tz.clone(),
-            );
+                suppress_lines,
+                limit: cli.limit,
+                tz: tz.clone(),
+                sampler: sampler.clone(),
+                add_pairs: &add_view,
+                remove_keys: &remove_view,
+            };
+            let mut recorders = Recorders::new(cli, bucket);
+            let mut emitter = LineEmitter::new(cli.raw_key.as_deref(), cli.sort_by.as_deref());
             if bucket.is_some() {
-                sinks.enable_streaming(cli.window_nanos());
+                recorders.counter.enable_streaming(cli.window_nanos());
             }
             let tf_default = TimeFilter::default();
             let mut pipeline =
-                Pipeline::new(&filter, &tf_default, &mut sinks, &add_view, &remove_view);
+                Pipeline::new(&filter, &tf_default, &cfg, &mut recorders, &mut emitter);
             stream_unbounded(&mut std::io::stdin().lock(), &mut pipeline, &mut output)?;
             output.flush()?;
-            flush_sort_buf(&mut sinks, &mut output)?;
-            emit_summaries(&sinks, bare_count, &tz, &mut output)?;
+            emitter.flush_sort_buf(&mut output)?;
+            emit_summaries(&recorders, &cfg, bare_count, &mut output)?;
         }
 
         ExecutionMode::Files {
@@ -385,35 +388,37 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
             bucket,
             has_stdin,
         } => {
-            let mut sinks = make_sinks(
-                cli,
-                sampler.clone(),
-                suppress_lines,
+            let cfg = RunConfig {
                 line_mode,
-                bucket,
-                tz.clone(),
-            );
+                suppress_lines,
+                limit: cli.limit,
+                tz: tz.clone(),
+                sampler: sampler.clone(),
+                add_pairs: &add_view,
+                remove_keys: &remove_view,
+            };
+            let mut recorders = Recorders::new(cli, bucket);
+            let mut emitter = LineEmitter::new(cli.raw_key.as_deref(), cli.sort_by.as_deref());
             // Master streams under follow or when stdin (`-`) is in the file list;
             // workers always batch (their output would interleave on the shared
             // writer otherwise) and merge into the master.
             if cli.bucket.is_some() && (following || has_stdin) {
-                sinks.enable_streaming(cli.window_nanos());
+                recorders.counter.enable_streaming(cli.window_nanos());
             }
 
             // Phase 2: stream each planned range in order. Only the last file
             // may attach the follow loop (set during planning).
             let n_workers = resolve_parallelism(cli);
             for plan in plans {
-                if interrupted() || sinks.done() {
+                if interrupted() || pipeline_done(&cfg, &recorders) {
                     break;
                 }
                 if n_workers > 1 && !plan.follow_this_file && !is_stdin_path(plan.path) {
                     let plan_tf = plan.tf;
                     let filter_ref = &filter;
-                    let sampler_ref = &sampler;
                     let line_transform_ref = &line_transform;
-                    let tz_ref = &tz;
-                    let worker_sinks = crate::parallel::run(
+                    let cfg_ref = &cfg;
+                    let worker_results = crate::parallel::run(
                         crate::parallel::Job {
                             path: plan.path,
                             start_byte: plan.start_byte,
@@ -422,31 +427,40 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
                         },
                         &mut *output,
                         |mut reader, byte_budget, sink| {
-                            let mut worker_sinks = make_sinks(
-                                cli,
-                                sampler_ref.clone(),
-                                suppress_lines,
-                                line_mode,
-                                bucket,
-                                tz_ref.clone(),
-                            );
+                            let mut worker_recorders = Recorders::new(cli, bucket);
+                            let mut worker_emitter =
+                                LineEmitter::new(cli.raw_key.as_deref(), cli.sort_by.as_deref());
                             let worker_tf = line_transform_ref.clone();
                             let (add_view, remove_view) = transform_views(worker_tf.as_ref());
+                            // Workers borrow shared `cfg` for the immutable parts
+                            // (line_mode, limit, tz, sampler) but get their own
+                            // add_pairs/remove_keys views into their own clone of
+                            // the line transform.
+                            let worker_cfg = RunConfig {
+                                line_mode: cfg_ref.line_mode,
+                                suppress_lines: cfg_ref.suppress_lines,
+                                limit: cfg_ref.limit,
+                                tz: cfg_ref.tz.clone(),
+                                sampler: cfg_ref.sampler.clone(),
+                                add_pairs: &add_view,
+                                remove_keys: &remove_view,
+                            };
                             {
                                 let mut pipeline = Pipeline::new(
                                     filter_ref,
                                     &plan_tf,
-                                    &mut worker_sinks,
-                                    &add_view,
-                                    &remove_view,
+                                    &worker_cfg,
+                                    &mut worker_recorders,
+                                    &mut worker_emitter,
                                 );
                                 stream_bounded(&mut reader, byte_budget, &mut pipeline, sink)?;
                             }
-                            Ok(worker_sinks)
+                            Ok((worker_recorders, worker_emitter))
                         },
                     )?;
-                    for s in worker_sinks {
-                        sinks.merge(s);
+                    for (r, e) in worker_results {
+                        recorders.merge(r);
+                        emitter.merge_sort_buf(e.sort_buf);
                     }
                     output.flush()?;
                 } else {
@@ -455,33 +469,41 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
                         cli,
                         &filter,
                         &mut output,
-                        &mut sinks,
-                        &add_view,
-                        &remove_view,
+                        &cfg,
+                        &mut recorders,
+                        &mut emitter,
                     )?;
                 }
             }
 
             output.flush()?;
-            flush_sort_buf(&mut sinks, &mut output)?;
-            emit_summaries(&sinks, bare_count, &tz, &mut output)?;
+            emitter.flush_sort_buf(&mut output)?;
+            emit_summaries(&recorders, &cfg, bare_count, &mut output)?;
         }
     }
 
     Ok(())
 }
 
+/// `--limit` check without needing to construct a `Pipeline`. Used at the
+/// top of the per-file loop in the Files arm where the pipeline doesn't
+/// exist yet.
+#[inline]
+fn pipeline_done(cfg: &RunConfig<'_>, recorders: &Recorders) -> bool {
+    matches!(cfg.limit, Some(n) if recorders.stats.matched_lines >= n)
+}
+
 /// Phase 2: open `plan.path`, seek to the planned start, stream the bounded
-/// byte range through filters and sinks, then optionally attach the follow
+/// byte range through filters and emitter, then optionally attach the follow
 /// loop.
 fn stream_plan<W: Write>(
     plan: FilePlan<'_>,
     cli: &Cli,
     filter: &Filter,
     output: &mut W,
-    sinks: &mut Sinks,
-    add_pairs: &[(&str, &str)],
-    remove_keys: &[&str],
+    cfg: &RunConfig<'_>,
+    recorders: &mut Recorders,
+    emitter: &mut LineEmitter,
 ) -> anyhow::Result<()> {
     let FilePlan {
         path,
@@ -494,7 +516,7 @@ fn stream_plan<W: Write>(
     if is_stdin_path(path) {
         // No bisect, no follow loop. Per-line `tf` still applies (resolved
         // against the real files' span by the caller).
-        let mut pipeline = Pipeline::new(filter, &tf, sinks, add_pairs, remove_keys);
+        let mut pipeline = Pipeline::new(filter, &tf, cfg, recorders, emitter);
         return stream_unbounded(&mut std::io::stdin().lock(), &mut pipeline, output);
     }
 
@@ -512,21 +534,19 @@ fn stream_plan<W: Write>(
     };
     let mut reader = BufReader::with_capacity(STREAM_BUF_CAP, file);
 
-    let mut pipeline = Pipeline::new(filter, &tf, sinks, add_pairs, remove_keys);
-    stream_bounded(&mut reader, max_bytes, &mut pipeline, output)?;
+    {
+        let mut pipeline = Pipeline::new(filter, &tf, cfg, &mut *recorders, &mut *emitter);
+        stream_bounded(&mut reader, max_bytes, &mut pipeline, output)?;
+    }
     output.flush()?;
 
     if let Some(handle) = file_for_reopen {
-        // Re-borrow check: the original `sinks.done()` call after stream_bounded
-        // is gated through the pipeline's borrow. End the borrow so we can
-        // re-check `sinks.done()` and build a fresh pipeline for the follow loop.
-        let _ = pipeline;
-        if !interrupted() && !sinks.done() {
+        if !interrupted() && !pipeline_done(cfg, recorders) {
             // Follow mode ignores the per-file `tf` (newly arrived lines have
             // no resolved time bound), matching the previous behavior where
             // `follow_loop` passed `TimeFilter::default()`.
             let tf_follow = TimeFilter::default();
-            let mut pipeline = Pipeline::new(filter, &tf_follow, sinks, add_pairs, remove_keys);
+            let mut pipeline = Pipeline::new(filter, &tf_follow, cfg, recorders, emitter);
             follow_loop(
                 path,
                 handle,
@@ -560,18 +580,6 @@ pub(crate) fn resolve_parallelism(cli: &Cli) -> usize {
 /// noise. Big enough to fit pathologically long log lines without spilling
 /// into the carryover `tail`.
 pub(crate) const STREAM_BUF_CAP: usize = 128 * 1024;
-
-/// Run the per-chunk `Counter::flush_closed`. Borrow-split so the call site
-/// in the streaming loop doesn't have to.
-#[inline]
-fn flush_closed_chunk<W: Write + ?Sized>(
-    pipeline: &mut Pipeline<'_>,
-    output: &mut W,
-) -> std::io::Result<()> {
-    let json = matches!(pipeline.sinks.line_mode, LineMode::Json);
-    let sinks = &mut *pipeline.sinks;
-    sinks.counter.flush_closed(output, &sinks.tz, json)
-}
 
 /// Outcome of scanning one filled buffer.
 enum ChunkOutcome {
@@ -635,7 +643,7 @@ impl LineScanner {
                 self.tail.clear();
             }
             start = nl + 1;
-            if pipeline.sinks.done() {
+            if pipeline.done() {
                 hit_limit_at = Some(nl + 1);
                 break;
             }
@@ -643,7 +651,7 @@ impl LineScanner {
         if let Some(consumed) = hit_limit_at {
             reader.consume(consumed);
             // Final per-chunk flush for buckets that may have just closed.
-            flush_closed_chunk(pipeline, output)?;
+            pipeline.flush_closed_chunk(output)?;
             return Ok(ChunkOutcome::HitLimit);
         }
         if start < usable_len {
@@ -653,7 +661,7 @@ impl LineScanner {
         self.total_read += usable_len as u64;
         // Per-chunk streaming-bucket flush: no-op when streaming is off
         // (the common case), real work only when `-f`/`-F` + `--bucket`.
-        flush_closed_chunk(pipeline, output)?;
+        pipeline.flush_closed_chunk(output)?;
         Ok(ChunkOutcome::Full)
     }
 
@@ -668,9 +676,9 @@ impl LineScanner {
         pipeline: &mut Pipeline<'_>,
         output: &mut W,
     ) -> anyhow::Result<bool> {
-        if !self.tail.is_empty() && !pipeline.sinks.done() {
+        if !self.tail.is_empty() && !pipeline.done() {
             pipeline.process_line(&self.tail, output)?;
-            flush_closed_chunk(pipeline, output)?;
+            pipeline.flush_closed_chunk(output)?;
             return Ok(true);
         }
         Ok(false)

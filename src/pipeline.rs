@@ -1,47 +1,66 @@
 //! Per-line processing pipeline. Bundles the borrows that `process_line`
-//! threaded as separate arguments (filter, time-filter, sinks, transform
-//! views) into a single struct. The streaming helpers in `run.rs` hold
+//! threaded as separate arguments (filter, time-filter, recorders, emitter,
+//! config) into a single struct. The streaming helpers in `run.rs` hold
 //! `&mut Pipeline` and call `process_line` for each line read.
 
 use std::io::Write;
 
 use crate::filter::Filter;
 use crate::logfmt;
-use crate::output::{JsonlFormat, JsonlOptions, LogfmtFormat, LogfmtOptions, OutputFormat};
-use crate::raw_extractor::RawExtractor;
 use crate::run::TimeFilter;
-use crate::sinks::{LineMode, Sinks};
+use crate::sinks::{LineEmitter, LineMode, Recorders, RunConfig};
 use crate::timestamp;
-use crate::transform::EmitScratch;
 
 /// Per-line state bundle: the borrows that every line-processing call needs.
 ///
 /// One `Pipeline` is constructed per stream (per file, or once for stdin).
-/// In the parallel path each worker builds its own, since `sinks` is
-/// per-worker.
+/// In the parallel path each worker builds its own, since `recorders` and
+/// `emitter` are per-worker.
 pub(crate) struct Pipeline<'a> {
     pub(crate) filter: &'a Filter,
     pub(crate) tf: &'a TimeFilter,
-    pub(crate) sinks: &'a mut Sinks,
-    pub(crate) add_pairs: &'a [(&'a str, &'a str)],
-    pub(crate) remove_keys: &'a [&'a str],
+    pub(crate) cfg: &'a RunConfig<'a>,
+    pub(crate) recorders: &'a mut Recorders,
+    pub(crate) emitter: &'a mut LineEmitter,
 }
 
 impl<'a> Pipeline<'a> {
     pub(crate) fn new(
         filter: &'a Filter,
         tf: &'a TimeFilter,
-        sinks: &'a mut Sinks,
-        add_pairs: &'a [(&'a str, &'a str)],
-        remove_keys: &'a [&'a str],
+        cfg: &'a RunConfig<'a>,
+        recorders: &'a mut Recorders,
+        emitter: &'a mut LineEmitter,
     ) -> Self {
         Self {
             filter,
             tf,
-            sinks,
-            add_pairs,
-            remove_keys,
+            cfg,
+            recorders,
+            emitter,
         }
+    }
+
+    /// True once the `--limit` matched-line count has been reached. Used by
+    /// the streaming loops to break mid-chunk.
+    #[inline]
+    pub(crate) fn done(&self) -> bool {
+        matches!(self.cfg.limit, Some(n) if self.recorders.stats.matched_lines >= n)
+    }
+
+    /// Per-chunk streaming-bucket flush. No-op when streaming is off (the
+    /// common case); real work only when `-f`/`-F` + `--bucket`. Lives here
+    /// so the borrow split (`&mut counter` + `&tz`) is encapsulated; `tz`
+    /// now lives on the immutable `RunConfig`, so the borrow is trivial.
+    #[inline]
+    pub(crate) fn flush_closed_chunk<W: Write + ?Sized>(
+        &mut self,
+        output: &mut W,
+    ) -> std::io::Result<()> {
+        let json = matches!(self.cfg.line_mode, LineMode::Json);
+        self.recorders
+            .counter
+            .flush_closed(output, &self.cfg.tz, json)
     }
 
     /// Process one line. `line` may include a trailing `\n` or `\r\n`; it is
@@ -60,14 +79,14 @@ impl<'a> Pipeline<'a> {
             parse_end -= 1;
         }
 
-        self.sinks.stats.bytes += raw_len;
-        self.sinks.stats.total_lines += 1;
+        self.recorders.stats.bytes += raw_len;
+        self.recorders.stats.total_lines += 1;
 
         let parse_slice = &line[..parse_end];
         let line_str = match std::str::from_utf8(parse_slice) {
             Ok(s) => s,
             Err(_) => {
-                self.sinks.stats.invalid_utf += 1;
+                self.recorders.stats.invalid_utf += 1;
                 return Ok(());
             }
         };
@@ -77,7 +96,7 @@ impl<'a> Pipeline<'a> {
 
         // Extract the timestamp at most once per line, only when something
         // downstream actually needs it (time-window filter or grouping counter).
-        let ts = if !self.tf.is_empty() || self.sinks.counter.is_active() {
+        let ts = if !self.tf.is_empty() || self.recorders.counter.is_active() {
             timestamp::extract_timestamp(parsed)
         } else {
             None
@@ -85,151 +104,21 @@ impl<'a> Pipeline<'a> {
 
         let matched = self.tf.check(ts)
             && (self.filter.is_empty() || self.filter.matches(parsed))
-            && self.sinks.sampler.as_ref().is_none_or(|s| s.keep(parsed));
+            && self.cfg.sampler.as_ref().is_none_or(|s| s.keep(parsed));
 
-        self.sinks.stats.pairs += parsed.len();
-        self.sinks.stats.overflow += overflow as usize;
+        self.recorders.stats.pairs += parsed.len();
+        self.recorders.stats.overflow += overflow as usize;
         if matched {
-            self.sinks.stats.matched_lines += 1;
-            self.sinks.counter.record(parsed, ts);
+            self.recorders.stats.matched_lines += 1;
+            self.recorders.counter.record(parsed, ts);
             // Streaming-bucket `flush_closed` used to live here; it now runs
             // once per chunk in the streaming loops (`run::stream_*` /
             // `follow_loop`), which is a real win when many lines match.
-            self.sinks.keys.record(parsed);
-            self.sinks.values.record(parsed);
-            if let Some(sort_buf) = self.sinks.sort_buf.as_mut() {
-                // Aggregation modes without --raw-key produce no per-line bytes;
-                // skip the capture in that case (counters above already recorded).
-                if !self.sinks.suppress_lines || self.sinks.raw.raw_key.is_some() {
-                    let raw = &mut self.sinks.raw;
-                    let scratch = &mut self.sinks.emit_scratch;
-                    let suppress = self.sinks.suppress_lines;
-                    let mode = self.sinks.line_mode;
-                    let add_pairs = self.add_pairs;
-                    let remove_keys = self.remove_keys;
-                    sort_buf.capture(parsed, |w| {
-                        emit_match(
-                            parsed,
-                            line,
-                            raw_len,
-                            parse_end,
-                            raw,
-                            suppress,
-                            mode,
-                            add_pairs,
-                            remove_keys,
-                            scratch,
-                            w,
-                        )
-                    })?;
-                }
-            } else {
-                emit_match(
-                    parsed,
-                    line,
-                    raw_len,
-                    parse_end,
-                    &mut self.sinks.raw,
-                    self.sinks.suppress_lines,
-                    self.sinks.line_mode,
-                    self.add_pairs,
-                    self.remove_keys,
-                    &mut self.sinks.emit_scratch,
-                    output,
-                )?;
-            }
+            self.recorders.keys.record(parsed);
+            self.recorders.values.record(parsed);
+            self.emitter
+                .emit(parsed, line, raw_len, parse_end, self.cfg, output)?;
         }
         Ok(())
-    }
-}
-
-#[inline]
-fn append_reconstructed_plain_tail(
-    buf: &mut Vec<u8>,
-    line_buf: &[u8],
-    raw_len: usize,
-    parse_end: usize,
-) {
-    if raw_len == parse_end {
-        buf.push(b'\n');
-    } else {
-        buf.extend_from_slice(&line_buf[parse_end..raw_len]);
-    }
-}
-
-/// Emit one matched line to `out`: the `--raw-key` extraction (if any),
-/// followed by the full line in the configured `LineMode` unless line output
-/// is suppressed by an aggregation/raw-key mode.
-///
-/// `add_pairs` and `remove_keys` are pre-computed views over the run-wide
-/// `LineTransform`; they're empty when no `--add`/`--rm` is set. They live
-/// in the caller's frame for the whole stream, so per-line work is just two
-/// slice borrows.
-#[allow(clippy::too_many_arguments)]
-fn emit_match<W: Write + ?Sized>(
-    parsed: &[(&str, &str)],
-    line_buf: &[u8],
-    raw_len: usize,
-    parse_end: usize,
-    raw: &mut RawExtractor,
-    suppress_lines: bool,
-    mode: LineMode,
-    add_pairs: &[(&str, &str)],
-    remove_keys: &[&str],
-    scratch: &mut EmitScratch,
-    out: &mut W,
-) -> std::io::Result<()> {
-    raw.emit(parsed, out)?;
-
-    if suppress_lines {
-        return Ok(());
-    }
-
-    // Passthrough copies bytes verbatim — no trait dispatch needed (and the
-    // memcpy fast path is what makes this mode worth keeping separate).
-    if let LineMode::Passthrough = mode {
-        out.write_all(line_buf)?;
-        if raw_len == parse_end {
-            out.write_all(b"\n")?;
-        }
-        return Ok(());
-    }
-
-    let pairs: &[&[(&str, &str)]] = if add_pairs.is_empty() {
-        &[parsed]
-    } else {
-        &[parsed, add_pairs]
-    };
-
-    match mode {
-        LineMode::Passthrough => unreachable!("handled above"),
-        LineMode::Json => {
-            JsonlFormat::output_line(out, pairs, remove_keys, &JsonlOptions, &mut scratch.str_buf)
-        }
-        LineMode::Colored => {
-            let EmitScratch { buf, str_buf } = scratch;
-            buf.clear();
-            LogfmtFormat::output_line(
-                buf,
-                pairs,
-                remove_keys,
-                &LogfmtOptions { color: true },
-                str_buf,
-            )?;
-            out.write_all(buf)
-        }
-        LineMode::Plain => {
-            let EmitScratch { buf, str_buf } = scratch;
-            buf.clear();
-            LogfmtFormat::output_line(
-                buf,
-                pairs,
-                remove_keys,
-                &LogfmtOptions { color: false },
-                str_buf,
-            )?;
-            append_reconstructed_plain_tail(buf, line_buf, raw_len, parse_end);
-            out.write_all(buf)
-        }
     }
 }

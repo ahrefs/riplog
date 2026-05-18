@@ -1,7 +1,15 @@
-//! Per-run sinks: stats, counters, gathers, sampler, sort buffer, and the
-//! per-emit scratch buffers. Bundled into `Sinks` so the streaming helpers
-//! don't drown in arguments. Constructed once via `make_sinks` for the
-//! master, and again per worker in the parallel path.
+//! Per-run state split into three structs with distinct lifecycles:
+//!
+//! - [`RunConfig`]: built once in `run()`, borrowed everywhere. Read-only
+//!   configuration (line mode, suppression, limit, tz, sampler, add/remove
+//!   key views).
+//! - [`Recorders`]: accumulators that record matches and are merged across
+//!   workers at the end of a parallel run.
+//! - [`LineEmitter`]: per-thread scratch + sort buffer for formatting matched
+//!   lines. Only the optional `sort_buf` is merged across workers.
+//!
+//! `Pipeline` (in `pipeline.rs`) bundles `&RunConfig`, `&mut Recorders`, and
+//! `&mut LineEmitter` (plus filters) for the hot per-line path.
 
 use smartstring::alias::String as SmartString;
 use std::io::Write;
@@ -9,6 +17,7 @@ use std::io::Write;
 use crate::bucket::ResolvedBucket;
 use crate::cli::Cli;
 use crate::counter::Counter;
+use crate::output::{JsonlFormat, JsonlOptions, LogfmtFormat, LogfmtOptions, OutputFormat};
 use crate::raw_extractor::RawExtractor;
 use crate::sampler::Sampler;
 use crate::sort::SortBuffer;
@@ -30,86 +39,231 @@ pub(crate) enum LineMode {
     Plain,
 }
 
-/// Bundles per-line bookkeeping (stats + summarisers) so the streaming
-/// helpers don't drown in arguments.
-pub(crate) struct Sinks {
+/// Read-only run configuration: branching constants and shared views that
+/// don't change after `run()` builds them. Borrowed by `Pipeline` and the
+/// emit hot path; never mutated during the run.
+///
+/// The `'a` lifetime ties `add_pairs` / `remove_keys` to the run-scoped
+/// `LineTransform` they're borrowed from.
+pub(crate) struct RunConfig<'a> {
+    pub(crate) line_mode: LineMode,
+    pub(crate) suppress_lines: bool,
+    pub(crate) limit: Option<usize>,
+    pub(crate) tz: jiff::tz::TimeZone,
+    pub(crate) sampler: Option<Sampler>,
+    pub(crate) add_pairs: &'a [(&'a str, &'a str)],
+    pub(crate) remove_keys: &'a [&'a str],
+}
+
+/// Accumulators that record matches across the run. Merged across workers
+/// after a parallel job completes (every field; no silent skips).
+pub(crate) struct Recorders {
     pub(crate) stats: Stats,
     pub(crate) counter: Counter,
     pub(crate) keys: KeyGather,
     pub(crate) values: ValueGather,
-    pub(crate) raw: RawExtractor,
-    pub(crate) sampler: Option<Sampler>,
-    pub(crate) sort_buf: Option<SortBuffer>,
-    pub(crate) suppress_lines: bool,
-    /// Picks the line emitter (passthrough / json / colored / plain).
-    pub(crate) line_mode: LineMode,
-    pub(crate) limit: Option<usize>,
-    /// Display timezone, used by the streaming bucket flush to format
-    /// `bucket.start` / `bucket.end` / `time.start` / `time.end` on the fly.
-    pub(crate) tz: jiff::tz::TimeZone,
-    pub(crate) emit_scratch: EmitScratch,
 }
 
-impl Sinks {
-    #[inline]
-    pub(crate) fn done(&self) -> bool {
-        matches!(self.limit, Some(n) if self.stats.matched_lines >= n)
+impl Recorders {
+    /// Build a fresh `Recorders` for the master or a worker. All collected
+    /// state starts empty; `bucket` is the resolved bucket spec (master-side
+    /// constructed once, then passed by value into each worker).
+    pub(crate) fn new(cli: &Cli, bucket: Option<ResolvedBucket>) -> Self {
+        let counter = Counter::new(cli.group_by.iter().map(SmartString::from).collect(), bucket);
+        Self {
+            stats: Stats::default(),
+            counter,
+            keys: KeyGather::new(cli.list_keys),
+            values: ValueGather::new(cli.list_values_for.iter().map(SmartString::from).collect()),
+        }
     }
 
-    /// Activate streaming bucket emission on the underlying counter. Should
-    /// only be called on the *master* `Sinks` in follow mode — workers must
-    /// stay batched so their output can't interleave on the shared writer.
-    pub(crate) fn enable_streaming(&mut self, close_grace_nanos: i64) {
-        self.counter.enable_streaming(close_grace_nanos);
-    }
-
-    /// Fold per-worker collected state into `self`. `started` and the
-    /// configuration fields (`suppress_lines`, `colorize`, `limit`, ...)
-    /// are kept from `self`.
+    /// Total merge: every field gets folded in. The master's `started`
+    /// instant is preserved (see `Stats::merge`); everything else
+    /// accumulates.
     pub(crate) fn merge(&mut self, other: Self) {
-        self.stats.merge(other.stats);
-        self.counter.merge(other.counter);
-        self.keys.merge(other.keys);
-        self.values.merge(other.values);
-        if let (Some(a), Some(b)) = (self.sort_buf.as_mut(), other.sort_buf) {
+        let Recorders {
+            stats,
+            counter,
+            keys,
+            values,
+        } = other;
+        self.stats.merge(stats);
+        self.counter.merge(counter);
+        self.keys.merge(keys);
+        self.values.merge(values);
+    }
+}
+
+/// Per-thread emit machinery: scratch buffers for line formatting, the
+/// `--raw-key` extractor, and (optionally) the `--sort-by` capture buffer.
+///
+/// `raw` and `scratch` are pure per-worker scratch and are *not* merged.
+/// `sort_buf`, when present, IS merged from workers into the master so all
+/// captured rows are sorted together before emission. See
+/// [`LineEmitter::merge_sort_buf`].
+pub(crate) struct LineEmitter {
+    raw: RawExtractor,
+    scratch: EmitScratch,
+    pub(crate) sort_buf: Option<SortBuffer>,
+}
+
+impl LineEmitter {
+    pub(crate) fn new(raw_key: Option<&str>, sort_by: Option<&str>) -> Self {
+        Self {
+            raw: RawExtractor::new(raw_key),
+            scratch: EmitScratch::default(),
+            sort_buf: sort_by.map(SortBuffer::new),
+        }
+    }
+
+    /// Fold a worker's sort buffer into this one. No-op when either side
+    /// has none. Mirrors the pre-refactor `Sinks::merge` behaviour.
+    pub(crate) fn merge_sort_buf(&mut self, other: Option<SortBuffer>) {
+        if let (Some(a), Some(b)) = (self.sort_buf.as_mut(), other) {
             a.merge(b);
+        }
+    }
+
+    /// Emit one matched line. When `sort_buf` is active, the bytes are
+    /// captured into the sort buffer (keyed by `--sort-by`); otherwise
+    /// they're written straight to `out`.
+    ///
+    /// Handles `--raw-key` extraction, the passthrough memcpy fast path,
+    /// and the format-dispatched slow path.
+    pub(crate) fn emit<W: Write + ?Sized>(
+        &mut self,
+        parsed: &[(&str, &str)],
+        line_buf: &[u8],
+        raw_len: usize,
+        parse_end: usize,
+        cfg: &RunConfig,
+        out: &mut W,
+    ) -> std::io::Result<()> {
+        // Capture path: redirect bytes into the sort buffer instead of `out`.
+        // Aggregation modes without --raw-key produce no per-line bytes; skip
+        // the capture in that case to avoid pointless allocations.
+        if let Some(sort_buf) = self.sort_buf.as_mut() {
+            if cfg.suppress_lines && self.raw.raw_key.is_none() {
+                return Ok(());
+            }
+            let raw = &mut self.raw;
+            let scratch = &mut self.scratch;
+            return sort_buf.capture(parsed, |w| {
+                emit_inner(parsed, line_buf, raw_len, parse_end, raw, scratch, cfg, w)
+            });
+        }
+
+        emit_inner(
+            parsed,
+            line_buf,
+            raw_len,
+            parse_end,
+            &mut self.raw,
+            &mut self.scratch,
+            cfg,
+            out,
+        )
+    }
+
+    /// Flush the sort buffer (if any) and the writer. Takes ownership of the
+    /// buffer's contents, so subsequent calls are no-ops.
+    pub(crate) fn flush_sort_buf<W: Write>(&mut self, out: &mut W) -> std::io::Result<()> {
+        if let Some(sort_buf) = self.sort_buf.take() {
+            sort_buf.emit(out)?;
+            out.flush()?;
+        }
+        Ok(())
+    }
+}
+
+/// Inner emit: writes `--raw-key` extraction (if any) and then the full line
+/// in the configured `LineMode`. Shared between the direct-emit and sort-buf
+/// paths via a tiny indirection so both routes go through the same logic.
+///
+/// `add_pairs` and `remove_keys` (from `cfg`) are pre-computed views over
+/// the run-wide `LineTransform`; they're empty when no `--add`/`--rm` is set.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn emit_inner<W: Write + ?Sized>(
+    parsed: &[(&str, &str)],
+    line_buf: &[u8],
+    raw_len: usize,
+    parse_end: usize,
+    raw: &mut RawExtractor,
+    scratch: &mut EmitScratch,
+    cfg: &RunConfig,
+    out: &mut W,
+) -> std::io::Result<()> {
+    raw.emit(parsed, out)?;
+
+    if cfg.suppress_lines {
+        return Ok(());
+    }
+
+    // Passthrough copies bytes verbatim — no trait dispatch needed (and the
+    // memcpy fast path is what makes this mode worth keeping separate).
+    if let LineMode::Passthrough = cfg.line_mode {
+        out.write_all(line_buf)?;
+        if raw_len == parse_end {
+            out.write_all(b"\n")?;
+        }
+        return Ok(());
+    }
+
+    let pairs: &[&[(&str, &str)]] = if cfg.add_pairs.is_empty() {
+        &[parsed]
+    } else {
+        &[parsed, cfg.add_pairs]
+    };
+
+    match cfg.line_mode {
+        LineMode::Passthrough => unreachable!("handled above"),
+        LineMode::Json => JsonlFormat::output_line(
+            out,
+            pairs,
+            cfg.remove_keys,
+            &JsonlOptions,
+            &mut scratch.str_buf,
+        ),
+        LineMode::Colored => {
+            let EmitScratch { buf, str_buf } = scratch;
+            buf.clear();
+            LogfmtFormat::output_line(
+                buf,
+                pairs,
+                cfg.remove_keys,
+                &LogfmtOptions { color: true },
+                str_buf,
+            )?;
+            out.write_all(buf)
+        }
+        LineMode::Plain => {
+            let EmitScratch { buf, str_buf } = scratch;
+            buf.clear();
+            LogfmtFormat::output_line(
+                buf,
+                pairs,
+                cfg.remove_keys,
+                &LogfmtOptions { color: false },
+                str_buf,
+            )?;
+            append_reconstructed_plain_tail(buf, line_buf, raw_len, parse_end);
+            out.write_all(buf)
         }
     }
 }
 
-/// Construct a fresh `Sinks` for the master or a worker. Configuration
-/// fields are derived from `cli`; the `sampler` template is cloned in (its
-/// inner `Arc<Filter>` is shared, so cloning is cheap). All collected
-/// state (counts, gathers, sort buffer) starts empty.
-pub(crate) fn make_sinks(
-    cli: &Cli,
-    sampler: Option<Sampler>,
-    suppress_lines: bool,
-    line_mode: LineMode,
-    bucket: Option<ResolvedBucket>,
-    tz: jiff::tz::TimeZone,
-) -> Sinks {
-    let counter = Counter::new(cli.group_by.iter().map(SmartString::from).collect(), bucket);
-    Sinks {
-        stats: Stats::default(),
-        counter,
-        keys: KeyGather::new(cli.list_keys),
-        values: ValueGather::new(cli.list_values_for.iter().map(SmartString::from).collect()),
-        raw: RawExtractor::new(cli.raw_key.as_deref()),
-        sampler,
-        sort_buf: cli.sort_by.as_deref().map(SortBuffer::new),
-        suppress_lines,
-        line_mode,
-        limit: cli.limit,
-        tz,
-        emit_scratch: EmitScratch::default(),
+#[inline]
+fn append_reconstructed_plain_tail(
+    buf: &mut Vec<u8>,
+    line_buf: &[u8],
+    raw_len: usize,
+    parse_end: usize,
+) {
+    if raw_len == parse_end {
+        buf.push(b'\n');
+    } else {
+        buf.extend_from_slice(&line_buf[parse_end..raw_len]);
     }
-}
-
-pub(crate) fn flush_sort_buf<W: Write>(sinks: &mut Sinks, out: &mut W) -> std::io::Result<()> {
-    if let Some(sort_buf) = sinks.sort_buf.take() {
-        sort_buf.emit(out)?;
-        out.flush()?;
-    }
-    Ok(())
 }
