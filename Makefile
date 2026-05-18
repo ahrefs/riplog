@@ -21,6 +21,12 @@ fmt:
 clippy:
 	cargo clippy --all-targets -- -D warnings
 
+bench-perf:
+	python tests/bench.py
+
+bench-perf-update-baseline:
+	python tests/bench.py --update-baseline
+
 test:
 	cargo test
 

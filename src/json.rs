@@ -8,6 +8,7 @@ use smartstring::alias::String as SmartString;
 use std::io::{self, Write};
 
 use crate::logfmt;
+use crate::output::{is_removed, sorted, OutputFormat};
 use crate::timestamp::{self, Timestamp};
 
 #[inline]
@@ -145,91 +146,111 @@ impl<'w, W: Write + ?Sized> JsonArr<'w, W> {
     }
 }
 
-// -------- JSON summary writers --------
+// -------- jsonl format --------
 
-fn sorted(set: &RapidHashSet<SmartString>) -> Vec<&SmartString> {
-    let mut v: Vec<&SmartString> = set.iter().collect();
-    v.sort_unstable();
-    v
-}
+pub(crate) struct JsonlFormat;
 
-/// `--list-keys` JSON: one JSON array on a single line, sorted.
-pub(crate) fn write_string_set_json<W: Write + ?Sized>(
-    out: &mut W,
-    set: &RapidHashSet<SmartString>,
-) -> io::Result<()> {
-    let mut arr = JsonArr::open(out)?;
-    for v in sorted(set) {
-        arr.push_str(v.as_str())?;
+impl OutputFormat for JsonlFormat {
+    #[inline]
+    fn line<W: Write + ?Sized>(
+        &self,
+        w: &mut W,
+        pairs: &[&[(&str, &str)]],
+        remove: &[&str],
+        _original_trailer: &[u8],
+        scratch: &mut String,
+    ) -> io::Result<()> {
+        let mut obj = JsonObj::open(w)?;
+        for slice in pairs {
+            for (k, v) in *slice {
+                if is_removed(remove, k) {
+                    continue;
+                }
+                obj.entry_logfmt_value(k, v, scratch)?;
+            }
+        }
+        obj.finish()?;
+        w.write_all(b"\n")
     }
-    arr.finish()?;
-    out.write_all(b"\n")
-}
 
-/// `--list-values-for` JSON. Single key → array of strings; multiple keys →
-/// array of `{"key": K, "value": V}` objects. One line either way.
-pub(crate) fn write_values_summary_json<W: Write + ?Sized>(
-    out: &mut W,
-    keys: &[SmartString],
-    values: &[RapidHashSet<SmartString>],
-) -> io::Result<()> {
-    if keys.len() == 1 {
-        write_string_set_json(out, &values[0])?;
-        return Ok(());
+    fn agg_row<W: Write + ?Sized>(
+        &self,
+        w: &mut W,
+        count: u64,
+        keys: &[SmartString],
+        combo: &[SmartString],
+        bucket: Option<(Timestamp, Timestamp)>,
+        time_range: Option<(Timestamp, Timestamp)>,
+        tz: &jiff::tz::TimeZone,
+    ) -> io::Result<()> {
+        let mut obj = JsonObj::open(w)?;
+        obj.entry_u64("count", count)?;
+        if !keys.is_empty() {
+            let mut k_obj = obj.start_obj("keys")?;
+            for (k, v) in keys.iter().zip(combo.iter()) {
+                k_obj.entry_str(k.as_str(), v.as_str())?;
+            }
+            k_obj.finish()?;
+        }
+        if let Some((start, end)) = bucket {
+            obj.entry_str("bucket.start", &timestamp::format_rfc3339(start, tz))?;
+            obj.entry_str("bucket.end", &timestamp::format_rfc3339(end, tz))?;
+        }
+        if let Some((a, b)) = time_range {
+            obj.entry_str("time.start", &timestamp::format_rfc3339(a, tz))?;
+            obj.entry_str("time.end", &timestamp::format_rfc3339(b, tz))?;
+        }
+        obj.finish()?;
+        w.write_all(b"\n")
     }
-    let mut arr = JsonArr::open(out)?;
-    for (key, set) in keys.iter().zip(values.iter()) {
+
+    fn string_set<W: Write + ?Sized>(
+        &self,
+        w: &mut W,
+        set: &RapidHashSet<SmartString>,
+    ) -> io::Result<()> {
+        let mut arr = JsonArr::open(w)?;
         for v in sorted(set) {
-            let mut o = arr.start_obj()?;
-            o.entry_str("key", key.as_str())?;
-            o.entry_str("value", v.as_str())?;
-            o.finish()?;
+            arr.push_str(v.as_str())?;
         }
+        arr.finish()?;
+        w.write_all(b"\n")
     }
-    arr.finish()?;
-    out.write_all(b"\n")
+
+    fn values_summary<W: Write + ?Sized>(
+        &self,
+        w: &mut W,
+        keys: &[SmartString],
+        values: &[RapidHashSet<SmartString>],
+    ) -> io::Result<()> {
+        // Single key: shape matches `--list-keys` (one JSON array).
+        // Multiple keys: array of `{"key": K, "value": V}` so the consumer
+        // doesn't have to disambiguate by position.
+        if keys.len() == 1 {
+            return self.string_set(w, &values[0]);
+        }
+        let mut arr = JsonArr::open(w)?;
+        for (key, set) in keys.iter().zip(values.iter()) {
+            for v in sorted(set) {
+                let mut o = arr.start_obj()?;
+                o.entry_str("key", key.as_str())?;
+                o.entry_str("value", v.as_str())?;
+                o.finish()?;
+            }
+        }
+        arr.finish()?;
+        w.write_all(b"\n")
+    }
+
+    fn count_only<W: Write + ?Sized>(&self, w: &mut W, n: u64) -> io::Result<()> {
+        let mut obj = JsonObj::open(w)?;
+        obj.entry_u64("count", n)?;
+        obj.finish()?;
+        w.write_all(b"\n")
+    }
 }
 
-/// JSON aggregation row: `{"count": N, "keys": {"<k>": "...", ...}, ...}`.
-/// The `keys` field is omitted entirely when there are no grouping keys.
-pub(crate) fn write_agg_row_json<W: Write + ?Sized>(
-    out: &mut W,
-    count: u64,
-    keys: &[SmartString],
-    combo: &[SmartString],
-    bucket: Option<(Timestamp, Timestamp)>,
-    time_range: Option<(Timestamp, Timestamp)>,
-    tz: &jiff::tz::TimeZone,
-) -> io::Result<()> {
-    let mut obj = JsonObj::open(out)?;
-    obj.entry_u64("count", count)?;
-    if !keys.is_empty() {
-        let mut k_obj = obj.start_obj("keys")?;
-        for (k, v) in keys.iter().zip(combo.iter()) {
-            k_obj.entry_str(k.as_str(), v.as_str())?;
-        }
-        k_obj.finish()?;
-    }
-    if let Some((start, end)) = bucket {
-        obj.entry_str("bucket.start", &timestamp::format_rfc3339(start, tz))?;
-        obj.entry_str("bucket.end", &timestamp::format_rfc3339(end, tz))?;
-    }
-    if let Some((a, b)) = time_range {
-        obj.entry_str("time.start", &timestamp::format_rfc3339(a, tz))?;
-        obj.entry_str("time.end", &timestamp::format_rfc3339(b, tz))?;
-    }
-    obj.finish()?;
-    out.write_all(b"\n")
-}
-
-/// One-shot `{"count": N}\n` line. Used for the bare `--count` summary
-/// under `--json`.
-pub(crate) fn write_count_json<W: Write + ?Sized>(out: &mut W, count: u64) -> io::Result<()> {
-    let mut obj = JsonObj::open(out)?;
-    obj.entry_u64("count", count)?;
-    obj.finish()?;
-    out.write_all(b"\n")
-}
+// -------- tests --------
 
 #[cfg(test)]
 mod tests {

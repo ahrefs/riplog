@@ -11,7 +11,7 @@ use smartstring::alias::String as SmartString;
 use std::io::Write;
 use std::time::Instant;
 
-use crate::output;
+use crate::output::{Formatter, OutputFormat};
 use crate::raw_extractor::unescape_for_key;
 
 /// Insert `s` into `set` only if not already present, allocating a
@@ -28,20 +28,21 @@ pub(crate) fn intern_into_set(set: &mut RapidHashSet<SmartString>, s: &str) {
 /// `--list-keys` is set; in that mode line output is suppressed.
 #[derive(Default)]
 pub(crate) struct KeyGather {
-    enabled: bool,
+    is_active: bool,
     keys: RapidHashSet<SmartString>,
 }
 
 impl KeyGather {
-    pub(crate) fn new(enabled: bool) -> Self {
+    pub(crate) fn new(is_active: bool) -> Self {
         Self {
-            enabled,
+            is_active,
             keys: RapidHashSet::default(),
         }
     }
 
+    #[inline]
     pub(crate) fn record(&mut self, pairs: &[(&str, &str)]) {
-        if !self.enabled {
+        if !self.is_active {
             return;
         }
         for (k, _) in pairs {
@@ -49,15 +50,15 @@ impl KeyGather {
         }
     }
 
-    pub(crate) fn report<W: Write>(&self, out: &mut W, json: bool) -> std::io::Result<()> {
-        if !self.enabled {
+    pub(crate) fn report<W: Write>(
+        &self,
+        out: &mut W,
+        formatter: &Formatter,
+    ) -> std::io::Result<()> {
+        if !self.is_active {
             return Ok(());
         }
-        if json {
-            crate::json::write_string_set_json(out, &self.keys)
-        } else {
-            output::write_string_set_logfmt(out, &self.keys)
-        }
+        formatter.string_set(out, &self.keys)
     }
 
     pub(crate) fn merge(&mut self, other: Self) {
@@ -90,6 +91,7 @@ impl ValueGather {
         !self.keys.is_empty()
     }
 
+    #[inline]
     pub(crate) fn record(&mut self, pairs: &[(&str, &str)]) {
         if !self.is_active() {
             return;
@@ -101,15 +103,15 @@ impl ValueGather {
         }
     }
 
-    pub(crate) fn report<W: Write>(&self, out: &mut W, json: bool) -> std::io::Result<()> {
+    pub(crate) fn report<W: Write>(
+        &self,
+        out: &mut W,
+        formatter: &Formatter,
+    ) -> std::io::Result<()> {
         if !self.is_active() {
             return Ok(());
         }
-        if json {
-            crate::json::write_values_summary_json(out, &self.keys, &self.values)
-        } else {
-            output::write_values_summary_logfmt(out, &self.keys, &self.values)
-        }
+        formatter.values_summary(out, &self.keys, &self.values)
     }
 
     pub(crate) fn merge(&mut self, other: Self) {
@@ -180,26 +182,20 @@ impl Stats {
 /// optional bare `--count` number. Pulled out so the `run::run`
 /// happy-path doesn't have to thread `bare_count` through everywhere.
 pub(crate) fn emit_summaries<W: Write>(
-    sinks: &crate::sinks::Sinks,
+    recorders: &crate::sinks::Recorders,
+    cfg: &crate::sinks::RunConfig<'_>,
     count_only: bool,
-    tz: &jiff::tz::TimeZone,
     output: &mut W,
 ) -> anyhow::Result<()> {
-    sinks.stats.report();
-    let json = matches!(sinks.line_mode, crate::sinks::LineMode::Json);
-    if sinks.counter.streaming {
-        sinks.counter.flush_remaining(output, tz, json)?;
-    } else {
-        sinks.counter.report(output, tz, json)?;
-    }
-    sinks.keys.report(output, json)?;
-    sinks.values.report(output, json)?;
+    recorders.stats.report();
+    recorders
+        .counter
+        .emit_final(output, cfg.formatter, &cfg.tz)?;
+    recorders.keys.report(output, cfg.formatter)?;
+    recorders.values.report(output, cfg.formatter)?;
     if count_only {
-        if json {
-            crate::json::write_count_json(output, sinks.stats.matched_lines as u64)?;
-        } else {
-            writeln!(output, "{}", sinks.stats.matched_lines)?;
-        }
+        cfg.formatter
+            .count_only(output, recorders.stats.matched_lines as u64)?;
     }
     output.flush()?;
     Ok(())
