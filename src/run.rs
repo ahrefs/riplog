@@ -289,17 +289,18 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
         }
     };
 
-    // Pick the line emitter once. Order matters: passthrough is the memcpy
-    // fast path, only eligible when no transform/filter/color/json applies.
+    // Pick the line formatter and the memcpy fast-path flag independently.
+    // When `passthrough` is true, the emit path writes the input bytes
+    // verbatim and `line_mode` is unused — its `Plain` value is a default,
+    // not a meaningful choice.
     let line_mode = if cli.json {
         LineMode::Json
     } else if colorize {
         LineMode::Colored
-    } else if line_transform.is_none() && filter.is_empty() {
-        LineMode::Passthrough
     } else {
         LineMode::Plain
     };
+    let passthrough = !cli.json && !colorize && line_transform.is_none() && filter.is_empty();
 
     // `Send` so the parallel path can hand `&mut output` to its workers
     // through a shared `Mutex`. Using the unlocked `Stdout` (rather than
@@ -362,6 +363,7 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
             // calls `flush_remaining` for the still-open buckets.
             let cfg = RunConfig {
                 line_mode,
+                passthrough,
                 suppress_lines,
                 limit: cli.limit,
                 tz: tz.clone(),
@@ -390,6 +392,7 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
         } => {
             let cfg = RunConfig {
                 line_mode,
+                passthrough,
                 suppress_lines,
                 limit: cli.limit,
                 tz: tz.clone(),
@@ -439,6 +442,7 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
                             // the line transform.
                             let worker_cfg = RunConfig {
                                 line_mode: cfg_ref.line_mode,
+                                passthrough: cfg_ref.passthrough,
                                 suppress_lines: cfg_ref.suppress_lines,
                                 limit: cfg_ref.limit,
                                 tz: cfg_ref.tz.clone(),

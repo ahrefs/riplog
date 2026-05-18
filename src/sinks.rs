@@ -24,13 +24,11 @@ use crate::sort::SortBuffer;
 use crate::stats::{KeyGather, Stats, ValueGather};
 use crate::transform::EmitScratch;
 
-/// How matched lines are emitted. Exactly one branch is active for a given
-/// run, decided once in `run::run` from `--color`, `--json`, and whether
-/// the memcpy fast path is eligible (no filter, no `--rm`/`--add`).
+/// How matched lines are formatted when we don't take the memcpy fast path.
+/// Decided once in `run::run` from `--color` / `--json`; the orthogonal
+/// `RunConfig::passthrough` flag overrides this on the emit path.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum LineMode {
-    /// Copy the input bytes verbatim — the fast path.
-    Passthrough,
     /// JSONL: one JSON object per line.
     Json,
     /// ANSI-colored logfmt reconstruction.
@@ -47,6 +45,9 @@ pub(crate) enum LineMode {
 /// `LineTransform` they're borrowed from.
 pub(crate) struct RunConfig<'a> {
     pub(crate) line_mode: LineMode,
+    /// Memcpy fast path: when true, the emit path writes `line_buf` verbatim
+    /// (plus a trailing newline if needed) and ignores `line_mode`.
+    pub(crate) passthrough: bool,
     pub(crate) suppress_lines: bool,
     pub(crate) limit: Option<usize>,
     pub(crate) tz: jiff::tz::TimeZone,
@@ -216,8 +217,8 @@ fn emit_inner<W: Write + ?Sized>(
     }
 
     // Passthrough copies bytes verbatim — no trait dispatch needed (and the
-    // memcpy fast path is what makes this mode worth keeping separate).
-    if let LineMode::Passthrough = cfg.line_mode {
+    // memcpy fast path is what makes this branch worth keeping separate).
+    if cfg.passthrough {
         out.write_all(line_buf)?;
         if raw_len == parse_end {
             out.write_all(b"\n")?;
@@ -232,7 +233,6 @@ fn emit_inner<W: Write + ?Sized>(
     };
 
     match cfg.line_mode {
-        LineMode::Passthrough => unreachable!("handled above"),
         LineMode::Json => JsonlFormat::output_line(
             out,
             pairs,
