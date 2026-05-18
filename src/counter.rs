@@ -16,6 +16,17 @@ use crate::timestamp::Timestamp;
 
 pub(crate) type Combo = SmallVec<[SmartString; 3]>;
 
+/// Sort order for emitting aggregated rows.
+enum SortOrder {
+    /// `report` (batched end-of-run): largest groups first.
+    /// `count desc, combo asc, bucket asc`.
+    CountDesc,
+    /// `flush_closed` (streaming mid-run) and `flush_remaining`
+    /// (streaming end-of-run): chronological.
+    /// `bucket asc, count desc, combo asc`.
+    BucketAsc,
+}
+
 /// Aggregated stats for a single (group-keys [, bucket]) combination.
 #[derive(Default)]
 pub(crate) struct GroupStats {
@@ -180,6 +191,35 @@ impl Counter {
         }
     }
 
+    /// Sort `entries` per `order` and write each row via `write_row`. Does
+    /// NOT flush `out` — callers decide flush points.
+    fn emit_rows<'a, W: Write + ?Sized>(
+        &self,
+        out: &mut W,
+        tz: &jiff::tz::TimeZone,
+        json: bool,
+        mut entries: Vec<(&'a Combo, Option<Timestamp>, &'a GroupStats)>,
+        order: SortOrder,
+    ) -> std::io::Result<()> {
+        match order {
+            SortOrder::CountDesc => entries.sort_unstable_by(|a, b| {
+                b.2.count
+                    .cmp(&a.2.count)
+                    .then_with(|| a.0.cmp(b.0))
+                    .then_with(|| a.1.cmp(&b.1))
+            }),
+            SortOrder::BucketAsc => entries.sort_unstable_by(|a, b| {
+                a.1.cmp(&b.1)
+                    .then_with(|| b.2.count.cmp(&a.2.count))
+                    .then_with(|| a.0.cmp(b.0))
+            }),
+        }
+        for (combo, bucket_ts, stats) in entries {
+            self.write_row(out, combo, bucket_ts, stats, tz, json)?;
+        }
+        Ok(())
+    }
+
     /// Batch-mode end-of-run report: count desc, ties broken by key.
     fn report<W: Write>(
         &self,
@@ -190,22 +230,16 @@ impl Counter {
         if !self.is_active() || self.counts.is_empty() {
             return Ok(());
         }
-        let mut entries = Vec::new();
-        for (bucket_ts, groups) in &self.counts {
-            for (combo, stats) in groups {
-                entries.push((combo, *bucket_ts, stats));
-            }
-        }
-        entries.sort_unstable_by(|a, b| {
-            b.2.count
-                .cmp(&a.2.count)
-                .then_with(|| a.0.cmp(b.0))
-                .then_with(|| a.1.cmp(&b.1))
-        });
-        for (combo, bucket_ts, stats) in entries {
-            self.write_row(out, combo, bucket_ts, stats, tz, json)?;
-        }
-        Ok(())
+        let entries: Vec<_> = self
+            .counts
+            .iter()
+            .flat_map(|(bucket_ts, groups)| {
+                groups
+                    .iter()
+                    .map(move |(combo, stats)| (combo, *bucket_ts, stats))
+            })
+            .collect();
+        self.emit_rows(out, tz, json, entries, SortOrder::CountDesc)
     }
 
     /// Streaming flush: emit and remove every group whose bucket has
@@ -244,25 +278,16 @@ impl Counter {
             return Ok(());
         }
 
-        let mut to_close = Vec::new();
         let closing_counts = std::mem::replace(&mut self.counts, open_buckets);
-        for (bucket_ts, groups) in closing_counts.into_iter() {
-            for (combo, stats) in groups {
-                to_close.push((combo, bucket_ts, stats));
-            }
-        }
-
-        // Since we extracted them in bucket order, and split_off splits at bucket level,
-        // we can just sort to_close as needed.
-        // stream_order is: bucket_ts asc, count desc, combo asc.
-        to_close.sort_unstable_by(|a, b| {
-            a.1.cmp(&b.1)
-                .then_with(|| b.2.count.cmp(&a.2.count))
-                .then_with(|| a.0.cmp(&b.0))
-        });
-        for (combo, bucket_ts, stats) in &to_close {
-            self.write_row(out, combo, *bucket_ts, stats, tz, json)?;
-        }
+        let entries: Vec<_> = closing_counts
+            .iter()
+            .flat_map(|(bucket_ts, groups)| {
+                groups
+                    .iter()
+                    .map(move |(combo, stats)| (combo, *bucket_ts, stats))
+            })
+            .collect();
+        self.emit_rows(out, tz, json, entries, SortOrder::BucketAsc)?;
         out.flush()
     }
 
@@ -277,21 +302,16 @@ impl Counter {
         if self.counts.is_empty() {
             return Ok(());
         }
-        let mut entries = Vec::new();
-        for (bucket_ts, groups) in &self.counts {
-            for (combo, stats) in groups {
-                entries.push((combo, *bucket_ts, stats));
-            }
-        }
-        entries.sort_unstable_by(|a, b| {
-            a.1.cmp(&b.1)
-                .then_with(|| b.2.count.cmp(&a.2.count))
-                .then_with(|| a.0.cmp(b.0))
-        });
-        for (combo, bucket_ts, stats) in entries {
-            self.write_row(out, combo, bucket_ts, stats, tz, json)?;
-        }
-        Ok(())
+        let entries: Vec<_> = self
+            .counts
+            .iter()
+            .flat_map(|(bucket_ts, groups)| {
+                groups
+                    .iter()
+                    .map(move |(combo, stats)| (combo, *bucket_ts, stats))
+            })
+            .collect();
+        self.emit_rows(out, tz, json, entries, SortOrder::BucketAsc)
     }
 
     /// End-of-run output: dispatches between batched `report` (count desc,
