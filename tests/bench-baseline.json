@@ -1,74 +1,74 @@
 {
   "configs": {
     "bisect_window": {
-      "branch-misses": 8083385.0,
-      "cache-misses": 168464.0,
-      "cycles": 1256347632.0,
-      "instructions": 5516887326.0,
-      "task-clock": 281.559502
+      "branch-misses": 7780563.0,
+      "cache-misses": 136874.0,
+      "cycles": 1199585024.0,
+      "instructions": 5369317323.0,
+      "task-clock": 265.028862
     },
     "bucket_1m": {
-      "branch-misses": 17477925.0,
-      "cache-misses": 96879.0,
-      "cycles": 3605813030.0,
-      "instructions": 15577929681.0,
-      "task-clock": 780.107059
+      "branch-misses": 17482996.0,
+      "cache-misses": 84142.0,
+      "cycles": 3303749879.0,
+      "instructions": 15258123613.0,
+      "task-clock": 697.111719
     },
     "count_only": {
-      "branch-misses": 10880791.0,
-      "cache-misses": 77515.0,
-      "cycles": 1957330921.0,
-      "instructions": 8499594719.0,
-      "task-clock": 448.46104
+      "branch-misses": 10921556.0,
+      "cache-misses": 60788.0,
+      "cycles": 1876485729.0,
+      "instructions": 8171784574.0,
+      "task-clock": 420.564859
     },
     "filter_level_error": {
-      "branch-misses": 17800356.0,
-      "cache-misses": 83809.0,
-      "cycles": 2692517292.0,
-      "instructions": 10541483202.0,
-      "task-clock": 580.332645
+      "branch-misses": 17192728.0,
+      "cache-misses": 85774.0,
+      "cycles": 2620859144.0,
+      "instructions": 10406631790.0,
+      "task-clock": 571.309318
     },
     "group_by_level": {
-      "branch-misses": 19382214.0,
-      "cache-misses": 69692.0,
-      "cycles": 4124524047.0,
-      "instructions": 17737051010.0,
-      "task-clock": 871.960413
+      "branch-misses": 20688567.0,
+      "cache-misses": 71666.0,
+      "cycles": 4013360775.0,
+      "instructions": 17457240672.0,
+      "task-clock": 854.219665
     },
     "json_emit": {
-      "branch-misses": 19524129.0,
-      "cache-misses": 82544.0,
-      "cycles": 3742196989.0,
-      "instructions": 15277061503.0,
-      "task-clock": 820.371538
+      "branch-misses": 19332001.0,
+      "cache-misses": 101153.0,
+      "cycles": 3474212012.0,
+      "instructions": 13699011484.0,
+      "task-clock": 740.874511
     },
     "n_buckets_10": {
-      "branch-misses": 17499965.0,
-      "cache-misses": 155531.0,
-      "cycles": 3310556241.0,
-      "instructions": 14585653977.0,
-      "task-clock": 721.054744
+      "branch-misses": 17499162.0,
+      "cache-misses": 114280.0,
+      "cycles": 3038635337.0,
+      "instructions": 14265827916.0,
+      "task-clock": 649.35396
     },
     "parallel_4": {
-      "branch-misses": 17572265.0,
-      "cache-misses": 119146.0,
-      "cycles": 2669289933.0,
-      "instructions": 10595907676.0,
-      "task-clock": 725.695977
+      "branch-misses": 17586425.0,
+      "cache-misses": 130499.0,
+      "cycles": 2624438762.0,
+      "instructions": 10490971683.0,
+      "task-clock": 696.722643
     },
     "passthrough_no_filter": {
-      "branch-misses": 11099046.0,
-      "cache-misses": 64245.0,
-      "cycles": 2027494987.0,
-      "instructions": 8883399353.0,
-      "task-clock": 449.486988
+      "branch-misses": 11208686.0,
+      "cache-misses": 57163.0,
+      "cycles": 1973274209.0,
+      "instructions": 8555589217.0,
+      "task-clock": 448.559332
     },
     "sort_by_time": {
-      "branch-misses": 18308635.0,
-      "cache-misses": 1656541.0,
-      "cycles": 3593820301.0,
-      "instructions": 13367631235.0,
-      "task-clock": 822.25282
+      "branch-misses": 18217716.0,
+      "cache-misses": 1645521.0,
+      "cycles": 3557720826.0,
+      "instructions": 13145590240.0,
+      "task-clock": 838.485043
     }
   },
   "fixture_sha256": "56eb0dcb4084fd96de0696c51e985bbd240d0398156f4641cdd30f748c0faf83",
