@@ -8,7 +8,7 @@ use std::io::Write;
 use crate::filter::Filter;
 use crate::logfmt;
 use crate::run::TimeFilter;
-use crate::sinks::{LineEmitter, LineMode, Recorders, RunConfig};
+use crate::sinks::{LineEmitter, Recorders, RunConfig};
 use crate::timestamp;
 
 /// Per-line state bundle: the borrows that every line-processing call needs.
@@ -57,10 +57,9 @@ impl<'a> Pipeline<'a> {
         &mut self,
         output: &mut W,
     ) -> std::io::Result<()> {
-        let json = matches!(self.cfg.line_mode, LineMode::Json);
         self.recorders
             .counter
-            .flush_closed(output, &self.cfg.tz, json)
+            .flush_closed(output, self.cfg.formatter, &self.cfg.tz)
     }
 
     /// Process one line. `line` may include a trailing `\n` or `\r\n`; it is

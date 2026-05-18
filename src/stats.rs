@@ -11,7 +11,7 @@ use smartstring::alias::String as SmartString;
 use std::io::Write;
 use std::time::Instant;
 
-use crate::output;
+use crate::output::{Formatter, OutputFormat};
 use crate::raw_extractor::unescape_for_key;
 
 /// Insert `s` into `set` only if not already present, allocating a
@@ -49,15 +49,15 @@ impl KeyGather {
         }
     }
 
-    pub(crate) fn report<W: Write>(&self, out: &mut W, json: bool) -> std::io::Result<()> {
+    pub(crate) fn report<W: Write>(
+        &self,
+        out: &mut W,
+        formatter: &Formatter,
+    ) -> std::io::Result<()> {
         if !self.enabled {
             return Ok(());
         }
-        if json {
-            crate::json::write_string_set_json(out, &self.keys)
-        } else {
-            output::write_string_set_logfmt(out, &self.keys)
-        }
+        formatter.string_set(out, &self.keys)
     }
 
     pub(crate) fn merge(&mut self, other: Self) {
@@ -101,15 +101,15 @@ impl ValueGather {
         }
     }
 
-    pub(crate) fn report<W: Write>(&self, out: &mut W, json: bool) -> std::io::Result<()> {
+    pub(crate) fn report<W: Write>(
+        &self,
+        out: &mut W,
+        formatter: &Formatter,
+    ) -> std::io::Result<()> {
         if !self.is_active() {
             return Ok(());
         }
-        if json {
-            crate::json::write_values_summary_json(out, &self.keys, &self.values)
-        } else {
-            output::write_values_summary_logfmt(out, &self.keys, &self.values)
-        }
+        formatter.values_summary(out, &self.keys, &self.values)
     }
 
     pub(crate) fn merge(&mut self, other: Self) {
@@ -186,16 +186,14 @@ pub(crate) fn emit_summaries<W: Write>(
     output: &mut W,
 ) -> anyhow::Result<()> {
     recorders.stats.report();
-    let json = matches!(cfg.line_mode, crate::sinks::LineMode::Json);
-    recorders.counter.emit_final(output, &cfg.tz, json)?;
-    recorders.keys.report(output, json)?;
-    recorders.values.report(output, json)?;
+    recorders
+        .counter
+        .emit_final(output, cfg.formatter, &cfg.tz)?;
+    recorders.keys.report(output, cfg.formatter)?;
+    recorders.values.report(output, cfg.formatter)?;
     if count_only {
-        if json {
-            crate::json::write_count_json(output, recorders.stats.matched_lines as u64)?;
-        } else {
-            writeln!(output, "{}", recorders.stats.matched_lines)?;
-        }
+        cfg.formatter
+            .count_only(output, recorders.stats.matched_lines as u64)?;
     }
     output.flush()?;
     Ok(())

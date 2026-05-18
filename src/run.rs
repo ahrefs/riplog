@@ -14,10 +14,13 @@ use crate::bucket::{self, BucketSpec, ResolvedBucket};
 use crate::cli::{Cli, ColorMode};
 use crate::file_plan::{peek_global_window, plan_file, FilePlan};
 use crate::filter::Filter;
+use crate::json::JsonlFormat;
+use crate::logfmt::LogfmtFormat;
+use crate::output::Formatter;
 use crate::pipeline::Pipeline;
 use crate::sampler::build_sampler;
 use crate::signal_handling::{install_signal_handler, interrupted};
-use crate::sinks::{LineEmitter, LineMode, Recorders, RunConfig};
+use crate::sinks::{LineEmitter, Recorders, RunConfig};
 use crate::stats::emit_summaries;
 use crate::time_bisect;
 use crate::timestamp::{self, Timestamp};
@@ -289,16 +292,20 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
         }
     };
 
-    // Pick the line formatter and the memcpy fast-path flag independently.
+    // Pick the format engine and the memcpy fast-path flag independently.
     // When `passthrough` is true, the emit path writes the input bytes
-    // verbatim and `line_mode` is unused — its `Plain` value is a default,
-    // not a meaningful choice.
-    let line_mode = if cli.json {
-        LineMode::Json
-    } else if colorize {
-        LineMode::Colored
+    // verbatim and `formatter` is only used for end-of-run summaries
+    // (agg rows, list-keys, list-values-for, bare count).
+    //
+    // `Formatter` is a plain enum (no heap allocation); workers and master
+    // share the same `&formatter` borrow. Static dispatch via `match` on
+    // the enum lets the compiler inline `LogfmtFormat::line`'s per-pair
+    // `write_all` loop directly into the caller's writer type, because this
+    // is in the hot path.
+    let formatter = if cli.json {
+        Formatter::Json(JsonlFormat)
     } else {
-        LineMode::Plain
+        Formatter::Logfmt(LogfmtFormat { color: colorize })
     };
     let passthrough = !cli.json && !colorize && line_transform.is_none() && filter.is_empty();
 
@@ -362,7 +369,7 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
             // without any seek (pipes can't seek). At EOF, `emit_summaries`
             // calls `flush_remaining` for the still-open buckets.
             let cfg = RunConfig {
-                line_mode,
+                formatter: &formatter,
                 passthrough,
                 suppress_lines,
                 limit: cli.limit,
@@ -391,7 +398,7 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
             has_stdin,
         } => {
             let cfg = RunConfig {
-                line_mode,
+                formatter: &formatter,
                 passthrough,
                 suppress_lines,
                 limit: cli.limit,
@@ -437,11 +444,11 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
                             let worker_tf = line_transform_ref.clone();
                             let (add_view, remove_view) = transform_views(worker_tf.as_ref());
                             // Workers borrow shared `cfg` for the immutable parts
-                            // (line_mode, limit, tz, sampler) but get their own
+                            // (formatter, limit, tz, sampler) but get their own
                             // add_pairs/remove_keys views into their own clone of
                             // the line transform.
                             let worker_cfg = RunConfig {
-                                line_mode: cfg_ref.line_mode,
+                                formatter: cfg_ref.formatter,
                                 passthrough: cfg_ref.passthrough,
                                 suppress_lines: cfg_ref.suppress_lines,
                                 limit: cfg_ref.limit,

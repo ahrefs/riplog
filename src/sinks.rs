@@ -1,7 +1,7 @@
 //! Per-run state split into three structs with distinct lifecycles:
 //!
 //! - [`RunConfig`]: built once in `run()`, borrowed everywhere. Read-only
-//!   configuration (line mode, suppression, limit, tz, sampler, add/remove
+//!   configuration (formatter, suppression, limit, tz, sampler, add/remove
 //!   key views).
 //! - [`Recorders`]: accumulators that record matches and are merged across
 //!   workers at the end of a parallel run.
@@ -17,36 +17,31 @@ use std::io::Write;
 use crate::bucket::ResolvedBucket;
 use crate::cli::Cli;
 use crate::counter::Counter;
-use crate::output::{JsonlFormat, JsonlOptions, LogfmtFormat, LogfmtOptions, OutputFormat};
+use crate::output::{Formatter, OutputFormat};
 use crate::raw_extractor::RawExtractor;
 use crate::sampler::Sampler;
 use crate::sort::SortBuffer;
 use crate::stats::{KeyGather, Stats, ValueGather};
 use crate::transform::EmitScratch;
 
-/// How matched lines are formatted when we don't take the memcpy fast path.
-/// Decided once in `run::run` from `--color` / `--json`; the orthogonal
-/// `RunConfig::passthrough` flag overrides this on the emit path.
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum LineMode {
-    /// JSONL: one JSON object per line.
-    Json,
-    /// ANSI-colored logfmt reconstruction.
-    Colored,
-    /// Plain logfmt reconstruction (no color).
-    Plain,
-}
-
 /// Read-only run configuration: branching constants and shared views that
 /// don't change after `run()` builds them. Borrowed by `Pipeline` and the
 /// emit hot path; never mutated during the run.
 ///
-/// The `'a` lifetime ties `add_pairs` / `remove_keys` to the run-scoped
-/// `LineTransform` they're borrowed from.
+/// The `'a` lifetime ties `formatter`, `add_pairs`, and `remove_keys` to
+/// the run-scoped values they're borrowed from.
 pub(crate) struct RunConfig<'a> {
-    pub(crate) line_mode: LineMode,
+    /// Format engine for every output shape (line, agg row, summary, count).
+    /// Decided once in `run::run` from `--color` / `--json`. The orthogonal
+    /// `passthrough` flag overrides this on the per-line path.
+    ///
+    /// Stored as `&Formatter` (an enum dispatched via `match`) rather than
+    /// `&dyn OutputFormat` so the per-line emit path resolves to direct,
+    /// inlinable calls instead of vtable indirections — critical for the
+    /// inner `write_all` loop in `LogfmtFormat::line`.
+    pub(crate) formatter: &'a Formatter,
     /// Memcpy fast path: when true, the emit path writes `line_buf` verbatim
-    /// (plus a trailing newline if needed) and ignores `line_mode`.
+    /// (plus a trailing newline if needed) and ignores `formatter`.
     pub(crate) passthrough: bool,
     pub(crate) suppress_lines: bool,
     pub(crate) limit: Option<usize>,
@@ -193,8 +188,9 @@ impl LineEmitter {
 }
 
 /// Inner emit: writes `--raw-key` extraction (if any) and then the full line
-/// in the configured `LineMode`. Shared between the direct-emit and sort-buf
-/// paths via a tiny indirection so both routes go through the same logic.
+/// through the configured `formatter`. Shared between the direct-emit and
+/// sort-buf paths via a tiny indirection so both routes go through the same
+/// logic.
 ///
 /// `add_pairs` and `remove_keys` (from `cfg`) are pre-computed views over
 /// the run-wide `LineTransform`; they're empty when no `--add`/`--rm` is set.
@@ -232,52 +228,28 @@ fn emit_inner<W: Write + ?Sized>(
         &[parsed, cfg.add_pairs]
     };
 
-    match cfg.line_mode {
-        LineMode::Json => JsonlFormat::output_line(
-            out,
-            pairs,
-            cfg.remove_keys,
-            &JsonlOptions,
-            &mut scratch.str_buf,
-        ),
-        LineMode::Colored => {
-            let EmitScratch { buf, str_buf } = scratch;
-            buf.clear();
-            LogfmtFormat::output_line(
-                buf,
-                pairs,
-                cfg.remove_keys,
-                &LogfmtOptions { color: true },
-                str_buf,
-            )?;
-            out.write_all(buf)
-        }
-        LineMode::Plain => {
-            let EmitScratch { buf, str_buf } = scratch;
-            buf.clear();
-            LogfmtFormat::output_line(
-                buf,
-                pairs,
-                cfg.remove_keys,
-                &LogfmtOptions { color: false },
-                str_buf,
-            )?;
-            append_reconstructed_plain_tail(buf, line_buf, raw_len, parse_end);
-            out.write_all(buf)
-        }
-    }
-}
-
-#[inline]
-fn append_reconstructed_plain_tail(
-    buf: &mut Vec<u8>,
-    line_buf: &[u8],
-    raw_len: usize,
-    parse_end: usize,
-) {
-    if raw_len == parse_end {
-        buf.push(b'\n');
+    // The trailer is the raw bytes between the parsed prefix and the end of
+    // the line (whitespace + newline). Plain logfmt preserves it verbatim so
+    // CRLF inputs stay CRLF; colored logfmt and jsonl ignore it.
+    let trailer: &[u8] = if raw_len > parse_end {
+        &line_buf[parse_end..raw_len]
     } else {
-        buf.extend_from_slice(&line_buf[parse_end..raw_len]);
-    }
+        &[]
+    };
+
+    // Buffer the formatted line into `scratch.buf`, then emit it with one
+    // `write_all`. This is required for the parallel path: workers write
+    // through `UnorderedSink` which flushes to the shared writer at
+    // byte-count thresholds, so a multi-write `line` body would let
+    // fragments of concurrent lines interleave. Per-line `Vec::clear` is
+    // O(0); the allocation only grows once.
+    scratch.buf.clear();
+    cfg.formatter.line(
+        &mut scratch.buf,
+        pairs,
+        cfg.remove_keys,
+        trailer,
+        &mut scratch.str_buf,
+    )?;
+    out.write_all(&scratch.buf)
 }

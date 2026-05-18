@@ -6,7 +6,13 @@
 #![allow(unsafe_code)]
 
 use memchr::{memchr, memchr2};
+use rapidhash::RapidHashSet;
+use smartstring::alias::String as SmartString;
+use std::io::{self, Write};
 use std::mem::MaybeUninit;
+
+use crate::output::{is_removed, sorted, OutputFormat};
+use crate::timestamp::{self, Timestamp};
 
 /// Fixed-size stack-allocated scratch buffer for [`PairsBuffer::parse`].
 ///
@@ -271,6 +277,188 @@ pub fn write_logfmt_value<W: std::io::Write + ?Sized>(
         out.write_all(&bytes[last..])?;
     }
     out.write_all(b"\"")
+}
+
+// -------- ANSI escapes (colored logfmt only) --------
+
+const RESET: &str = "\x1b[0m";
+const BOLD: &str = "\x1b[1m";
+const COL_BLUE: &str = "\x1b[34m";
+const COL_RED: &str = "\x1b[31m";
+const COL_YELLOW: &str = "\x1b[33m";
+const COL_GRAY: &str = "\x1b[90m";
+const COL_QUOTE: &str = "\x1b[1;34m";
+// Bright white on red background — used for `critical`/`crit` so it really pops.
+const COL_CRIT: &str = "\x1b[97;41m";
+
+// -------- logfmt format (plain + colored, picked via `LogfmtFormat::color`) --------
+
+/// Logfmt formatter. `color: true` enables ANSI styling for the per-line
+/// path; the aggregation / summary paths are color-free either way (they
+/// emit structured key=value rows that are already easy to parse).
+pub(crate) struct LogfmtFormat {
+    pub color: bool,
+}
+
+fn level_color(value: &str) -> &'static str {
+    let v = value.trim_matches('"');
+    match v {
+        "critical" | "CRITICAL" | "crit" | "CRIT" => COL_CRIT,
+        "error" | "fatal" | "ERROR" | "FATAL" => COL_RED,
+        "warn" | "warning" | "WARN" | "WARNING" => COL_YELLOW,
+        "info" | "INFO" => COL_BLUE,
+        "debug" | "trace" | "DEBUG" | "TRACE" => COL_GRAY,
+        _ => "",
+    }
+}
+
+/// Emit a value with optional color and bold. If the value is wrapped in
+/// double quotes, the quote characters are highlighted so the content
+/// boundary is easy to spot.
+#[inline]
+fn write_value<W: Write + ?Sized>(out: &mut W, v: &str, color: &str, bold: bool) -> io::Result<()> {
+    let b = v.as_bytes();
+    let quoted = b.len() >= 2 && b[0] == b'"' && b[b.len() - 1] == b'"';
+    let inner = if quoted { &v[1..v.len() - 1] } else { v };
+    let styled = bold || !color.is_empty();
+
+    if quoted {
+        write!(out, "{COL_QUOTE}\"{RESET}")?;
+    }
+    if bold {
+        out.write_all(BOLD.as_bytes())?;
+    }
+    if !color.is_empty() {
+        out.write_all(color.as_bytes())?;
+    }
+    out.write_all(inner.as_bytes())?;
+    if styled {
+        out.write_all(RESET.as_bytes())?;
+    }
+    if quoted {
+        write!(out, "{COL_QUOTE}\"{RESET}")?;
+    }
+    Ok(())
+}
+
+impl OutputFormat for LogfmtFormat {
+    #[inline]
+    fn line<W: Write + ?Sized>(
+        &self,
+        w: &mut W,
+        pairs: &[&[(&str, &str)]],
+        remove: &[&str],
+        original_trailer: &[u8],
+        _scratch: &mut String,
+    ) -> io::Result<()> {
+        // For colored output, pick the level colour up front so the bold value
+        // styling matches the level value (matters when `level` appears mid-line).
+        let lvl_sgr = if self.color {
+            pairs
+                .iter()
+                .flat_map(|s| s.iter())
+                .find_map(|(k, v)| {
+                    if is_removed(remove, k) {
+                        return None;
+                    }
+                    (*k == "level").then(|| level_color(v))
+                })
+                .unwrap_or("")
+        } else {
+            ""
+        };
+
+        let mut first = true;
+        for slice in pairs {
+            for (k, v) in *slice {
+                if is_removed(remove, k) {
+                    continue;
+                }
+                if !first {
+                    w.write_all(b" ")?;
+                }
+                first = false;
+                if self.color {
+                    write!(w, "{BOLD}{k}{RESET}=")?;
+                    let color: &str = match *k {
+                        "time" | "ts" => COL_BLUE,
+                        "level" => lvl_sgr,
+                        _ => "",
+                    };
+                    write_value(w, v, color, *k == "level")?;
+                } else {
+                    w.write_all(k.as_bytes())?;
+                    w.write_all(b"=")?;
+                    w.write_all(v.as_bytes())?;
+                }
+            }
+        }
+        // Colored output always terminates its own line; plain output
+        // preserves the original trailer (e.g. CRLF) when present, falling
+        // back to a single `\n` otherwise.
+        if self.color || original_trailer.is_empty() {
+            w.write_all(b"\n")
+        } else {
+            w.write_all(original_trailer)
+        }
+    }
+
+    fn agg_row<W: Write + ?Sized>(
+        &self,
+        w: &mut W,
+        count: u64,
+        keys: &[SmartString],
+        combo: &[SmartString],
+        bucket: Option<(Timestamp, Timestamp)>,
+        time_range: Option<(Timestamp, Timestamp)>,
+        tz: &jiff::tz::TimeZone,
+    ) -> io::Result<()> {
+        write!(w, "count={count}")?;
+        for (k, v) in keys.iter().zip(combo.iter()) {
+            write!(w, " key.{k}=")?;
+            write_logfmt_value(w, v.as_str())?;
+        }
+        if let Some((start, end)) = bucket {
+            write!(w, " bucket.start={}", timestamp::format_rfc3339(start, tz))?;
+            write!(w, " bucket.end={}", timestamp::format_rfc3339(end, tz))?;
+        }
+        if let Some((a, b)) = time_range {
+            write!(w, " time.start={}", timestamp::format_rfc3339(a, tz))?;
+            write!(w, " time.end={}", timestamp::format_rfc3339(b, tz))?;
+        }
+        writeln!(w)
+    }
+
+    fn string_set<W: Write + ?Sized>(
+        &self,
+        w: &mut W,
+        set: &RapidHashSet<SmartString>,
+    ) -> io::Result<()> {
+        for v in sorted(set) {
+            writeln!(w, "{v}")?;
+        }
+        Ok(())
+    }
+
+    fn values_summary<W: Write + ?Sized>(
+        &self,
+        w: &mut W,
+        keys: &[SmartString],
+        values: &[RapidHashSet<SmartString>],
+    ) -> io::Result<()> {
+        let multi = keys.len() > 1;
+        for (key, set) in keys.iter().zip(values.iter()) {
+            if multi {
+                writeln!(w, "# {key}")?;
+            }
+            self.string_set(w, set)?;
+        }
+        Ok(())
+    }
+
+    fn count_only<W: Write + ?Sized>(&self, w: &mut W, n: u64) -> io::Result<()> {
+        writeln!(w, "{n}")
+    }
 }
 
 #[cfg(test)]

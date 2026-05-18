@@ -19,9 +19,12 @@ pub(crate) struct LineTransform {
     pub add_escaped: Vec<(SmartString, SmartString)>,
 }
 
-/// Reusable buffers for reconstructed line emission. `buf` collects bytes
-/// for the logfmt slow path; `str_buf` is the unescape scratch used by the
-/// JSON emitter.
+/// Reusable buffers for reconstructed line emission. `buf` collects the
+/// fully-formatted line bytes so the slow path emits one `write_all` per
+/// line (atomic w.r.t. the parallel-worker `UnorderedSink`, which flushes
+/// at byte-count thresholds and would otherwise interleave fragments of
+/// concurrent lines). `str_buf` is the unescape scratch used by the JSON
+/// emitter.
 #[derive(Debug, Default)]
 pub(crate) struct EmitScratch {
     pub(crate) buf: Vec<u8>,

@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 
 use crate::bucket::ResolvedBucket;
-use crate::output;
+use crate::output::{Formatter, OutputFormat};
 use crate::raw_extractor::unescape_for_key;
 use crate::timestamp::Timestamp;
 
@@ -172,8 +172,8 @@ impl Counter {
         combo: &Combo,
         bucket_ts: Option<Timestamp>,
         stats: &GroupStats,
+        formatter: &Formatter,
         tz: &jiff::tz::TimeZone,
-        json: bool,
     ) -> std::io::Result<()> {
         let bucket = match (self.bucket, bucket_ts) {
             (Some(bspec), Some(start)) => Some((start, start + bspec.dur_nanos)),
@@ -184,11 +184,7 @@ impl Counter {
             _ => None,
         };
         let count = stats.count as u64;
-        if json {
-            crate::json::write_agg_row_json(out, count, &self.keys, combo, bucket, time_range, tz)
-        } else {
-            output::write_agg_row_logfmt(out, count, &self.keys, combo, bucket, time_range, tz)
-        }
+        formatter.agg_row(out, count, &self.keys, combo, bucket, time_range, tz)
     }
 
     /// Sort `entries` per `order` and write each row via `write_row`. Does
@@ -196,8 +192,8 @@ impl Counter {
     fn emit_rows<'a, W: Write + ?Sized>(
         &self,
         out: &mut W,
+        formatter: &Formatter,
         tz: &jiff::tz::TimeZone,
-        json: bool,
         mut entries: Vec<(&'a Combo, Option<Timestamp>, &'a GroupStats)>,
         order: SortOrder,
     ) -> std::io::Result<()> {
@@ -215,7 +211,7 @@ impl Counter {
             }),
         }
         for (combo, bucket_ts, stats) in entries {
-            self.write_row(out, combo, bucket_ts, stats, tz, json)?;
+            self.write_row(out, combo, bucket_ts, stats, formatter, tz)?;
         }
         Ok(())
     }
@@ -224,8 +220,8 @@ impl Counter {
     fn report<W: Write>(
         &self,
         out: &mut W,
+        formatter: &Formatter,
         tz: &jiff::tz::TimeZone,
-        json: bool,
     ) -> std::io::Result<()> {
         if !self.is_active() || self.counts.is_empty() {
             return Ok(());
@@ -239,7 +235,7 @@ impl Counter {
                     .map(move |(combo, stats)| (combo, *bucket_ts, stats))
             })
             .collect();
-        self.emit_rows(out, tz, json, entries, SortOrder::CountDesc)
+        self.emit_rows(out, formatter, tz, entries, SortOrder::CountDesc)
     }
 
     /// Streaming flush: emit and remove every group whose bucket has
@@ -249,8 +245,8 @@ impl Counter {
     pub(crate) fn flush_closed<W: Write + ?Sized>(
         &mut self,
         out: &mut W,
+        formatter: &Formatter,
         tz: &jiff::tz::TimeZone,
-        json: bool,
     ) -> std::io::Result<()> {
         let CounterMode::Streaming {
             close_grace_nanos,
@@ -287,7 +283,7 @@ impl Counter {
                     .map(move |(combo, stats)| (combo, *bucket_ts, stats))
             })
             .collect();
-        self.emit_rows(out, tz, json, entries, SortOrder::BucketAsc)?;
+        self.emit_rows(out, formatter, tz, entries, SortOrder::BucketAsc)?;
         out.flush()
     }
 
@@ -296,8 +292,8 @@ impl Counter {
     fn flush_remaining<W: Write>(
         &self,
         out: &mut W,
+        formatter: &Formatter,
         tz: &jiff::tz::TimeZone,
-        json: bool,
     ) -> std::io::Result<()> {
         if self.counts.is_empty() {
             return Ok(());
@@ -311,7 +307,7 @@ impl Counter {
                     .map(move |(combo, stats)| (combo, *bucket_ts, stats))
             })
             .collect();
-        self.emit_rows(out, tz, json, entries, SortOrder::BucketAsc)
+        self.emit_rows(out, formatter, tz, entries, SortOrder::BucketAsc)
     }
 
     /// End-of-run output: dispatches between batched `report` (count desc,
@@ -322,12 +318,12 @@ impl Counter {
     pub(crate) fn emit_final<W: Write>(
         &self,
         out: &mut W,
+        formatter: &Formatter,
         tz: &jiff::tz::TimeZone,
-        json: bool,
     ) -> std::io::Result<()> {
         match self.mode {
-            CounterMode::Batched => self.report(out, tz, json),
-            CounterMode::Streaming { .. } => self.flush_remaining(out, tz, json),
+            CounterMode::Batched => self.report(out, formatter, tz),
+            CounterMode::Streaming { .. } => self.flush_remaining(out, formatter, tz),
         }
     }
 
