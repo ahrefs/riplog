@@ -68,8 +68,22 @@ impl Recorders {
     /// Build a fresh `Recorders` for the master or a worker. All collected
     /// state starts empty; `bucket` is the resolved bucket spec (master-side
     /// constructed once, then passed by value into each worker).
-    pub(crate) fn new(cli: &Cli, bucket: Option<ResolvedBucket>) -> Self {
-        let counter = Counter::new(cli.group_by.iter().map(SmartString::from).collect(), bucket);
+    ///
+    /// `streaming_close_grace_nanos` requests streaming output from the
+    /// counter when both a bucket is present and a close-grace is given.
+    /// Workers pass `None`; only the master can stream (workers always
+    /// batch and merge into the master). See `Counter::new` for the
+    /// silent-downgrade rule when `bucket.is_none()`.
+    pub(crate) fn new(
+        cli: &Cli,
+        bucket: Option<ResolvedBucket>,
+        streaming_close_grace_nanos: Option<i64>,
+    ) -> Self {
+        let counter = Counter::new(
+            cli.group_by.iter().map(SmartString::from).collect(),
+            bucket,
+            streaming_close_grace_nanos,
+        );
         Self {
             stats: Stats::default(),
             counter,

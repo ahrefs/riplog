@@ -369,11 +369,11 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
                 add_pairs: &add_view,
                 remove_keys: &remove_view,
             };
-            let mut recorders = Recorders::new(cli, bucket);
+            // stdin always streams when bucketed (no seek; mid-run flush is
+            // the only way to emit closed buckets in order).
+            let streaming_grace = bucket.is_some().then(|| cli.window_nanos());
+            let mut recorders = Recorders::new(cli, bucket, streaming_grace);
             let mut emitter = LineEmitter::new(cli.raw_key.as_deref(), cli.sort_by.as_deref());
-            if bucket.is_some() {
-                recorders.counter.enable_streaming(cli.window_nanos());
-            }
             let tf_default = TimeFilter::default();
             let mut pipeline =
                 Pipeline::new(&filter, &tf_default, &cfg, &mut recorders, &mut emitter);
@@ -397,14 +397,13 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
                 add_pairs: &add_view,
                 remove_keys: &remove_view,
             };
-            let mut recorders = Recorders::new(cli, bucket);
-            let mut emitter = LineEmitter::new(cli.raw_key.as_deref(), cli.sort_by.as_deref());
             // Master streams under follow or when stdin (`-`) is in the file list;
             // workers always batch (their output would interleave on the shared
             // writer otherwise) and merge into the master.
-            if cli.bucket.is_some() && (following || has_stdin) {
-                recorders.counter.enable_streaming(cli.window_nanos());
-            }
+            let master_streaming_grace =
+                (cli.bucket.is_some() && (following || has_stdin)).then(|| cli.window_nanos());
+            let mut recorders = Recorders::new(cli, bucket, master_streaming_grace);
+            let mut emitter = LineEmitter::new(cli.raw_key.as_deref(), cli.sort_by.as_deref());
 
             // Phase 2: stream each planned range in order. Only the last file
             // may attach the follow loop (set during planning).
@@ -427,7 +426,9 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
                         },
                         &mut *output,
                         |mut reader, byte_budget, sink| {
-                            let mut worker_recorders = Recorders::new(cli, bucket);
+                            // Workers always batch; the master is the only
+                            // counter that may stream.
+                            let mut worker_recorders = Recorders::new(cli, bucket, None);
                             let mut worker_emitter =
                                 LineEmitter::new(cli.raw_key.as_deref(), cli.sort_by.as_deref());
                             let worker_tf = line_transform_ref.clone();

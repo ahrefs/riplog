@@ -54,6 +54,28 @@ impl GroupStats {
     }
 }
 
+/// Run-time mode of a `Counter`. Decided once at `Counter::new` from
+/// `(bucket, streaming_close_grace_nanos)` and never changes thereafter.
+///
+/// Encoding the two modes (batched end-of-run report vs. per-bucket
+/// streaming flush) as a sum type makes the precondition impossible to
+/// violate: `Streaming` only exists when a bucket is also present, so the
+/// streaming-flush methods can `let Streaming { .. } = mode` without
+/// re-checking `bucket.is_some()`.
+#[derive(Default)]
+pub(crate) enum CounterMode {
+    #[default]
+    Batched,
+    Streaming {
+        /// Reorder grace; mirrors `--window-secs`. Bucket B is closed (and
+        /// streamed out) once `max_ts_seen > B.end + close_grace_nanos`.
+        close_grace_nanos: i64,
+        /// Highest timestamp observed across all matched lines. Used to
+        /// decide which buckets are past the close threshold.
+        max_ts_seen: Option<Timestamp>,
+    },
+}
+
 /// Groups matched lines by the value tuple of `keys` (and optionally a time
 /// bucket) and records per-group count + observed timestamp range. Missing
 /// user keys produce an empty value slot (rendered as `key.<k>=""` in the
@@ -64,40 +86,34 @@ pub(crate) struct Counter {
     bucket: Option<ResolvedBucket>,
     counts: BTreeMap<Option<Timestamp>, RapidHashMap<Combo, GroupStats>>,
     scratch: String,
-    /// In streaming mode, track the highest timestamp observed across all
-    /// matched lines. Used to decide which buckets are past the close
-    /// threshold (`bucket.end + close_grace_nanos`).
-    max_ts_seen: Option<Timestamp>,
-    /// Reorder grace; mirrors `--window-secs`. Bucket B is closed (and
-    /// streamed out) once `max_ts_seen > B.end + close_grace_nanos`.
-    close_grace_nanos: i64,
-    /// Set in follow mode when `--bucket` is active. When `false`, the
-    /// streaming flush methods are no-ops and end-of-process output goes
-    /// through `report` (today's count-desc, single-emission behaviour).
-    pub(crate) streaming: bool,
+    mode: CounterMode,
 }
 
 impl Counter {
-    pub(crate) fn new(keys: Vec<SmartString>, bucket: Option<ResolvedBucket>) -> Self {
+    /// Build a counter. `streaming_close_grace_nanos`:
+    /// - `None` → batched (end-of-run report only).
+    /// - `Some(g)` with `bucket: Some(_)` → streaming with reorder grace `g`.
+    /// - `Some(_)` with `bucket: None` → silently downgraded to batched
+    ///   (streaming an unbucketed group has no completion signal). Preserves
+    ///   the pre-refactor `enable_streaming` no-op behaviour.
+    pub(crate) fn new(
+        keys: Vec<SmartString>,
+        bucket: Option<ResolvedBucket>,
+        streaming_close_grace_nanos: Option<i64>,
+    ) -> Self {
+        let mode = match (bucket, streaming_close_grace_nanos) {
+            (Some(_), Some(close_grace_nanos)) => CounterMode::Streaming {
+                close_grace_nanos,
+                max_ts_seen: None,
+            },
+            _ => CounterMode::Batched,
+        };
         Self {
             keys,
             bucket,
             counts: BTreeMap::default(),
             scratch: String::new(),
-            max_ts_seen: None,
-            close_grace_nanos: 0,
-            streaming: false,
-        }
-    }
-
-    /// Enable streaming output: per-bucket rows emit as soon as
-    /// `max_ts_seen > bucket.end + close_grace_nanos`. No-op unless
-    /// `bucket` is also set (streaming an unbucketed group has no
-    /// completion signal).
-    pub(crate) fn enable_streaming(&mut self, close_grace_nanos: i64) {
-        if self.bucket.is_some() {
-            self.streaming = true;
-            self.close_grace_nanos = close_grace_nanos;
+            mode,
         }
     }
 
@@ -117,9 +133,9 @@ impl Counter {
             (None, _) => None,
         };
 
-        if self.streaming {
+        if let CounterMode::Streaming { max_ts_seen, .. } = &mut self.mode {
             if let Some(t) = ts {
-                fold_max(&mut self.max_ts_seen, t);
+                fold_max(max_ts_seen, t);
             }
         }
 
@@ -165,7 +181,7 @@ impl Counter {
     }
 
     /// Batch-mode end-of-run report: count desc, ties broken by key.
-    pub(crate) fn report<W: Write>(
+    fn report<W: Write>(
         &self,
         out: &mut W,
         tz: &jiff::tz::TimeZone,
@@ -195,24 +211,28 @@ impl Counter {
     /// Streaming flush: emit and remove every group whose bucket has
     /// passed the close threshold (`bucket.end + close_grace_nanos <
     /// max_ts_seen`). Rows go out in (bucket.start asc, count desc, combo
-    /// asc) order. No-op when `streaming` is false.
+    /// asc) order. No-op in `Batched` mode.
     pub(crate) fn flush_closed<W: Write + ?Sized>(
         &mut self,
         out: &mut W,
         tz: &jiff::tz::TimeZone,
         json: bool,
     ) -> std::io::Result<()> {
-        if !self.streaming {
+        let CounterMode::Streaming {
+            close_grace_nanos,
+            max_ts_seen,
+        } = &self.mode
+        else {
             return Ok(());
-        }
+        };
         let Some(bspec) = self.bucket else {
             return Ok(());
         };
-        let Some(seen) = self.max_ts_seen else {
+        let Some(seen) = *max_ts_seen else {
             return Ok(());
         };
 
-        let close_threshold = seen - bspec.dur_nanos - self.close_grace_nanos;
+        let close_threshold = seen - bspec.dur_nanos - *close_grace_nanos;
 
         let mut open_buckets = self.counts.split_off(&Some(close_threshold));
         if let Some(none_groups) = self.counts.remove(&None) {
@@ -248,7 +268,7 @@ impl Counter {
 
     /// End-of-stream flush: emit any still-open buckets in time order.
     /// Used in place of `report` when streaming.
-    pub(crate) fn flush_remaining<W: Write>(
+    fn flush_remaining<W: Write>(
         &self,
         out: &mut W,
         tz: &jiff::tz::TimeZone,
@@ -274,9 +294,40 @@ impl Counter {
         Ok(())
     }
 
+    /// End-of-run output: dispatches between batched `report` (count desc,
+    /// single emission) and streaming `flush_remaining` (still-open buckets
+    /// in time order) based on `self.mode`. This is the only public
+    /// end-of-run entry point; the two underlying methods stay private to
+    /// this module so callers can't accidentally pick the wrong one.
+    pub(crate) fn emit_final<W: Write>(
+        &self,
+        out: &mut W,
+        tz: &jiff::tz::TimeZone,
+        json: bool,
+    ) -> std::io::Result<()> {
+        match self.mode {
+            CounterMode::Batched => self.report(out, tz, json),
+            CounterMode::Streaming { .. } => self.flush_remaining(out, tz, json),
+        }
+    }
+
     pub(crate) fn merge(&mut self, other: Self) {
-        if let Some(t) = other.max_ts_seen {
-            fold_max(&mut self.max_ts_seen, t);
+        // Only fold `max_ts_seen` when both sides are streaming. In practice
+        // workers always batch and the master decides streaming once, so
+        // mixed pairs only occur if the call path changes; be defensive and
+        // leave `self.mode` untouched in any non-(Streaming, Streaming) case.
+        if let (
+            CounterMode::Streaming {
+                max_ts_seen: self_seen,
+                ..
+            },
+            CounterMode::Streaming {
+                max_ts_seen: Some(other_seen),
+                ..
+            },
+        ) = (&mut self.mode, &other.mode)
+        {
+            fold_max(self_seen, *other_seen);
         }
         for (bucket_ts, groups) in other.counts {
             match self.counts.entry(bucket_ts) {

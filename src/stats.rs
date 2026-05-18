@@ -187,11 +187,7 @@ pub(crate) fn emit_summaries<W: Write>(
 ) -> anyhow::Result<()> {
     recorders.stats.report();
     let json = matches!(cfg.line_mode, crate::sinks::LineMode::Json);
-    if recorders.counter.streaming {
-        recorders.counter.flush_remaining(output, &cfg.tz, json)?;
-    } else {
-        recorders.counter.report(output, &cfg.tz, json)?;
-    }
+    recorders.counter.emit_final(output, &cfg.tz, json)?;
     recorders.keys.report(output, json)?;
     recorders.values.report(output, json)?;
     if count_only {
