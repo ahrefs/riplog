@@ -1,0 +1,82 @@
+{
+  "configs": {
+    "bisect_window": {
+      "branch-misses": 8083385.0,
+      "cache-misses": 168464.0,
+      "cycles": 1256347632.0,
+      "instructions": 5516887326.0,
+      "task-clock": 281.559502
+    },
+    "bucket_1m": {
+      "branch-misses": 17477925.0,
+      "cache-misses": 96879.0,
+      "cycles": 3605813030.0,
+      "instructions": 15577929681.0,
+      "task-clock": 780.107059
+    },
+    "count_only": {
+      "branch-misses": 10880791.0,
+      "cache-misses": 77515.0,
+      "cycles": 1957330921.0,
+      "instructions": 8499594719.0,
+      "task-clock": 448.46104
+    },
+    "filter_level_error": {
+      "branch-misses": 17800356.0,
+      "cache-misses": 83809.0,
+      "cycles": 2692517292.0,
+      "instructions": 10541483202.0,
+      "task-clock": 580.332645
+    },
+    "group_by_level": {
+      "branch-misses": 19382214.0,
+      "cache-misses": 69692.0,
+      "cycles": 4124524047.0,
+      "instructions": 17737051010.0,
+      "task-clock": 871.960413
+    },
+    "json_emit": {
+      "branch-misses": 19524129.0,
+      "cache-misses": 82544.0,
+      "cycles": 3742196989.0,
+      "instructions": 15277061503.0,
+      "task-clock": 820.371538
+    },
+    "n_buckets_10": {
+      "branch-misses": 17499965.0,
+      "cache-misses": 155531.0,
+      "cycles": 3310556241.0,
+      "instructions": 14585653977.0,
+      "task-clock": 721.054744
+    },
+    "parallel_4": {
+      "branch-misses": 17572265.0,
+      "cache-misses": 119146.0,
+      "cycles": 2669289933.0,
+      "instructions": 10595907676.0,
+      "task-clock": 725.695977
+    },
+    "passthrough_no_filter": {
+      "branch-misses": 11099046.0,
+      "cache-misses": 64245.0,
+      "cycles": 2027494987.0,
+      "instructions": 8883399353.0,
+      "task-clock": 449.486988
+    },
+    "sort_by_time": {
+      "branch-misses": 18308635.0,
+      "cache-misses": 1656541.0,
+      "cycles": 3593820301.0,
+      "instructions": 13367631235.0,
+      "task-clock": 822.25282
+    }
+  },
+  "fixture_sha256": "56eb0dcb4084fd96de0696c51e985bbd240d0398156f4641cdd30f748c0faf83",
+  "perf_event_args": [
+    "task-clock",
+    "instructions",
+    "cycles",
+    "branch-misses",
+    "cache-misses"
+  ]
+}
