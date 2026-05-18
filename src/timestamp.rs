@@ -4,6 +4,18 @@ use std::fmt::Write as _;
 
 pub type Timestamp = i64;
 
+/// Fold `t` into `slot`, keeping the minimum. `None` becomes `Some(t)`.
+#[inline]
+pub(crate) fn fold_min(slot: &mut Option<Timestamp>, t: Timestamp) {
+    *slot = Some(slot.map_or(t, |cur| cur.min(t)));
+}
+
+/// Fold `t` into `slot`, keeping the maximum. `None` becomes `Some(t)`.
+#[inline]
+pub(crate) fn fold_max(slot: &mut Option<Timestamp>, t: Timestamp) {
+    *slot = Some(slot.map_or(t, |cur| cur.max(t)));
+}
+
 /// Parse an RFC 3339 / ISO 8601 timestamp into nanoseconds since the Unix epoch.
 ///
 /// Accepts:

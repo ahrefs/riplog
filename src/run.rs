@@ -6,7 +6,7 @@ use anyhow::Context as _;
 use std::{
     fs::File,
     io::{BufRead, BufReader, BufWriter, IsTerminal, Read, Seek, SeekFrom, Write},
-    path::Path,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -109,6 +109,49 @@ impl<'a> ExecutionMode<'a> {
     }
 }
 
+/// Resolve `--from`/`--to` once against the union of all files' time windows.
+///
+/// Symbolic anchors (`start`, `end`, `start+1h`, etc.) refer to the *global*
+/// span, not each file's local one — so with two log files around a rotation,
+/// `--from start+1h --to start+2h` is one contiguous absolute window applied
+/// across both files, not two disjoint slices.
+///
+/// Returns `(tf, global_first, global_last)`. The global window is returned
+/// alongside `tf` because the caller still needs it to resolve the bucket
+/// spec (`--n-buckets` divides that span); folding bucket resolution into
+/// this helper would conflate two concerns, so we hand the window back.
+/// When neither `--from`, `--to`, nor `--n-buckets` is set, the file probe
+/// is skipped and both bounds are `None`.
+fn resolve_time_filter(
+    cli: &Cli,
+    files: &[PathBuf],
+) -> anyhow::Result<(TimeFilter, Option<Timestamp>, Option<Timestamp>)> {
+    let need_global = cli.from.is_some() || cli.to.is_some() || cli.n_buckets.is_some();
+    let (global_first, global_last) = if need_global {
+        peek_global_window(files)?
+    } else {
+        (None, None)
+    };
+    let mut tf = TimeFilter::default();
+    if let Some(s) = cli.from.as_deref() {
+        tf.from = Some(timestamp::resolve_bound(
+            s,
+            global_first,
+            global_last,
+            global_first,
+        )?);
+    }
+    if let Some(s) = cli.to.as_deref() {
+        tf.to = Some(timestamp::resolve_bound(
+            s,
+            global_first,
+            global_last,
+            global_last,
+        )?);
+    }
+    Ok((tf, global_first, global_last))
+}
+
 /// Classify the run into one of the `ExecutionMode` arms. All CLI validations
 /// that don't depend on output state happen here (and in the same order they
 /// did pre-refactor), so the error messages and short-circuit behaviour are
@@ -158,34 +201,7 @@ fn classify<'a>(cli: &'a Cli, following: bool) -> anyhow::Result<ExecutionMode<'
         return Ok(ExecutionMode::TimeRange);
     }
 
-    // Resolve `--from`/`--to` once against the union of all files' time
-    // windows. Symbolic anchors (`start`, `end`, `start+1h`, etc.) refer to
-    // the *global* span, not each file's local one — so with two log files
-    // around a rotation, `--from start+1h --to start+2h` is one contiguous
-    // absolute window applied across both files, not two disjoint slices.
-    let need_global = cli.from.is_some() || cli.to.is_some() || cli.n_buckets.is_some();
-    let (global_first, global_last) = if need_global {
-        peek_global_window(&cli.files)?
-    } else {
-        (None, None)
-    };
-    let mut tf = TimeFilter::default();
-    if let Some(s) = cli.from.as_deref() {
-        tf.from = Some(timestamp::resolve_bound(
-            s,
-            global_first,
-            global_last,
-            global_first,
-        )?);
-    }
-    if let Some(s) = cli.to.as_deref() {
-        tf.to = Some(timestamp::resolve_bound(
-            s,
-            global_first,
-            global_last,
-            global_last,
-        )?);
-    }
+    let (tf, global_first, global_last) = resolve_time_filter(cli, &cli.files)?;
 
     // Resolve the bucket spec now that the time window is known. Two forms:
     // - `--bucket=DURATION`: epoch-aligned grid (origin = 0).

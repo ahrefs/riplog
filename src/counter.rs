@@ -12,7 +12,7 @@ use std::io::Write;
 use crate::bucket::ResolvedBucket;
 use crate::output::{Formatter, OutputFormat};
 use crate::raw_extractor::unescape_for_key;
-use crate::timestamp::Timestamp;
+use crate::timestamp::{fold_max, fold_min, Timestamp};
 
 pub(crate) type Combo = SmallVec<[SmartString; 3]>;
 
@@ -33,16 +33,6 @@ pub(crate) struct GroupStats {
     pub(crate) count: usize,
     pub(crate) min_ts: Option<Timestamp>,
     pub(crate) max_ts: Option<Timestamp>,
-}
-
-#[inline]
-pub(crate) fn fold_min(slot: &mut Option<Timestamp>, t: Timestamp) {
-    *slot = Some(slot.map_or(t, |cur| cur.min(t)));
-}
-
-#[inline]
-pub(crate) fn fold_max(slot: &mut Option<Timestamp>, t: Timestamp) {
-    *slot = Some(slot.map_or(t, |cur| cur.max(t)));
 }
 
 impl GroupStats {
@@ -133,6 +123,7 @@ impl Counter {
         !self.keys.is_empty() || self.bucket.is_some()
     }
 
+    #[inline]
     pub(crate) fn record(&mut self, pairs: &[(&str, &str)], ts: Option<Timestamp>) {
         if !self.is_active() {
             return;

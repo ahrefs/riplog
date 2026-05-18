@@ -28,20 +28,21 @@ pub(crate) fn intern_into_set(set: &mut RapidHashSet<SmartString>, s: &str) {
 /// `--list-keys` is set; in that mode line output is suppressed.
 #[derive(Default)]
 pub(crate) struct KeyGather {
-    enabled: bool,
+    is_active: bool,
     keys: RapidHashSet<SmartString>,
 }
 
 impl KeyGather {
-    pub(crate) fn new(enabled: bool) -> Self {
+    pub(crate) fn new(is_active: bool) -> Self {
         Self {
-            enabled,
+            is_active,
             keys: RapidHashSet::default(),
         }
     }
 
+    #[inline]
     pub(crate) fn record(&mut self, pairs: &[(&str, &str)]) {
-        if !self.enabled {
+        if !self.is_active {
             return;
         }
         for (k, _) in pairs {
@@ -54,7 +55,7 @@ impl KeyGather {
         out: &mut W,
         formatter: &Formatter,
     ) -> std::io::Result<()> {
-        if !self.enabled {
+        if !self.is_active {
             return Ok(());
         }
         formatter.string_set(out, &self.keys)
@@ -90,6 +91,7 @@ impl ValueGather {
         !self.keys.is_empty()
     }
 
+    #[inline]
     pub(crate) fn record(&mut self, pairs: &[(&str, &str)]) {
         if !self.is_active() {
             return;

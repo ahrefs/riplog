@@ -141,6 +141,7 @@ impl LineEmitter {
     ///
     /// Handles `--raw-key` extraction, the passthrough memcpy fast path,
     /// and the format-dispatched slow path.
+    #[inline]
     pub(crate) fn emit<W: Write + ?Sized>(
         &mut self,
         parsed: &[(&str, &str)],

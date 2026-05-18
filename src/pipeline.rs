@@ -66,6 +66,7 @@ impl<'a> Pipeline<'a> {
     /// preserved verbatim in passthrough output. The caller owns the buffer
     /// (typically a slice into a `BufReader`'s internal buffer or a small
     /// carry-over `Vec`).
+    #[inline]
     pub(crate) fn process_line<W: Write + ?Sized>(
         &mut self,
         line: &[u8],
