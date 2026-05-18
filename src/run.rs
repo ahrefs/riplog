@@ -573,6 +573,110 @@ fn flush_closed_chunk<W: Write + ?Sized>(
     sinks.counter.flush_closed(output, &sinks.tz, json)
 }
 
+/// Outcome of scanning one filled buffer.
+enum ChunkOutcome {
+    /// Full chunk processed; caller should keep going.
+    Full,
+    /// `--limit` reached mid-chunk: `usize` is the byte count to `consume()`.
+    /// Caller has already had `flush_closed_chunk` invoked and should break.
+    HitLimit,
+}
+
+/// Owns the per-stream carry-over buffer (`tail`) for a partial line that
+/// straddles two `fill_buf` chunks, plus the cumulative byte count used by
+/// `stream_bounded` to honour its byte budget. Shared by all three streaming
+/// loops (bounded byte range, unbounded stdin/pipe, follow mode); the
+/// loop-specific behaviours (byte cap, per-chunk `output.flush`, empty-chunk
+/// action) live in the callers.
+struct LineScanner {
+    tail: Vec<u8>,
+    total_read: u64,
+}
+
+impl LineScanner {
+    fn new() -> Self {
+        Self {
+            tail: Vec::new(),
+            total_read: 0,
+        }
+    }
+
+    /// Scan one `fill_buf` chunk: emit one line per `\n` (carrying over the
+    /// `tail` partial-line buffer), check `sinks.done()` after each line for
+    /// mid-chunk `--limit` exit, then `reader.consume()` the bytes processed
+    /// and run `flush_closed_chunk` for the per-chunk streaming-bucket flush.
+    ///
+    /// `usable` is the caller-trimmed view of the chunk (bounded readers
+    /// shrink it to fit the remaining byte budget; unbounded uses the full
+    /// chunk). The returned `ChunkOutcome` tells the caller whether to keep
+    /// looping or break for `--limit`.
+    fn scan_chunk<R: BufRead, W: Write + ?Sized>(
+        &mut self,
+        reader: &mut R,
+        usable_len: usize,
+        pipeline: &mut Pipeline<'_>,
+        output: &mut W,
+    ) -> anyhow::Result<ChunkOutcome> {
+        // Re-borrow the chunk here: callers passed us the trimmed length, not
+        // the slice, because the buffer is borrowed from `reader` and we need
+        // a fresh borrow scope to also call `reader.consume`.
+        let chunk = reader.fill_buf()?;
+        let usable = &chunk[..usable_len];
+
+        let mut start = 0;
+        let mut hit_limit_at: Option<usize> = None;
+        for nl in memchr::memchr_iter(b'\n', usable) {
+            if self.tail.is_empty() {
+                pipeline.process_line(&usable[start..=nl], output)?;
+            } else {
+                // add the beginning of the line, saved from previous call
+                self.tail.extend_from_slice(&usable[start..=nl]);
+                pipeline.process_line(&self.tail, output)?;
+                self.tail.clear();
+            }
+            start = nl + 1;
+            if pipeline.sinks.done() {
+                hit_limit_at = Some(nl + 1);
+                break;
+            }
+        }
+        if let Some(consumed) = hit_limit_at {
+            reader.consume(consumed);
+            // Final per-chunk flush for buckets that may have just closed.
+            flush_closed_chunk(pipeline, output)?;
+            return Ok(ChunkOutcome::HitLimit);
+        }
+        if start < usable_len {
+            self.tail.extend_from_slice(&usable[start..usable_len]);
+        }
+        reader.consume(usable_len);
+        self.total_read += usable_len as u64;
+        // Per-chunk streaming-bucket flush: no-op when streaming is off
+        // (the common case), real work only when `-f`/`-F` + `--bucket`.
+        flush_closed_chunk(pipeline, output)?;
+        Ok(ChunkOutcome::Full)
+    }
+
+    /// Process the trailing partial line at EOF (no terminating `\n`). Used
+    /// by the non-follow loops; `follow_loop` deliberately leaves a non-empty
+    /// `tail` in place between polls so more bytes can complete the line.
+    /// Returns `true` if it actually emitted the partial line (i.e. tail was
+    /// non-empty AND `sinks.done()` was false), so the unbounded caller knows
+    /// whether to chase it with an `output.flush()`.
+    fn finish_eof<W: Write + ?Sized>(
+        &mut self,
+        pipeline: &mut Pipeline<'_>,
+        output: &mut W,
+    ) -> anyhow::Result<bool> {
+        if !self.tail.is_empty() && !pipeline.sinks.done() {
+            pipeline.process_line(&self.tail, output)?;
+            flush_closed_chunk(pipeline, output)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+}
+
 /// Read a fixed byte budget from `reader`, write matching lines to `output`.
 ///
 /// Uses `fill_buf` + `memchr::memchr_iter` so newline scanning is one SIMD
@@ -585,54 +689,26 @@ pub(crate) fn stream_bounded<R: BufRead, W: Write + ?Sized>(
     pipeline: &mut Pipeline<'_>,
     output: &mut W,
 ) -> anyhow::Result<()> {
-    let mut tail: Vec<u8> = Vec::new();
-    let mut total_read: u64 = 0;
+    let mut scan = LineScanner::new();
 
-    'outer: while total_read < max_bytes && !interrupted() {
-        let chunk = reader.fill_buf()?;
-        if chunk.is_empty() {
+    while scan.total_read < max_bytes && !interrupted() {
+        let chunk_len = {
+            let chunk = reader.fill_buf()?;
+            chunk.len()
+        };
+        if chunk_len == 0 {
             break;
         }
-        let remaining = (max_bytes - total_read) as usize;
-        let usable_len = chunk.len().min(remaining);
-        let usable = &chunk[..usable_len];
-
-        let mut start = 0;
-        let mut hit_limit_at: Option<usize> = None;
-        for nl in memchr::memchr_iter(b'\n', usable) {
-            if tail.is_empty() {
-                pipeline.process_line(&usable[start..=nl], output)?;
-            } else {
-                tail.extend_from_slice(&usable[start..=nl]);
-                pipeline.process_line(&tail, output)?;
-                tail.clear();
-            }
-            start = nl + 1;
-            if pipeline.sinks.done() {
-                hit_limit_at = Some(nl + 1);
-                break;
-            }
+        let remaining = (max_bytes - scan.total_read) as usize;
+        let usable_len = chunk_len.min(remaining);
+        if matches!(
+            scan.scan_chunk(reader, usable_len, pipeline, output)?,
+            ChunkOutcome::HitLimit
+        ) {
+            break;
         }
-        if let Some(consumed) = hit_limit_at {
-            reader.consume(consumed);
-            // Final per-chunk flush for buckets that may have just closed.
-            flush_closed_chunk(pipeline, output)?;
-            break 'outer;
-        }
-        if start < usable_len {
-            tail.extend_from_slice(&usable[start..usable_len]);
-        }
-        reader.consume(usable_len);
-        total_read += usable_len as u64;
-        // Per-chunk streaming-bucket flush: no-op when streaming is off
-        // (the common case), real work only when `-f`/`-F` + `--bucket`.
-        flush_closed_chunk(pipeline, output)?;
     }
-    // Trailing partial line at EOF (no newline). Process it if anything's there.
-    if !tail.is_empty() && !pipeline.sinks.done() {
-        pipeline.process_line(&tail, output)?;
-        flush_closed_chunk(pipeline, output)?;
-    }
+    let _ = scan.finish_eof(pipeline, output)?;
     Ok(())
 }
 
@@ -643,52 +719,37 @@ fn stream_unbounded<R: Read, W: Write>(
     output: &mut W,
 ) -> anyhow::Result<()> {
     let mut reader = BufReader::with_capacity(STREAM_BUF_CAP, reader);
-    let mut tail: Vec<u8> = Vec::new();
+    let mut scan = LineScanner::new();
 
-    // Per-chunk flush instead of per-line: interactive `tail -f | riplog`
-    // accepts batch-latency (bounded by chunk size ~64 KB) for higher
-    // throughput. If a user reports lag on interactive pipes, gate this on
-    // `stdout().is_terminal()` and revert to per-line flush in that case.
-    'outer: while !interrupted() {
-        let chunk = reader.fill_buf()?;
-        if chunk.is_empty() {
+    // Per-chunk `output.flush()` instead of per-line: interactive
+    // `tail -f | riplog` accepts batch-latency (bounded by chunk size
+    // ~128 KB) for higher throughput. If a user reports lag on interactive
+    // pipes, gate this on `stdout().is_terminal()` and revert to per-line
+    // flush in that case.
+    //
+    // NOTE: `stream_bounded` does NOT do a per-chunk `output.flush()` (it
+    // flushes once at the end of `stream_plan`). That asymmetry is
+    // deliberate-for-now — the bounded path is the bulk-throughput one and a
+    // single trailing flush is cheaper. If it ever becomes a bug, surface it
+    // here rather than fixing it silently.
+    while !interrupted() {
+        let chunk_len = {
+            let chunk = reader.fill_buf()?;
+            chunk.len()
+        };
+        if chunk_len == 0 {
             break;
         }
-        let usable_len = chunk.len();
-        let usable = &chunk[..usable_len];
-
-        let mut start = 0;
-        let mut hit_limit_at: Option<usize> = None;
-        for nl in memchr::memchr_iter(b'\n', usable) {
-            if tail.is_empty() {
-                pipeline.process_line(&usable[start..=nl], output)?;
-            } else {
-                tail.extend_from_slice(&usable[start..=nl]);
-                pipeline.process_line(&tail, output)?;
-                tail.clear();
-            }
-            start = nl + 1;
-            if pipeline.sinks.done() {
-                hit_limit_at = Some(nl + 1);
-                break;
-            }
-        }
-        if let Some(consumed) = hit_limit_at {
-            reader.consume(consumed);
-            flush_closed_chunk(pipeline, output)?;
-            output.flush()?;
-            break 'outer;
-        }
-        if start < usable_len {
-            tail.extend_from_slice(&usable[start..usable_len]);
-        }
-        reader.consume(usable_len);
-        flush_closed_chunk(pipeline, output)?;
+        let outcome = scan.scan_chunk(&mut reader, chunk_len, pipeline, output)?;
         output.flush()?;
+        if matches!(outcome, ChunkOutcome::HitLimit) {
+            break;
+        }
     }
-    if !tail.is_empty() && !pipeline.sinks.done() {
-        pipeline.process_line(&tail, output)?;
-        flush_closed_chunk(pipeline, output)?;
+    if scan.finish_eof(pipeline, output)? {
+        // Mirror the original unbounded behaviour of flushing `output` after
+        // emitting a trailing partial line; `finish_eof` only flushes the
+        // `Counter`.
         output.flush()?;
     }
     Ok(())
@@ -703,15 +764,18 @@ fn follow_loop<W: Write>(
     output: &mut W,
 ) -> anyhow::Result<()> {
     let mut pos = reader.stream_position()?;
-    let mut tail: Vec<u8> = Vec::new();
+    let mut scan = LineScanner::new();
 
     while !interrupted() {
-        let chunk = reader.fill_buf()?;
-        if chunk.is_empty() {
+        let chunk_len = {
+            let chunk = reader.fill_buf()?;
+            chunk.len()
+        };
+        if chunk_len == 0 {
             // No bytes available right now. If we have a buffered partial line,
             // just wait — don't process it yet (more bytes may complete it).
             output.flush()?;
-            if tail.is_empty() && reopen {
+            if scan.tail.is_empty() && reopen {
                 if let Some((new_handle, new_reader)) = check_rotation(path, &handle, pos)? {
                     log::info!(
                         "follow: file rotated/truncated; reopening {}",
@@ -726,36 +790,13 @@ fn follow_loop<W: Write>(
             std::thread::sleep(FOLLOW_POLL);
             continue;
         }
-        let usable_len = chunk.len();
-        let usable = &chunk[..usable_len];
-
-        let mut start = 0;
-        let mut hit_limit_at: Option<usize> = None;
-        for nl in memchr::memchr_iter(b'\n', usable) {
-            if tail.is_empty() {
-                pipeline.process_line(&usable[start..=nl], output)?;
-            } else {
-                tail.extend_from_slice(&usable[start..=nl]);
-                pipeline.process_line(&tail, output)?;
-                tail.clear();
-            }
-            start = nl + 1;
-            if pipeline.sinks.done() {
-                hit_limit_at = Some(nl + 1);
-                break;
-            }
-        }
-        if let Some(consumed) = hit_limit_at {
-            reader.consume(consumed);
-            flush_closed_chunk(pipeline, output)?;
+        let outcome = scan.scan_chunk(&mut reader, chunk_len, pipeline, output)?;
+        // `scan_chunk` advances `total_read` by `usable_len`; mirror that
+        // into the follow-specific `pos` used by `check_rotation`.
+        pos += chunk_len as u64;
+        if matches!(outcome, ChunkOutcome::HitLimit) {
             break;
         }
-        if start < usable_len {
-            tail.extend_from_slice(&usable[start..usable_len]);
-        }
-        reader.consume(usable_len);
-        pos += usable_len as u64;
-        flush_closed_chunk(pipeline, output)?;
     }
     Ok(())
 }
