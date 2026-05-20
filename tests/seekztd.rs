@@ -7,29 +7,26 @@ mod common;
 
 use common::{big_fixture, fixture_path, riplog_bin, run};
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
-/// Run `zeekstd compress` against `input` and cache the resulting archive
-/// alongside the plain fixture. Panics with a clear message if `zeekstd` is
-/// not on `PATH`.
+/// Compress `input` into a seekable-zstd archive at `<tmp>/<name>` using the
+/// `zeekstd` crate directly — no external CLI dependency. Frame size left at
+/// the crate default (2 MiB) so tests exercise the same layout the CLI
+/// produces in practice.
 fn compress_seekztd(input: &Path, name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join("riplog-it");
     fs::create_dir_all(&dir).unwrap();
     let out = dir.join(name);
     let _ = fs::remove_file(&out);
-    let st = Command::new("zeekstd")
-        .args(["compress", "--quiet", "-o"])
-        .arg(&out)
-        .arg(input)
-        .status()
-        .expect(
-            "zeekstd CLI not found on PATH; install with `cargo install zeekstd_cli` to run \
-             seekztd tests",
-        );
-    assert!(st.success(), "zeekstd compress failed for {input:?}");
+
+    let mut src = fs::File::open(input).unwrap();
+    let dst = fs::File::create(&out).unwrap();
+    let mut enc = zeekstd::Encoder::new(dst).unwrap();
+    io::copy(&mut src, &mut enc).unwrap();
+    enc.finish().unwrap();
     out
 }
 
@@ -143,6 +140,62 @@ fn streaming_zst_warns_and_counts() {
     assert!(
         err.contains("no seek table") || err.contains("falling back"),
         "expected streaming fallback warning, got: {err}"
+    );
+}
+
+/// Run `args + [zst_path]` and `args + [plain_path]`, assert byte-identical
+/// stdout. The streaming fallback emits a fallback warning on stderr; we
+/// ignore stderr here and only compare stdout.
+fn assert_zst_matches_plain(args: &[&str], zst_path: &Path, plain_path: &Path) {
+    let zst_args: Vec<&str> = args
+        .iter()
+        .copied()
+        .chain(std::iter::once(zst_path.to_str().unwrap()))
+        .collect();
+    let plain_args: Vec<&str> = args
+        .iter()
+        .copied()
+        .chain(std::iter::once(plain_path.to_str().unwrap()))
+        .collect();
+    let zst = run(&zst_args);
+    let plain = run(&plain_args);
+    assert_eq!(
+        zst.stdout, plain.stdout,
+        "streaming-zst output diverged from plain for {args:?}"
+    );
+}
+
+#[test]
+fn streaming_zst_group_by_matches_plain() {
+    assert_zst_matches_plain(
+        &["--count", "--group-by=level"],
+        streaming_zst_fixture(),
+        fixture_path(),
+    );
+}
+
+#[test]
+fn streaming_zst_if_filter_matches_plain() {
+    assert_zst_matches_plain(
+        &["--count", "--if=level=error"],
+        streaming_zst_fixture(),
+        fixture_path(),
+    );
+}
+
+#[test]
+fn streaming_zst_list_keys_matches_plain() {
+    assert_zst_matches_plain(&["--list-keys"], streaming_zst_fixture(), fixture_path());
+}
+
+#[test]
+fn streaming_zst_parallel_falls_back_to_sequential() {
+    // -j is silently demoted to sequential for streaming inputs (they can't
+    // be split by byte offset). Output must still match plain.
+    assert_zst_matches_plain(
+        &["-j=4", "--count", "--group-by=level"],
+        streaming_zst_fixture(),
+        fixture_path(),
     );
 }
 
