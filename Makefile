@@ -12,6 +12,9 @@ release-static:
 	@bin="$${CARGO_TARGET_DIR:-target}/$(TARGET_MUSL)/release/riplog"; \
 		ls -lh "$$bin"; file "$$bin"
 
+build-profiling:
+	cargo build --profile=profiling
+
 install:
 	cargo install --path=.
 
