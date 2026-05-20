@@ -14,6 +14,7 @@ use crate::bucket::{self, BucketSpec, ResolvedBucket};
 use crate::cli::{Cli, ColorMode};
 use crate::file_plan::{peek_global_window, plan_file, FilePlan};
 use crate::filter::Filter;
+use crate::input::FileInput;
 use crate::json::JsonlFormat;
 use crate::logfmt::LogfmtFormat;
 use crate::output::Formatter;
@@ -237,6 +238,30 @@ fn classify<'a>(cli: &'a Cli, following: bool) -> anyhow::Result<ExecutionMode<'
         })
         .collect::<anyhow::Result<_>>()?;
 
+    for plan in &plans {
+        if plan.streaming && !is_stdin_path(plan.path) {
+            if cli.time_range || cli.from.is_some() || cli.to.is_some() {
+                anyhow::bail!(
+                    "{}: streaming zstd input cannot be combined with `--time-range`, \
+                     `--from`, or `--to`; re-compress with `zeekstd compress`",
+                    plan.path.display()
+                );
+            }
+            if following {
+                anyhow::bail!(
+                    "{}: streaming zstd input cannot be combined with `-f`/`-F`",
+                    plan.path.display()
+                );
+            }
+        }
+        if plan.seek_table.is_some() && plan.follow_this_file {
+            anyhow::bail!(
+                "{}: seekable-zstd archive cannot be followed (sealed footer)",
+                plan.path.display()
+            );
+        }
+    }
+
     Ok(ExecutionMode::Files {
         plans,
         bucket,
@@ -343,7 +368,13 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
             let mut overall_first: Option<Timestamp> = None;
             let mut overall_last: Option<Timestamp> = None;
             for path in &cli.files {
-                let mut file = File::open(path)?;
+                let mut file = FileInput::open(path)?;
+                if !file.supports_seek() {
+                    anyhow::bail!(
+                        "{}: streaming zstd input cannot be combined with `--time-range`",
+                        path.display()
+                    );
+                }
                 let t0 = Instant::now();
                 let (first, last) = time_bisect::time_range(&mut file)?;
                 log::info!(
@@ -438,7 +469,11 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
                 if interrupted() || pipeline_done(&cfg, &recorders) {
                     break;
                 }
-                if n_workers > 1 && !plan.follow_this_file && !is_stdin_path(plan.path) {
+                if n_workers > 1
+                    && !plan.follow_this_file
+                    && !plan.streaming
+                    && !is_stdin_path(plan.path)
+                {
                     let plan_tf = plan.tf;
                     let filter_ref = &filter;
                     let line_transform_ref = &line_transform;
@@ -449,6 +484,7 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
                             start_byte: plan.start_byte,
                             max_bytes: plan.max_bytes,
                             n_workers,
+                            seek_table: plan.seek_table,
                         },
                         &mut *output,
                         |mut reader, byte_budget, sink| {
@@ -539,6 +575,8 @@ fn stream_plan<W: Write>(
         max_bytes,
         tf,
         follow_this_file,
+        streaming,
+        seek_table,
     } = plan;
 
     if is_stdin_path(path) {
@@ -548,31 +586,33 @@ fn stream_plan<W: Write>(
         return stream_unbounded(&mut std::io::stdin().lock(), &mut pipeline, output);
     }
 
-    let mut file = File::open(path)?;
-    file.seek(SeekFrom::Start(start_byte))?;
-    let file_for_reopen = if follow_this_file {
-        Some(file.try_clone().with_context(|| {
+    if streaming {
+        // Streaming zstd: no seek, no follow (rejected earlier). Treat like
+        // stdin — the per-line `TimeFilter::check` enforces the window.
+        let mut input = FileInput::open(path)?;
+        let mut pipeline = Pipeline::new(filter, &tf, cfg, recorders, emitter);
+        return stream_unbounded(&mut input, &mut pipeline, output);
+    }
+
+    if follow_this_file {
+        // Follow only fires on plain files (rejected for seekable-zstd in
+        // classify). Keep the `File`-typed reader so `follow_loop` can dup
+        // the handle for rotation detection.
+        let mut file = File::open(path)?;
+        file.seek(SeekFrom::Start(start_byte))?;
+        let handle = file.try_clone().with_context(|| {
             format!(
                 "dup file handle for follow-mode rotation tracking: {}",
                 path.display()
             )
-        })?)
-    } else {
-        None
-    };
-    let mut reader = BufReader::with_capacity(STREAM_BUF_CAP, file);
-
-    {
-        let mut pipeline = Pipeline::new(filter, &tf, cfg, &mut *recorders, &mut *emitter);
-        stream_bounded(&mut reader, max_bytes, &mut pipeline, output)?;
-    }
-    output.flush()?;
-
-    if let Some(handle) = file_for_reopen {
+        })?;
+        let mut reader = BufReader::with_capacity(STREAM_BUF_CAP, file);
+        {
+            let mut pipeline = Pipeline::new(filter, &tf, cfg, &mut *recorders, &mut *emitter);
+            stream_bounded(&mut reader, max_bytes, &mut pipeline, output)?;
+        }
+        output.flush()?;
         if !interrupted() && !pipeline_done(cfg, recorders) {
-            // Follow mode ignores the per-file `tf` (newly arrived lines have
-            // no resolved time bound), matching the previous behavior where
-            // `follow_loop` passed `TimeFilter::default()`.
             let tf_follow = TimeFilter::default();
             let mut pipeline = Pipeline::new(filter, &tf_follow, cfg, recorders, emitter);
             follow_loop(
@@ -584,8 +624,17 @@ fn stream_plan<W: Write>(
                 output,
             )?;
         }
+        return Ok(());
     }
 
+    let mut input = FileInput::open_with_table(path, seek_table.as_ref())?;
+    input.seek(SeekFrom::Start(start_byte))?;
+    let mut reader = BufReader::with_capacity(STREAM_BUF_CAP, input);
+    {
+        let mut pipeline = Pipeline::new(filter, &tf, cfg, &mut *recorders, &mut *emitter);
+        stream_bounded(&mut reader, max_bytes, &mut pipeline, output)?;
+    }
+    output.flush()?;
     Ok(())
 }
 

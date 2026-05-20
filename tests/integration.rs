@@ -2,6 +2,9 @@
 //! `tests/generate_logs.py` with a fixed seed and start time, so output is
 //! deterministic across runs.
 
+mod common;
+
+use common::{big_fixture, fixture_path, lines, riplog_bin, run, COUNT};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -10,74 +13,12 @@ use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
 
-const SEED: &str = "42";
-const COUNT: usize = 200;
-const START_TIME: &str = "2026-04-24T18:00:00Z";
-
 // Distribution of `level=` in the seed=42, count=200 fixture (precomputed).
 const N_DEBUG: usize = 54;
 const N_ERROR: usize = 49;
 const N_INFO: usize = 51;
 const N_WARN: usize = 43;
 const N_CRITICAL: usize = 3;
-
-fn riplog_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_riplog"))
-}
-
-fn project_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-}
-
-/// Generate the standard fixture once per test process.
-fn fixture_path() -> &'static Path {
-    static PATH: OnceLock<PathBuf> = OnceLock::new();
-    PATH.get_or_init(|| {
-        let dir = std::env::temp_dir().join("riplog-it");
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(format!("fixture-seed{SEED}-n{COUNT}.log"));
-        let script = project_root().join("tests/generate_logs.py");
-        // Rate=10 → 200 lines spans 20 seconds, leaves room for time-window
-        // tests that pick sub-second slices.
-        let out = Command::new("python3")
-            .arg(&script)
-            .arg("--rate=10")
-            .arg(format!("--count={COUNT}"))
-            .arg(format!("--seed={SEED}"))
-            .arg(format!("--start-time={START_TIME}"))
-            .output()
-            .expect("python3 not available, or generate_logs.py missing");
-        assert!(
-            out.status.success(),
-            "fixture generation failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        fs::write(&path, &out.stdout).unwrap();
-        path
-    })
-    .as_path()
-}
-
-fn run(args: &[&str]) -> std::process::Output {
-    let out = Command::new(riplog_bin())
-        .args(args)
-        .output()
-        .expect("spawn riplog");
-    assert!(
-        out.status.success(),
-        "riplog {:?} failed: {}",
-        args,
-        String::from_utf8_lossy(&out.stderr)
-    );
-    out
-}
-
-fn lines(s: &[u8]) -> Vec<String> {
-    String::from_utf8_lossy(s)
-        .lines()
-        .map(str::to_string)
-        .collect()
-}
 
 #[test]
 fn count_no_filter() {
@@ -868,41 +809,6 @@ fn stdin_rejects_seek_flags() {
         stderr.contains("require a file argument"),
         "stderr was: {stderr}"
     );
-}
-
-/// ~24 MiB synthetic logfmt fixture, big enough to actually split across 4
-/// workers (`MIN_BYTES_PER_WORKER * 4 = 16 MiB`). Cached for the test process.
-fn big_fixture() -> &'static Path {
-    static PATH: OnceLock<PathBuf> = OnceLock::new();
-    PATH.get_or_init(|| {
-        let dir = std::env::temp_dir().join("riplog-it");
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("big-fixture.log");
-        let mut buf: Vec<u8> = Vec::with_capacity(24 * 1024 * 1024);
-        for i in 0..500_000u64 {
-            let level = match i % 5 {
-                0 => "info",
-                1 => "warn",
-                2 => "error",
-                3 => "debug",
-                _ => "critical",
-            };
-            let secs = i / 10;
-            let frac = (i % 10) * 100_000;
-            let line = format!(
-                "time=2026-04-24T18:{:02}:{:02}.{:06}Z level={} msg=\"line {}\"\n",
-                secs / 60 % 60,
-                secs % 60,
-                frac,
-                level,
-                i,
-            );
-            buf.extend_from_slice(line.as_bytes());
-        }
-        fs::write(&path, &buf).unwrap();
-        path
-    })
-    .as_path()
 }
 
 #[test]

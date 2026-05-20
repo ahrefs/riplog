@@ -23,14 +23,20 @@ for slicing large rotated log files by time range and key/value queries
 without having to grep + awk by hand."""
 
 [features]
-default = []
+default = ["zeekstd"]
 # Embed the IANA tzdb in the binary so named timezones (`Europe/Paris`, …)
 # work on hosts that don't ship `/usr/share/zoneinfo` (e.g. scratch/alpine
 # containers). Adds ~600 KiB; enable for static release builds.
 bundled-tzdb = ["jiff/tzdb-bundle-always"]
+# Decompress `.zst`/`.zstd` inputs. Seekable-zstd archives (zeekstd) get
+# the full bisect/parallel/follow feature set; classic streaming zstd
+# falls back to the stdin-style forward-read path.
+zeekstd = ["dep:zeekstd", "dep:zstd"]
 
 [dependencies]
 anyhow = "1.0.102"
+zeekstd = { version = "0.6", optional = true }
+zstd = { version = "0.13", optional = true }
 clap = { version = "4.6.1", features = ["derive", "env", "wrap_help"] }
 ctrlc = "3"
 env_logger = "0.11.10"
