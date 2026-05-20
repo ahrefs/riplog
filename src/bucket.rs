@@ -2,7 +2,7 @@
 //! resolver for `--bucket` / `--n-buckets`.
 
 use crate::cli::Cli;
-use crate::timestamp::{self, Timestamp};
+use crate::timestamp::Timestamp;
 
 /// User-supplied bucketing input, parsed from CLI flags. One step removed
 /// from a concrete grid: `NBuckets` still needs the active time window to
@@ -52,7 +52,7 @@ impl BucketSpec {
     /// when neither flag is set.
     pub(crate) fn from_cli(cli: &Cli) -> anyhow::Result<Option<BucketSpec>> {
         if let Some(s) = cli.bucket.as_deref() {
-            let nanos = timestamp::parse_duration_nanos(s)?;
+            let nanos = crate::duration::parse_duration_nanos(s)?;
             return Ok(Some(BucketSpec::Duration(nanos)));
         }
         if let Some(n) = cli.n_buckets {
