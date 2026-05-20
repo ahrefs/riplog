@@ -51,3 +51,14 @@ libc = "0.2"
 proptest = "1"
 logfmt = "0.0.2"
 serde_json = "1"
+
+[profile.release]
+
+[profile.profiling]
+# `release` + line-table debuginfo. Use for `perf record` / flamegraphs: symbol
+# names and line numbers resolve cleanly without bloating the binary with
+# full DWARF type info. Build with `cargo build --profile profiling`; output
+# lands in `target/profiling/`.
+
+inherits = "release"
+debug = 1
