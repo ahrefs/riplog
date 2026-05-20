@@ -179,7 +179,7 @@ fn classify<'a>(cli: &'a Cli, following: bool) -> anyhow::Result<ExecutionMode<'
         let bucket = cli
             .bucket
             .as_deref()
-            .map(timestamp::parse_duration_nanos)
+            .map(crate::duration::parse_duration_nanos)
             .transpose()?
             .map(|nanos| ResolvedBucket {
                 start_nanos: 0,

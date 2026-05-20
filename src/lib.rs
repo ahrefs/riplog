@@ -3,6 +3,7 @@
 pub mod bucket;
 pub mod cli;
 pub mod counter;
+pub mod duration;
 pub mod file_plan;
 pub mod filter;
 pub mod input;
