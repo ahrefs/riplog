@@ -58,6 +58,9 @@ proptest = "1"
 logfmt = "0.0.2"
 serde_json = "1"
 
+[profile.dev]
+opt-level = 1
+
 [profile.release]
 
 [profile.profiling]
