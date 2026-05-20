@@ -5,6 +5,7 @@ pub mod cli;
 pub mod counter;
 pub mod file_plan;
 pub mod filter;
+pub mod input;
 pub mod json;
 pub mod logfmt;
 pub mod output;

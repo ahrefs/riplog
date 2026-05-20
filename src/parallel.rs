@@ -5,10 +5,11 @@
 //! that flushes to the shared writer through a `Mutex`. The caller folds
 //! the per-worker states returned from `run` into its own master state.
 
-use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::Mutex;
+
+use crate::input::{FileInput, SeekTable};
 
 /// Below this many bytes per worker, parallel mode falls back to sequential —
 /// the fixed per-thread overhead would dominate the per-byte work.
@@ -24,6 +25,11 @@ pub(crate) struct Job<'a> {
     pub start_byte: u64,
     pub max_bytes: u64,
     pub n_workers: usize,
+    /// Reuse a parsed seek table across workers so each thread skips the
+    /// per-open footer round-trip on seekable-zstd inputs. `None` for plain
+    /// files (and always when the feature is off). Workers borrow it across
+    /// `thread::scope`; the master keeps ownership.
+    pub seek_table: Option<SeekTable>,
 }
 
 /// Spawn `job.n_workers` threads searching disjoint chunks of `job.path`
@@ -42,7 +48,7 @@ pub(crate) fn run<S, F>(
     work: F,
 ) -> anyhow::Result<Vec<S>>
 where
-    F: Fn(BufReader<File>, u64, &mut dyn Write) -> anyhow::Result<S> + Send + Sync,
+    F: Fn(BufReader<FileInput>, u64, &mut dyn Write) -> anyhow::Result<S> + Send + Sync,
     S: Send,
 {
     let Job {
@@ -50,18 +56,19 @@ where
         start_byte,
         max_bytes,
         n_workers,
+        seek_table,
     } = job;
 
     let end_byte = start_byte.saturating_add(max_bytes);
     let chunks = {
-        let mut probe = File::open(path)?;
+        let mut probe = FileInput::open_with_table(path, seek_table.as_ref())?;
         compute_chunks(&mut probe, start_byte, end_byte, n_workers)?
     };
 
     if chunks.len() <= 1 {
-        let mut file = File::open(path)?;
-        file.seek(SeekFrom::Start(start_byte))?;
-        let reader = BufReader::with_capacity(crate::run::STREAM_BUF_CAP, file);
+        let mut input = FileInput::open_with_table(path, seek_table.as_ref())?;
+        input.seek(SeekFrom::Start(start_byte))?;
+        let reader = BufReader::with_capacity(crate::run::STREAM_BUF_CAP, input);
         let state = work(reader, max_bytes, output)?;
         return Ok(vec![state]);
     }
@@ -77,15 +84,16 @@ where
 
     let shared_out: Mutex<&mut (dyn Write + Send)> = Mutex::new(output);
     let work_ref = &work;
+    let st_ref = seek_table.as_ref();
     let worker_states: Vec<S> = std::thread::scope(|s| -> anyhow::Result<Vec<S>> {
         let handles: Vec<_> = chunks
             .iter()
             .map(|&(cs, ce)| {
                 let shared = &shared_out;
                 s.spawn(move || -> anyhow::Result<S> {
-                    let mut file = File::open(path)?;
-                    file.seek(SeekFrom::Start(cs))?;
-                    let reader = BufReader::with_capacity(crate::run::STREAM_BUF_CAP, file);
+                    let mut input = FileInput::open_with_table(path, st_ref)?;
+                    input.seek(SeekFrom::Start(cs))?;
+                    let reader = BufReader::with_capacity(crate::run::STREAM_BUF_CAP, input);
                     let mut sink = UnorderedSink::new(shared);
                     let state = work_ref(reader, ce - cs, &mut sink)?;
                     sink.flush()?;
@@ -108,8 +116,8 @@ where
 /// boundary is forward-snapped to the byte after the next `\n`, so every
 /// chunk except the first begins at a line boundary. Returns a single
 /// `(start, end)` chunk if the span is too small to be worth splitting.
-pub(crate) fn compute_chunks(
-    file: &mut File,
+pub(crate) fn compute_chunks<R: Read + Seek>(
+    reader: &mut R,
     start: u64,
     end: u64,
     n: usize,
@@ -126,7 +134,7 @@ pub(crate) fn compute_chunks(
     bounds.push(start);
     for i in 1..n {
         let approx = start + chunk * i as u64;
-        bounds.push(snap_forward_to_newline(file, approx, end)?);
+        bounds.push(snap_forward_to_newline(reader, approx, end)?);
     }
     bounds.push(end);
     Ok(bounds
@@ -136,11 +144,15 @@ pub(crate) fn compute_chunks(
 }
 
 /// Read forward from `from` until just past the next `\n`, capped at `cap`.
-/// Returns the new absolute position. Restores the file's seek position to
+/// Returns the new absolute position. Restores the reader's seek position to
 /// its value on entry.
-fn snap_forward_to_newline(file: &mut File, from: u64, cap: u64) -> std::io::Result<u64> {
-    let saved = file.stream_position()?;
-    file.seek(SeekFrom::Start(from))?;
+fn snap_forward_to_newline<R: Read + Seek>(
+    reader: &mut R,
+    from: u64,
+    cap: u64,
+) -> std::io::Result<u64> {
+    let saved = reader.stream_position()?;
+    reader.seek(SeekFrom::Start(from))?;
     let mut buf = [0u8; 8192];
     let mut pos = from;
     let result = loop {
@@ -148,7 +160,7 @@ fn snap_forward_to_newline(file: &mut File, from: u64, cap: u64) -> std::io::Res
             break cap;
         }
         let to_read = std::cmp::min(buf.len() as u64, cap - pos) as usize;
-        let n = file.read(&mut buf[..to_read])?;
+        let n = reader.read(&mut buf[..to_read])?;
         if n == 0 {
             break pos;
         }
@@ -157,7 +169,7 @@ fn snap_forward_to_newline(file: &mut File, from: u64, cap: u64) -> std::io::Res
         }
         pos += n as u64;
     };
-    file.seek(SeekFrom::Start(saved))?;
+    reader.seek(SeekFrom::Start(saved))?;
     Ok(result)
 }
 
@@ -206,6 +218,7 @@ impl Write for UnorderedSink<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
 
     fn write_tmp(name: &str, data: &[u8]) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join("riplog-parallel-tests");
