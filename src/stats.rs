@@ -182,7 +182,7 @@ impl Stats {
 /// optional bare `--count` number. Pulled out so the `run::run`
 /// happy-path doesn't have to thread `bare_count` through everywhere.
 pub(crate) fn emit_summaries<W: Write>(
-    recorders: &crate::sinks::Recorders,
+    recorders: &mut crate::sinks::Recorders,
     cfg: &crate::sinks::RunConfig<'_>,
     count_only: bool,
     output: &mut W,
@@ -198,5 +198,35 @@ pub(crate) fn emit_summaries<W: Write>(
             .count_only(output, recorders.stats.matched_lines as u64)?;
     }
     output.flush()?;
+    emit_aggregate_warnings(&recorders.counter);
     Ok(())
+}
+
+/// Walk the merged counter and emit one stderr warning per (key, kind)
+/// that fired during the run:
+/// - per numeric key with `non_numeric > 0`: "N lines skipped".
+/// - once, if any accumulator hit the sample cap and switched to
+///   reservoir sampling.
+///
+/// Warnings go to stderr (not the `output` writer) so they don't
+/// interleave with structured agg rows piped into downstream tools.
+fn emit_aggregate_warnings(counter: &crate::counter::Counter) {
+    use std::collections::BTreeMap;
+    let totals = crate::aggregate::WarningTotals::collect(counter.iter_aggregates());
+    // BTreeMap for deterministic key order in the warnings.
+    let ordered: BTreeMap<&str, u64> = totals
+        .non_numeric
+        .iter()
+        .map(|(k, n)| (k.as_str(), *n))
+        .collect();
+    for (key, n) in ordered {
+        eprintln!("warning: non-numeric values for '{key}': {n} lines skipped");
+    }
+    if totals.reservoir_engaged {
+        let cap = counter.spec().sample_cap;
+        eprintln!(
+            "warning: sample cap ({cap}) exceeded for at least one (group, key); \
+             percentiles are approximate (raise --sample-cap to keep them exact)"
+        );
+    }
 }

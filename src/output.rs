@@ -16,6 +16,7 @@ use rapidhash::RapidHashSet;
 use smartstring::alias::String as SmartString;
 use std::io::{self, Write};
 
+use crate::aggregate::{AggregateSpec, Aggregates};
 use crate::timestamp::Timestamp;
 
 // -------- OutputFormat trait --------
@@ -53,16 +54,17 @@ pub(crate) trait OutputFormat: Send + Sync {
         scratch: &mut String,
     ) -> io::Result<()>;
 
-    /// One aggregation row (`--group-by` / `--bucket` / `--n-buckets`).
+    /// One aggregation row (`--group-by` / `--bucket` / `--n-buckets`
+    /// and/or any numeric aggregate).
     #[allow(clippy::too_many_arguments)]
     fn agg_row<W: Write + ?Sized>(
         &self,
         w: &mut W,
-        count: u64,
+        spec: &AggregateSpec,
+        aggregates: &mut Aggregates,
         keys: &[SmartString],
         combo: &[SmartString],
         bucket: Option<(Timestamp, Timestamp)>,
-        time_range: Option<(Timestamp, Timestamp)>,
         tz: &jiff::tz::TimeZone,
     ) -> io::Result<()>;
 
@@ -117,16 +119,16 @@ impl OutputFormat for Formatter {
     fn agg_row<W: Write + ?Sized>(
         &self,
         w: &mut W,
-        count: u64,
+        spec: &AggregateSpec,
+        aggregates: &mut Aggregates,
         keys: &[SmartString],
         combo: &[SmartString],
         bucket: Option<(Timestamp, Timestamp)>,
-        time_range: Option<(Timestamp, Timestamp)>,
         tz: &jiff::tz::TimeZone,
     ) -> io::Result<()> {
         match self {
-            Formatter::Logfmt(f) => f.agg_row(w, count, keys, combo, bucket, time_range, tz),
-            Formatter::Json(f) => f.agg_row(w, count, keys, combo, bucket, time_range, tz),
+            Formatter::Logfmt(f) => f.agg_row(w, spec, aggregates, keys, combo, bucket, tz),
+            Formatter::Json(f) => f.agg_row(w, spec, aggregates, keys, combo, bucket, tz),
         }
     }
 

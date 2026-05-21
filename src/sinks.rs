@@ -14,6 +14,7 @@
 use smartstring::alias::String as SmartString;
 use std::io::Write;
 
+use crate::aggregate::AggregateSpec;
 use crate::bucket::ResolvedBucket;
 use crate::cli::Cli;
 use crate::counter::Counter;
@@ -78,6 +79,7 @@ impl Recorders {
         let counter = Counter::new(
             cli.group_by.iter().map(SmartString::from).collect(),
             bucket,
+            AggregateSpec::from_cli(cli),
             streaming_close_grace_nanos,
         );
         Self {

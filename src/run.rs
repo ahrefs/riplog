@@ -305,18 +305,36 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
              nothing would print until you Ctrl-C."
         );
     }
+    // `--group-by` / `--bucket` / `--n-buckets` need an aggregate to fold
+    // into; without one, the rows would have nothing to report.
+    if (!cli.group_by.is_empty() || cli.bucket.is_some() || cli.n_buckets.is_some())
+        && !cli.has_aggregate()
+    {
+        anyhow::bail!(
+            "`--group-by`, `--bucket`, and `--n-buckets` require at least one \
+             aggregate flag: --count, --average, --p50, --p90, or --p99."
+        );
+    }
     let suppress_lines = cli.list_keys
-        || cli.count
+        || cli.has_aggregate()
         || !cli.list_values_for.is_empty()
         || !cli.group_by.is_empty()
         || cli.bucket.is_some()
         || cli.n_buckets.is_some()
         || cli.raw_key.is_some();
     let tz = timestamp::resolve_tz(cli.tz.as_deref())?;
-    // The bare-number `--count` line is redundant when grouping/bucketing is
-    // active (each row already carries its `count=`), so suppress it then.
-    let bare_count =
-        cli.count && cli.group_by.is_empty() && cli.bucket.is_none() && cli.n_buckets.is_none();
+    // The bare-number `--count` form is only used when `--count` is the
+    // *only* aggregate and there's no grouping/bucketing. Any other
+    // aggregate routes through the standard agg_row path (which emits
+    // `count=N avg.foo=… …` on one line).
+    let bare_count = cli.count
+        && cli.group_by.is_empty()
+        && cli.bucket.is_none()
+        && cli.n_buckets.is_none()
+        && cli.average.is_empty()
+        && cli.p50.is_empty()
+        && cli.p90.is_empty()
+        && cli.p99.is_empty();
 
     let sampler = build_sampler(cli)?;
 
@@ -436,7 +454,7 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
             stream_unbounded(&mut std::io::stdin().lock(), &mut pipeline, &mut output)?;
             output.flush()?;
             emitter.flush_sort_buf(&mut output)?;
-            emit_summaries(&recorders, &cfg, bare_count, &mut output)?;
+            emit_summaries(&mut recorders, &cfg, bare_count, &mut output)?;
         }
 
         ExecutionMode::Files {
@@ -542,7 +560,7 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
 
             output.flush()?;
             emitter.flush_sort_buf(&mut output)?;
-            emit_summaries(&recorders, &cfg, bare_count, &mut output)?;
+            emit_summaries(&mut recorders, &cfg, bare_count, &mut output)?;
         }
     }
 

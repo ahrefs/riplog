@@ -1,5 +1,6 @@
 #![deny(unsafe_code)]
 
+pub mod aggregate;
 pub mod bucket;
 pub mod cli;
 pub mod counter;

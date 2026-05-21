@@ -1,7 +1,8 @@
 //! Per-line aggregation counter: groups matched lines by a key tuple
-//! (and optionally a time bucket), tracks per-group count + observed
-//! timestamp range, and produces either an end-of-run report or a
-//! streaming flush when running under follow + bucket.
+//! (and optionally a time bucket), tracks per-group `Aggregates` (count,
+//! observed timestamp range, plus any numeric aggregates), and produces
+//! either an end-of-run report or a streaming flush when running under
+//! follow + bucket.
 
 use rapidhash::RapidHashMap;
 use smallvec::SmallVec;
@@ -9,10 +10,11 @@ use smartstring::alias::String as SmartString;
 use std::collections::BTreeMap;
 use std::io::Write;
 
+use crate::aggregate::{AggregateSpec, Aggregates};
 use crate::bucket::ResolvedBucket;
 use crate::output::{Formatter, OutputFormat};
 use crate::raw_extractor::unescape_for_key;
-use crate::timestamp::{fold_max, fold_min, Timestamp};
+use crate::timestamp::{fold_max, Timestamp};
 
 pub(crate) type Combo = SmallVec<[SmartString; 3]>;
 
@@ -25,34 +27,6 @@ enum SortOrder {
     /// (streaming end-of-run): chronological.
     /// `bucket asc, count desc, combo asc`.
     BucketAsc,
-}
-
-/// Aggregated stats for a single (group-keys [, bucket]) combination.
-#[derive(Default)]
-pub(crate) struct GroupStats {
-    pub(crate) count: usize,
-    pub(crate) min_ts: Option<Timestamp>,
-    pub(crate) max_ts: Option<Timestamp>,
-}
-
-impl GroupStats {
-    fn record(&mut self, ts: Option<Timestamp>) {
-        self.count += 1;
-        if let Some(t) = ts {
-            fold_min(&mut self.min_ts, t);
-            fold_max(&mut self.max_ts, t);
-        }
-    }
-
-    fn merge(&mut self, other: GroupStats) {
-        self.count += other.count;
-        if let Some(t) = other.min_ts {
-            fold_min(&mut self.min_ts, t);
-        }
-        if let Some(t) = other.max_ts {
-            fold_max(&mut self.max_ts, t);
-        }
-    }
 }
 
 /// Run-time mode of a `Counter`. Decided once at `Counter::new` from
@@ -78,14 +52,14 @@ pub(crate) enum CounterMode {
 }
 
 /// Groups matched lines by the value tuple of `keys` (and optionally a time
-/// bucket) and records per-group count + observed timestamp range. Missing
-/// user keys produce an empty value slot (rendered as `key.<k>=""` in the
-/// logfmt report).
+/// bucket) and records per-group `Aggregates`. Missing user keys produce
+/// an empty value slot (rendered as `key.<k>=""` in the logfmt report).
 #[derive(Default)]
 pub(crate) struct Counter {
     keys: Vec<SmartString>,
     bucket: Option<ResolvedBucket>,
-    counts: BTreeMap<Option<Timestamp>, RapidHashMap<Combo, GroupStats>>,
+    spec: AggregateSpec,
+    counts: BTreeMap<Option<Timestamp>, RapidHashMap<Combo, Aggregates>>,
     scratch: String,
     mode: CounterMode,
 }
@@ -100,6 +74,7 @@ impl Counter {
     pub(crate) fn new(
         keys: Vec<SmartString>,
         bucket: Option<ResolvedBucket>,
+        spec: AggregateSpec,
         streaming_close_grace_nanos: Option<i64>,
     ) -> Self {
         let mode = match (bucket, streaming_close_grace_nanos) {
@@ -112,6 +87,7 @@ impl Counter {
         Self {
             keys,
             bucket,
+            spec,
             counts: BTreeMap::default(),
             scratch: String::new(),
             mode,
@@ -120,7 +96,23 @@ impl Counter {
 
     #[inline]
     pub(crate) fn is_active(&self) -> bool {
-        !self.keys.is_empty() || self.bucket.is_some()
+        // Bare `--count` alone is handled by `count_only` in
+        // `emit_summaries`; the counter only needs to fire when there
+        // are group keys, a bucket, or a numeric aggregate (which needs
+        // per-line value extraction).
+        !self.keys.is_empty() || self.bucket.is_some() || self.spec.has_numeric()
+    }
+
+    /// Borrow the spec — used by the formatter to know which aggregate
+    /// fields to emit.
+    pub(crate) fn spec(&self) -> &AggregateSpec {
+        &self.spec
+    }
+
+    /// Iterate over every per-group `Aggregates` (read-only). Used by
+    /// end-of-run warning collection.
+    pub(crate) fn iter_aggregates(&self) -> impl Iterator<Item = &Aggregates> {
+        self.counts.values().flat_map(|groups| groups.values())
     }
 
     #[inline]
@@ -149,43 +141,29 @@ impl Counter {
             }
             combo.push(value);
         }
+        let spec = &self.spec;
+        let scratch = &mut self.scratch;
         self.counts
             .entry(bucket_ts)
             .or_default()
             .entry(combo)
-            .or_default()
-            .record(ts);
+            .or_insert_with(|| Aggregates::new(spec))
+            .record(pairs, ts, scratch);
     }
 
-    fn write_row<W: Write + ?Sized>(
-        &self,
-        out: &mut W,
-        combo: &Combo,
-        bucket_ts: Option<Timestamp>,
-        stats: &GroupStats,
-        formatter: &Formatter,
-        tz: &jiff::tz::TimeZone,
-    ) -> std::io::Result<()> {
-        let bucket = match (self.bucket, bucket_ts) {
-            (Some(bspec), Some(start)) => Some((start, start + bspec.dur_nanos)),
-            _ => None,
-        };
-        let time_range = match (stats.min_ts, stats.max_ts) {
-            (Some(a), Some(b)) => Some((a, b)),
-            _ => None,
-        };
-        let count = stats.count as u64;
-        formatter.agg_row(out, count, &self.keys, combo, bucket, time_range, tz)
-    }
-
-    /// Sort `entries` per `order` and write each row via `write_row`. Does
-    /// NOT flush `out` — callers decide flush points.
+    /// Sort `entries` per `order` and emit each row through `formatter`.
+    /// Does NOT flush `out`. Takes `bucket`/`keys`/`spec` directly so the
+    /// caller can hold a mutable borrow on `self.counts` across the call
+    /// (the per-entry `&mut Aggregates` overlaps that borrow).
+    #[allow(clippy::too_many_arguments)]
     fn emit_rows<'a, W: Write + ?Sized>(
-        &self,
         out: &mut W,
         formatter: &Formatter,
         tz: &jiff::tz::TimeZone,
-        mut entries: Vec<(&'a Combo, Option<Timestamp>, &'a GroupStats)>,
+        bucket: Option<ResolvedBucket>,
+        keys: &[SmartString],
+        spec: &AggregateSpec,
+        mut entries: Vec<(&'a Combo, Option<Timestamp>, &'a mut Aggregates)>,
         order: SortOrder,
     ) -> std::io::Result<()> {
         match order {
@@ -201,32 +179,54 @@ impl Counter {
                     .then_with(|| a.0.cmp(b.0))
             }),
         }
-        for (combo, bucket_ts, stats) in entries {
-            self.write_row(out, combo, bucket_ts, stats, formatter, tz)?;
+        for (combo, bucket_ts, aggregates) in entries {
+            let bucket_range = match (bucket, bucket_ts) {
+                (Some(bspec), Some(start)) => Some((start, start + bspec.dur_nanos)),
+                _ => None,
+            };
+            formatter.agg_row(out, spec, aggregates, keys, combo, bucket_range, tz)?;
         }
         Ok(())
     }
 
     /// Batch-mode end-of-run report: count desc, ties broken by key.
     fn report<W: Write>(
-        &self,
+        &mut self,
         out: &mut W,
         formatter: &Formatter,
         tz: &jiff::tz::TimeZone,
     ) -> std::io::Result<()> {
-        if !self.is_active() || self.counts.is_empty() {
+        if !self.is_active() {
             return Ok(());
         }
-        let entries: Vec<_> = self
-            .counts
-            .iter()
-            .flat_map(|(bucket_ts, groups)| {
-                groups
-                    .iter()
-                    .map(move |(combo, stats)| (combo, *bucket_ts, stats))
-            })
-            .collect();
-        self.emit_rows(out, formatter, tz, entries, SortOrder::CountDesc)
+        // Empty-combo bare row: when aggregates are active but there's no
+        // grouping/bucketing and no lines matched, we still want a single
+        // row (count=0, no aggregate fields). Construct one on the fly.
+        if self.counts.is_empty() {
+            if self.keys.is_empty() && self.bucket.is_none() && self.spec.is_active() {
+                let combo: Combo = SmallVec::new();
+                let mut empty = Aggregates::new(&self.spec);
+                return formatter
+                    .agg_row(out, &self.spec, &mut empty, &self.keys, &combo, None, tz);
+            }
+            return Ok(());
+        }
+        let mut entries: Vec<(&Combo, Option<Timestamp>, &mut Aggregates)> = Vec::new();
+        for (bucket_ts, groups) in self.counts.iter_mut() {
+            for (combo, agg) in groups.iter_mut() {
+                entries.push((combo, *bucket_ts, agg));
+            }
+        }
+        Self::emit_rows(
+            out,
+            formatter,
+            tz,
+            self.bucket,
+            &self.keys,
+            &self.spec,
+            entries,
+            SortOrder::CountDesc,
+        )
     }
 
     /// Streaming flush: emit and remove every group whose bucket has
@@ -265,23 +265,31 @@ impl Counter {
             return Ok(());
         }
 
-        let closing_counts = std::mem::replace(&mut self.counts, open_buckets);
-        let entries: Vec<_> = closing_counts
-            .iter()
-            .flat_map(|(bucket_ts, groups)| {
-                groups
-                    .iter()
-                    .map(move |(combo, stats)| (combo, *bucket_ts, stats))
-            })
-            .collect();
-        self.emit_rows(out, formatter, tz, entries, SortOrder::BucketAsc)?;
+        let mut closing_counts = std::mem::replace(&mut self.counts, open_buckets);
+        let mut entries: Vec<(&Combo, Option<Timestamp>, &mut Aggregates)> = Vec::new();
+        for (bucket_ts, groups) in closing_counts.iter_mut() {
+            for (combo, agg) in groups.iter_mut() {
+                entries.push((combo, *bucket_ts, agg));
+            }
+        }
+        Self::emit_rows(
+            out,
+            formatter,
+            tz,
+            self.bucket,
+            &self.keys,
+            &self.spec,
+            entries,
+            SortOrder::BucketAsc,
+        )?;
+        drop(closing_counts);
         out.flush()
     }
 
     /// End-of-stream flush: emit any still-open buckets in time order.
     /// Used in place of `report` when streaming.
     fn flush_remaining<W: Write>(
-        &self,
+        &mut self,
         out: &mut W,
         formatter: &Formatter,
         tz: &jiff::tz::TimeZone,
@@ -289,16 +297,22 @@ impl Counter {
         if self.counts.is_empty() {
             return Ok(());
         }
-        let entries: Vec<_> = self
-            .counts
-            .iter()
-            .flat_map(|(bucket_ts, groups)| {
-                groups
-                    .iter()
-                    .map(move |(combo, stats)| (combo, *bucket_ts, stats))
-            })
-            .collect();
-        self.emit_rows(out, formatter, tz, entries, SortOrder::BucketAsc)
+        let mut entries: Vec<(&Combo, Option<Timestamp>, &mut Aggregates)> = Vec::new();
+        for (bucket_ts, groups) in self.counts.iter_mut() {
+            for (combo, agg) in groups.iter_mut() {
+                entries.push((combo, *bucket_ts, agg));
+            }
+        }
+        Self::emit_rows(
+            out,
+            formatter,
+            tz,
+            self.bucket,
+            &self.keys,
+            &self.spec,
+            entries,
+            SortOrder::BucketAsc,
+        )
     }
 
     /// End-of-run output: dispatches between batched `report` (count desc,
@@ -307,7 +321,7 @@ impl Counter {
     /// end-of-run entry point; the two underlying methods stay private to
     /// this module so callers can't accidentally pick the wrong one.
     pub(crate) fn emit_final<W: Write>(
-        &self,
+        &mut self,
         out: &mut W,
         formatter: &Formatter,
         tz: &jiff::tz::TimeZone,
@@ -343,8 +357,12 @@ impl Counter {
                 }
                 std::collections::btree_map::Entry::Occupied(mut e) => {
                     let self_groups = e.get_mut();
-                    for (combo, stats) in groups {
-                        self_groups.entry(combo).or_default().merge(stats);
+                    let spec = &self.spec;
+                    for (combo, agg) in groups {
+                        self_groups
+                            .entry(combo)
+                            .or_insert_with(|| Aggregates::new(spec))
+                            .merge(agg);
                     }
                 }
             }

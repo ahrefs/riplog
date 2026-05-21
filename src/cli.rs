@@ -89,7 +89,7 @@ pub struct Cli {
     /// both produce one row per (level, facil) combination. `ts_start` and
     /// `ts_end` are the min/max timestamps observed in the group; they are
     /// omitted for groups with no parseable timestamp.
-    #[arg(long = "group-by", value_delimiter = ',', requires = "count")]
+    #[arg(long = "group-by", value_delimiter = ',')]
     pub group_by: Vec<String>,
 
     /// Add a fixed-width, epoch-aligned time bucket dimension to the
@@ -98,19 +98,14 @@ pub struct Cli {
     /// streaming output: rows emit as buckets close (when `max_ts_seen >
     /// bucket.end + window_secs`). Requires `--count`. Conflicts with
     /// `--n-buckets`.
-    #[arg(
-        long,
-        value_name = "DURATION",
-        requires = "count",
-        conflicts_with = "n_buckets"
-    )]
+    #[arg(long, value_name = "DURATION", conflicts_with = "n_buckets")]
     pub bucket: Option<String>,
 
     /// Divide the active time range into `N` equal-width buckets aligned to
     /// the window start. Window comes from `--from`/`--to` when set, else
     /// from the file's first/last timestamps. Requires `--count` and a file
     /// argument. Conflicts with `--bucket`.
-    #[arg(long = "n-buckets", value_name = "N", requires = "count")]
+    #[arg(long = "n-buckets", value_name = "N")]
     pub n_buckets: Option<usize>,
 
     /// Suppress line output; instead, gather every distinct key seen on
@@ -133,9 +128,46 @@ pub struct Cli {
     pub raw_key: Option<String>,
 
     /// Suppress line output; print only the count of matched lines at the
-    /// end. Combine with `-F` and Ctrl-C to count live.
+    /// end. Combine with `-F` and Ctrl-C to count live. One of several
+    /// aggregates (see `--average`, `--p50`, `--p90`, `--p99`); at least
+    /// one aggregate is required by `--group-by`, `--bucket`, and
+    /// `--n-buckets`.
     #[arg(long)]
     pub count: bool,
+
+    /// Numeric aggregate: arithmetic mean of `<KEY>`'s value across matched
+    /// lines. Repeatable and comma-separated like `--group-by`:
+    /// `--average=duration_ms,bytes`. Missing values are skipped silently;
+    /// non-numeric values are skipped and reported once at end of run on
+    /// stderr. Stays exact past `--sample-cap` (uses a running sum).
+    #[arg(long, value_name = "KEY", value_delimiter = ',')]
+    pub average: Vec<String>,
+
+    /// Numeric aggregate: 50th-percentile (median) of `<KEY>`'s value
+    /// across matched lines. Repeatable and comma-separated. See
+    /// `--sample-cap` for the exact-vs-reservoir threshold.
+    #[arg(long = "p50", value_name = "KEY", value_delimiter = ',')]
+    pub p50: Vec<String>,
+
+    /// Numeric aggregate: 90th-percentile of `<KEY>`'s value.
+    /// Repeatable and comma-separated.
+    #[arg(long = "p90", value_name = "KEY", value_delimiter = ',')]
+    pub p90: Vec<String>,
+
+    /// Numeric aggregate: 99th-percentile of `<KEY>`'s value.
+    /// Repeatable and comma-separated.
+    #[arg(long = "p99", value_name = "KEY", value_delimiter = ',')]
+    pub p99: Vec<String>,
+
+    /// Per (group, aggregated-key) sample cap for percentiles. Below the
+    /// cap, every value is stored and percentiles are exact. Past the cap,
+    /// switches to uniform reservoir sampling (Algorithm L) of `N` samples
+    /// and emits one warning on stderr at end of run. `--average` stays
+    /// exact (running sum) regardless. Default 1_000_000 (~8 MB per
+    /// accumulator). Lower to cap memory on high-cardinality workloads;
+    /// raise for tighter tail accuracy.
+    #[arg(long = "sample-cap", value_name = "N", default_value_t = 1_000_000)]
+    pub sample_cap: u64,
 
     /// Stop after this many matched lines.
     #[arg(short = 'n', long)]
@@ -219,5 +251,15 @@ impl Cli {
     /// in `plan_file` and as the bucket-close grace in streaming-bucket mode.
     pub fn window_nanos(&self) -> i64 {
         (self.window_secs as i64).saturating_mul(1_000_000_000)
+    }
+
+    /// True if any aggregate flag was set. `--group-by`, `--bucket`, and
+    /// `--n-buckets` require at least one aggregate; this is the gate.
+    pub fn has_aggregate(&self) -> bool {
+        self.count
+            || !self.average.is_empty()
+            || !self.p50.is_empty()
+            || !self.p90.is_empty()
+            || !self.p99.is_empty()
     }
 }

@@ -7,6 +7,7 @@ use rapidhash::RapidHashSet;
 use smartstring::alias::String as SmartString;
 use std::io::{self, Write};
 
+use crate::aggregate::{AggregateSpec, Aggregates};
 use crate::logfmt;
 use crate::output::{is_removed, sorted, OutputFormat};
 use crate::timestamp::{self, Timestamp};
@@ -81,6 +82,17 @@ impl<'w, W: Write + ?Sized> JsonObj<'w, W> {
         } else {
             // Switch to a string so the consumer doesn't truncate.
             write_json_string(self.out, &n.to_string())
+        }
+    }
+
+    /// Emit `"k": <f64>`. `NaN` and infinities are emitted as JSON strings
+    /// since they aren't representable in JSON proper.
+    pub fn entry_f64(&mut self, k: &str, v: f64) -> io::Result<()> {
+        self.write_key(k)?;
+        if v.is_finite() {
+            serde_json::to_writer(&mut *self.out, &v).map_err(jerr)
+        } else {
+            write_json_string(self.out, &v.to_string())
         }
     }
 
@@ -176,15 +188,57 @@ impl OutputFormat for JsonlFormat {
     fn agg_row<W: Write + ?Sized>(
         &self,
         w: &mut W,
-        count: u64,
+        spec: &AggregateSpec,
+        aggregates: &mut Aggregates,
         keys: &[SmartString],
         combo: &[SmartString],
         bucket: Option<(Timestamp, Timestamp)>,
-        time_range: Option<(Timestamp, Timestamp)>,
         tz: &jiff::tz::TimeZone,
     ) -> io::Result<()> {
         let mut obj = JsonObj::open(w)?;
-        obj.entry_u64("count", count)?;
+        obj.entry_u64("count", aggregates.count as u64)?;
+
+        // Helper: emit one nested object `{ key: value }` for an
+        // aggregate kind, lazily — skip the whole sub-object if every
+        // key produced None.
+        fn emit_kind<W: Write + ?Sized>(
+            obj: &mut JsonObj<'_, W>,
+            label: &str,
+            keys: &[SmartString],
+            mut compute: impl FnMut(&str) -> Option<f64>,
+        ) -> io::Result<()> {
+            let mut sub: Option<JsonObj<'_, W>> = None;
+            for key in keys {
+                if let Some(v) = compute(key.as_str()) {
+                    let s = match sub.as_mut() {
+                        Some(s) => s,
+                        None => {
+                            sub = Some(obj.start_obj(label)?);
+                            sub.as_mut().unwrap()
+                        }
+                    };
+                    s.entry_f64(key.as_str(), v)?;
+                }
+            }
+            if let Some(s) = sub {
+                s.finish()?;
+            }
+            Ok(())
+        }
+
+        emit_kind(&mut obj, "avg", &spec.averages, |k| {
+            aggregates.get_mut(k).and_then(|a| a.average())
+        })?;
+        emit_kind(&mut obj, "p50", &spec.p50s, |k| {
+            aggregates.get_mut(k).and_then(|a| a.percentile(0.5))
+        })?;
+        emit_kind(&mut obj, "p90", &spec.p90s, |k| {
+            aggregates.get_mut(k).and_then(|a| a.percentile(0.9))
+        })?;
+        emit_kind(&mut obj, "p99", &spec.p99s, |k| {
+            aggregates.get_mut(k).and_then(|a| a.percentile(0.99))
+        })?;
+
         if !keys.is_empty() {
             let mut k_obj = obj.start_obj("keys")?;
             for (k, v) in keys.iter().zip(combo.iter()) {
@@ -196,7 +250,7 @@ impl OutputFormat for JsonlFormat {
             obj.entry_str("bucket.start", &timestamp::format_rfc3339(start, tz))?;
             obj.entry_str("bucket.end", &timestamp::format_rfc3339(end, tz))?;
         }
-        if let Some((a, b)) = time_range {
+        if let (Some(a), Some(b)) = (aggregates.min_ts, aggregates.max_ts) {
             obj.entry_str("time.start", &timestamp::format_rfc3339(a, tz))?;
             obj.entry_str("time.end", &timestamp::format_rfc3339(b, tz))?;
         }

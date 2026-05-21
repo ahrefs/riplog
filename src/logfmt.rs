@@ -11,6 +11,7 @@ use smartstring::alias::String as SmartString;
 use std::io::{self, Write};
 use std::mem::MaybeUninit;
 
+use crate::aggregate::{AggregateSpec, Aggregates};
 use crate::output::{is_removed, sorted, OutputFormat};
 use crate::timestamp::{self, Timestamp};
 
@@ -406,14 +407,30 @@ impl OutputFormat for LogfmtFormat {
     fn agg_row<W: Write + ?Sized>(
         &self,
         w: &mut W,
-        count: u64,
+        spec: &AggregateSpec,
+        aggregates: &mut Aggregates,
         keys: &[SmartString],
         combo: &[SmartString],
         bucket: Option<(Timestamp, Timestamp)>,
-        time_range: Option<(Timestamp, Timestamp)>,
         tz: &jiff::tz::TimeZone,
     ) -> io::Result<()> {
-        write!(w, "count={count}")?;
+        write!(w, "count={}", aggregates.count as u64)?;
+        for key in &spec.averages {
+            if let Some(v) = aggregates.get_mut(key).and_then(|a| a.average()) {
+                write!(w, " avg.{key}={v}")?;
+            }
+        }
+        for (label, p, keys_for) in [
+            ("p50", 0.5, &spec.p50s),
+            ("p90", 0.9, &spec.p90s),
+            ("p99", 0.99, &spec.p99s),
+        ] {
+            for key in keys_for {
+                if let Some(v) = aggregates.get_mut(key).and_then(|a| a.percentile(p)) {
+                    write!(w, " {label}.{key}={v}")?;
+                }
+            }
+        }
         for (k, v) in keys.iter().zip(combo.iter()) {
             write!(w, " key.{k}=")?;
             write_logfmt_value(w, v.as_str())?;
@@ -422,7 +439,7 @@ impl OutputFormat for LogfmtFormat {
             write!(w, " bucket.start={}", timestamp::format_rfc3339(start, tz))?;
             write!(w, " bucket.end={}", timestamp::format_rfc3339(end, tz))?;
         }
-        if let Some((a, b)) = time_range {
+        if let (Some(a), Some(b)) = (aggregates.min_ts, aggregates.max_ts) {
             write!(w, " time.start={}", timestamp::format_rfc3339(a, tz))?;
             write!(w, " time.end={}", timestamp::format_rfc3339(b, tz))?;
         }
