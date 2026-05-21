@@ -85,30 +85,50 @@ Make sure `~/.cargo/bin` is in your path.
 
 ## Aggregation (suppresses line output)
 
-- `--count`: print the matched-line count. Alone, emits a bare number.
-  Combined with `--group-by`, `--bucket`, and/or `--n-buckets`, emits
-  one logfmt row per group instead.
+`--group-by`, `--bucket`, and `--n-buckets` need at least one aggregate
+to fold into. The aggregates are `--count`, `--average`, `--p50`,
+`--p90`, `--p99` — any combination is valid, and multiple aggregates
+land as additional fields on each row.
+
+- `--count`: tally matched lines. Alone (no grouping, no bucketing, no
+  other aggregate), emits a bare number for easy `$(…)` capture.
+  Otherwise contributes `count=N` to each agg row.
+- `--average <KEY[,KEY…]>`: arithmetic mean of `<KEY>`'s value across
+  matched lines. Emits `avg.<KEY>=<float>` per row. Missing values are
+  skipped silently; non-numeric values are skipped and reported once at
+  end of run on stderr. The average is computed from a running sum, so
+  it stays exact even past `--sample-cap`.
+- `--p50 / --p90 / --p99 <KEY[,KEY…]>`: percentiles of `<KEY>`. Emit
+  `p50.<KEY>=…`, `p90.<KEY>=…`, `p99.<KEY>=…`. Computed by linear
+  interpolation on stored samples. Up to `--sample-cap` samples per
+  `(group, key)` are kept exactly; past that, riplog switches to
+  reservoir sampling (uniform random subset) and emits one stderr
+  warning at end of run.
+- `--sample-cap <N>`: max exact samples per `(group, aggregated-key)`
+  before percentiles fall back to reservoir sampling. Default 1,000,000
+  (≈8 MB per accumulator). Lower it to cap memory on high-cardinality
+  workloads; raise it for tighter tail accuracy.
 - `--group-by <KEY[,KEY…]>`: group matched lines by key value (requires
-  `--count`). One logfmt row per tuple of values:
-  `count=N key.<k1>=… key.<k2>=… time.start=… time.end=…`. User keys
-  are prefixed with `key.` to disambiguate from synthetic columns;
-  `time.start`/`time.end` are the min/max observed timestamps in the
-  group. Repeatable, and a single flag may carry a comma-separated
-  list — `--group-by level,facil` and
+  at least one aggregate flag). One logfmt row per tuple of values:
+  `count=N <aggregate fields> key.<k1>=… key.<k2>=… time.start=…
+  time.end=…`. User keys are prefixed with `key.` to disambiguate from
+  synthetic columns; `time.start`/`time.end` are the min/max observed
+  timestamps in the group. Repeatable, and a single flag may carry a
+  comma-separated list — `--group-by level,facil` and
   `--group-by level --group-by facil` are equivalent.
-- `--bucket <DURATION>`: with `--count`, partition the time range into
-  fixed-size, epoch-aligned buckets; each row carries
-  `bucket.start=<RFC 3339>` and `bucket.end=<RFC 3339>` boundaries.
-  Same duration syntax as `--from start+<dur>`: `5m`, `30s`, `2 hours`.
-  Lines without a parseable timestamp are dropped (they can't be
-  bucketed). Composes with `--group-by` to bucket per
-  (group keys, time slice). Mutually exclusive with `--n-buckets`.
-- `--n-buckets <N>`: with `--count`, divide the active time window into
-  `N` equal-width buckets aligned to the window start. Width is
-  `(end − start) / N`, taking `start`/`end` from `--from`/`--to`
-  when set, otherwise from the file's first/last timestamps. Useful
-  for graphing — gives a fixed number of points across the time range.
-  Requires a file argument. Mutually exclusive with `--bucket`.
+- `--bucket <DURATION>`: partition the time range into fixed-size,
+  epoch-aligned buckets; each row carries `bucket.start=<RFC 3339>` and
+  `bucket.end=<RFC 3339>` boundaries. Same duration syntax as
+  `--from start+<dur>`: `5m`, `30s`, `2 hours`. Lines without a
+  parseable timestamp are dropped (they can't be bucketed). Composes
+  with `--group-by` to bucket per (group keys, time slice). Mutually
+  exclusive with `--n-buckets`. Requires at least one aggregate.
+- `--n-buckets <N>`: divide the active time window into `N` equal-width
+  buckets aligned to the window start. Width is `(end − start) / N`,
+  taking `start`/`end` from `--from`/`--to` when set, otherwise from
+  the file's first/last timestamps. Useful for graphing — gives a fixed
+  number of points across the time range. Requires a file argument and
+  at least one aggregate. Mutually exclusive with `--bucket`.
 - `--list-keys`: print every distinct key seen on matched lines.
 - `--list-values-for <KEY[,KEY…]>`: print every distinct value seen for
   `KEY`. Repeatable / comma-separated like `--group-by`.
@@ -138,6 +158,22 @@ riplog --count --n-buckets=60 --if 'level>=error' --from start --to end app.log
 ```
 
 always emits 60 rows — one per equal-width slice across the range.
+
+Example — latency p50/p99 per service in 5-minute slices:
+
+```
+riplog --count --p50=duration_ms --p99=duration_ms \
+       --group-by=svc --bucket=5m app.log
+```
+
+emits rows like:
+
+```
+count=312 p50.duration_ms=14 p99.duration_ms=210 key.svc=api bucket.start=2026-05-06T12:00:00Z bucket.end=2026-05-06T12:05:00Z time.start=2026-05-06T12:00:01Z time.end=2026-05-06T12:04:58Z
+```
+
+— the kind of summary you'd otherwise stitch together with `awk`, `sort`,
+and `datamash`, or hand off to a metrics pipeline.
 
 ### Streaming under `-f` / `-F` (and stdin)
 
