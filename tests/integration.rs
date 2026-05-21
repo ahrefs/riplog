@@ -140,7 +140,7 @@ fn group_by_level_matches_distribution() {
 }
 
 #[test]
-fn group_by_without_count_errors() {
+fn group_by_without_aggregate_errors() {
     let out = Command::new(riplog_bin())
         .args(["--group-by=level", fixture_path().to_str().unwrap()])
         .output()
@@ -148,9 +148,11 @@ fn group_by_without_count_errors() {
     assert!(!out.status.success(), "expected non-zero exit");
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
-        err.contains("--count"),
-        "stderr should mention --count: {err}"
+        err.contains("aggregate"),
+        "stderr should mention aggregate: {err}"
     );
+    assert!(err.contains("--count"), "stderr should list --count: {err}");
+    assert!(err.contains("--p50"), "stderr should list --p50: {err}");
 }
 
 #[test]
@@ -1555,4 +1557,285 @@ fn stdin_dash_parallel_falls_back_to_sequential() {
     let out = run_with_stdin(&["-j", "--count", path, "-"], stdin_in);
     let n: usize = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
     assert_eq!(n, COUNT + 1);
+}
+
+// ---------- Numeric aggregates (--average / --p50 / --p90 / --p99) ----------
+
+/// Write a tiny logfmt fixture with explicit `dur` (numeric) and `level`
+/// fields under tempdir. Each call gets a unique path so tests can run in
+/// parallel without stepping on each other.
+fn write_dur_fixture(name: &str, lines_in: &[&str]) -> PathBuf {
+    let dir = std::env::temp_dir().join("riplog-it-agg");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("{name}.log"));
+    let mut buf = String::new();
+    for l in lines_in {
+        buf.push_str(l);
+        buf.push('\n');
+    }
+    fs::write(&path, buf).unwrap();
+    path
+}
+
+/// Parse one logfmt agg row into a flat map of token=value.
+fn parse_agg_row(line: &str) -> std::collections::HashMap<String, String> {
+    line.split_whitespace()
+        .filter_map(|t| t.split_once('='))
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+fn fixture_durations_1_to_100() -> &'static Path {
+    static PATH: OnceLock<PathBuf> = OnceLock::new();
+    PATH.get_or_init(|| {
+        let mut owned: Vec<String> = Vec::with_capacity(100);
+        for i in 1..=100u64 {
+            owned.push(format!(
+                "time=2026-04-24T18:00:{:02}Z level=info dur={i}",
+                (i - 1) % 60
+            ));
+        }
+        let lines: Vec<&str> = owned.iter().map(String::as_str).collect();
+        write_dur_fixture("dur-1-100", &lines)
+    })
+    .as_path()
+}
+
+#[test]
+fn average_alone_emits_single_row_with_count() {
+    let path = fixture_durations_1_to_100();
+    let out = run(&["--average=dur", path.to_str().unwrap()]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    let row = text.lines().next().expect("one agg row");
+    let m = parse_agg_row(row);
+    assert_eq!(m.get("count").map(String::as_str), Some("100"));
+    let avg: f64 = m.get("avg.dur").expect("avg.dur").parse().unwrap();
+    assert!((avg - 50.5).abs() < 1e-9, "expected 50.5, got {avg}");
+}
+
+#[test]
+fn percentiles_match_known_uniform_distribution() {
+    let path = fixture_durations_1_to_100();
+    let out = run(&[
+        "--p50=dur",
+        "--p90=dur",
+        "--p99=dur",
+        path.to_str().unwrap(),
+    ]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    let row = text.lines().next().expect("one agg row");
+    let m = parse_agg_row(row);
+    let p50: f64 = m.get("p50.dur").unwrap().parse().unwrap();
+    let p90: f64 = m.get("p90.dur").unwrap().parse().unwrap();
+    let p99: f64 = m.get("p99.dur").unwrap().parse().unwrap();
+    // Linear interpolation on sorted 1..=100: rank p*(n-1) = p*99.
+    assert!((p50 - 50.5).abs() < 0.01, "p50={p50}");
+    assert!((p90 - 90.1).abs() < 0.01, "p90={p90}");
+    assert!((p99 - 99.01).abs() < 0.01, "p99={p99}");
+}
+
+#[test]
+fn aggregates_compose_with_group_by() {
+    // 6 lines: 3 info (dur 10/20/30), 3 warn (dur 100/200/300).
+    let path = write_dur_fixture(
+        "compose-group",
+        &[
+            "time=2026-04-24T18:00:00Z level=info dur=10",
+            "time=2026-04-24T18:00:01Z level=info dur=20",
+            "time=2026-04-24T18:00:02Z level=info dur=30",
+            "time=2026-04-24T18:00:03Z level=warn dur=100",
+            "time=2026-04-24T18:00:04Z level=warn dur=200",
+            "time=2026-04-24T18:00:05Z level=warn dur=300",
+        ],
+    );
+    let out = run(&["--average=dur", "--group-by=level", path.to_str().unwrap()]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut avgs = std::collections::HashMap::new();
+    for line in text.lines() {
+        let m = parse_agg_row(line);
+        if let (Some(lvl), Some(avg)) = (m.get("key.level"), m.get("avg.dur")) {
+            avgs.insert(lvl.clone(), avg.parse::<f64>().unwrap());
+        }
+    }
+    assert!(
+        (avgs["info"] - 20.0).abs() < 1e-9,
+        "info avg={}",
+        avgs["info"]
+    );
+    assert!(
+        (avgs["warn"] - 200.0).abs() < 1e-9,
+        "warn avg={}",
+        avgs["warn"]
+    );
+}
+
+#[test]
+fn aggregates_compose_with_bucket() {
+    // 8 lines in two 2-second buckets: [00..02) and [02..04).
+    let path = write_dur_fixture(
+        "compose-bucket",
+        &[
+            "time=2026-04-24T18:00:00Z level=info dur=10",
+            "time=2026-04-24T18:00:00Z level=info dur=20",
+            "time=2026-04-24T18:00:01Z level=info dur=30",
+            "time=2026-04-24T18:00:01Z level=info dur=40",
+            "time=2026-04-24T18:00:02Z level=info dur=100",
+            "time=2026-04-24T18:00:02Z level=info dur=200",
+            "time=2026-04-24T18:00:03Z level=info dur=300",
+            "time=2026-04-24T18:00:03Z level=info dur=400",
+        ],
+    );
+    let out = run(&["--p99=dur", "--bucket=2s", path.to_str().unwrap()]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut rows: Vec<_> = text.lines().map(parse_agg_row).collect();
+    rows.sort_by(|a, b| a.get("bucket.start").cmp(&b.get("bucket.start")));
+    assert_eq!(rows.len(), 2, "expected 2 buckets, got {}", rows.len());
+    for r in &rows {
+        assert!(r.contains_key("p99.dur"), "row missing p99.dur: {r:?}");
+        assert!(r.contains_key("bucket.start"), "row missing bucket.start");
+    }
+    // p99 of [10,20,30,40] ≈ 39.7, p99 of [100,200,300,400] ≈ 397.
+    let p99_a: f64 = rows[0].get("p99.dur").unwrap().parse().unwrap();
+    let p99_b: f64 = rows[1].get("p99.dur").unwrap().parse().unwrap();
+    assert!(p99_a < 50.0, "first bucket p99={p99_a}");
+    assert!(p99_b > 300.0, "second bucket p99={p99_b}");
+}
+
+#[test]
+fn non_numeric_value_emits_warning_and_skips_field() {
+    // dur is a string on 2 lines, numeric on 1 line.
+    let path = write_dur_fixture(
+        "non-numeric",
+        &[
+            "time=2026-04-24T18:00:00Z level=info dur=oops",
+            "time=2026-04-24T18:00:01Z level=info dur=alsoBad",
+            "time=2026-04-24T18:00:02Z level=info dur=42",
+        ],
+    );
+    let out = run(&["--average=dur", path.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("non-numeric values for 'dur'"),
+        "stderr missing warning: {stderr}"
+    );
+    assert!(
+        stderr.contains("2 lines skipped"),
+        "stderr should report 2 skipped: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let row = stdout.lines().next().expect("one agg row");
+    let m = parse_agg_row(row);
+    // Average is still emitted (from the single parseable sample).
+    assert_eq!(m.get("avg.dur").map(String::as_str), Some("42"));
+}
+
+#[test]
+fn non_numeric_with_no_valid_samples_omits_aggregate_field() {
+    let path = write_dur_fixture(
+        "non-numeric-all",
+        &[
+            "time=2026-04-24T18:00:00Z level=info dur=oops",
+            "time=2026-04-24T18:00:01Z level=info dur=bad",
+        ],
+    );
+    let out = run(&["--p99=dur", path.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let row = stdout.lines().next().expect("one agg row");
+    let m = parse_agg_row(row);
+    assert_eq!(m.get("count").map(String::as_str), Some("2"));
+    assert!(
+        !m.contains_key("p99.dur"),
+        "p99.dur should be absent: {m:?}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("non-numeric"));
+}
+
+#[test]
+fn missing_value_is_silent() {
+    // 3 lines have dur, 2 lines lack it. No warning should fire — missing
+    // values are tracked silently.
+    let path = write_dur_fixture(
+        "missing",
+        &[
+            "time=2026-04-24T18:00:00Z level=info dur=10",
+            "time=2026-04-24T18:00:01Z level=info",
+            "time=2026-04-24T18:00:02Z level=info dur=20",
+            "time=2026-04-24T18:00:03Z level=info",
+            "time=2026-04-24T18:00:04Z level=info dur=30",
+        ],
+    );
+    let out = run(&["--average=dur", path.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("non-numeric"),
+        "missing should not warn: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let row = stdout.lines().next().expect("one agg row");
+    let m = parse_agg_row(row);
+    assert_eq!(m.get("count").map(String::as_str), Some("5"));
+    let avg: f64 = m.get("avg.dur").unwrap().parse().unwrap();
+    assert!((avg - 20.0).abs() < 1e-9, "avg over present-only samples");
+}
+
+#[test]
+fn sample_cap_triggers_reservoir_warning_and_keeps_average_exact() {
+    let path = fixture_durations_1_to_100();
+    let out = run(&[
+        "--sample-cap=10",
+        "--average=dur",
+        "--p50=dur",
+        path.to_str().unwrap(),
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("sample cap (10) exceeded"),
+        "expected reservoir warning: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let m = parse_agg_row(stdout.lines().next().unwrap());
+    // Average stays exact (running sum), even past the cap.
+    let avg: f64 = m.get("avg.dur").unwrap().parse().unwrap();
+    assert!((avg - 50.5).abs() < 1e-9, "avg should be exact: {avg}");
+    // p50 from a reservoir of 10 out of 100 uniform [1,100] samples is
+    // approximate; just check it's in the ballpark.
+    let p50: f64 = m.get("p50.dur").unwrap().parse().unwrap();
+    assert!(
+        (10.0..=90.0).contains(&p50),
+        "p50 from reservoir should be near middle: {p50}"
+    );
+}
+
+#[test]
+fn json_aggregates_nest_by_kind() {
+    let path = fixture_durations_1_to_100();
+    let out = run(&[
+        "--json",
+        "--average=dur",
+        "--p50=dur",
+        "--p99=dur",
+        path.to_str().unwrap(),
+    ]);
+    let line = String::from_utf8_lossy(&out.stdout);
+    let line = line.lines().next().expect("one row");
+    let v: serde_json::Value = serde_json::from_str(line).expect("valid JSON");
+    assert_eq!(v["count"], 100);
+    assert!(v["avg"].is_object(), "avg should be a sub-object");
+    assert!(v["p50"].is_object(), "p50 should be a sub-object");
+    assert!(v["p99"].is_object(), "p99 should be a sub-object");
+    assert!((v["avg"]["dur"].as_f64().unwrap() - 50.5).abs() < 1e-9);
+    assert!((v["p50"]["dur"].as_f64().unwrap() - 50.5).abs() < 0.01);
+    assert!((v["p99"]["dur"].as_f64().unwrap() - 99.01).abs() < 0.01);
+}
+
+#[test]
+fn bucket_alone_still_requires_aggregate() {
+    let out = Command::new(riplog_bin())
+        .args(["--bucket=5s", fixture_path().to_str().unwrap()])
+        .output()
+        .expect("spawn riplog");
+    assert!(!out.status.success(), "expected non-zero exit");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("aggregate"), "stderr: {err}");
 }
