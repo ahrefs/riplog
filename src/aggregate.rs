@@ -314,27 +314,41 @@ impl NumericAccum {
 }
 
 /// Per-(group, bucket) aggregate state. Replaces the old `GroupStats`;
-/// always carries `count` + timestamp range, plus a `NumericAccum` per
-/// unique numeric key declared in the `AggregateSpec`.
+/// always carries `count` + timestamp range, plus an optional boxed
+/// slice of `NumericAccum`s — one per unique numeric key declared in
+/// the `AggregateSpec`.
+///
+/// `per_key` is `Option<Box<[NumericAccum]>>` (not an inline `SmallVec`)
+/// to keep `Aggregates` small in the no-numeric-aggregate hot path
+/// (just `--group-by` / `--bucket`). With niche optimization `Option<Box<[T]>>`
+/// is two words: total `Aggregates` size is roughly 56 B vs the ~296 B
+/// an inline-2 `SmallVec` would force. The boxed slice has a fixed
+/// length set at construction (spec is known up front), so we never
+/// need to grow it.
 #[derive(Default, Clone, Debug)]
 pub(crate) struct Aggregates {
     pub count: usize,
     pub min_ts: Option<Timestamp>,
     pub max_ts: Option<Timestamp>,
-    /// One entry per unique numeric key from `AggregateSpec::numeric_keys`,
-    /// in spec order. Lookups by key are linear; `n` is the total number
-    /// of distinct keys across all four aggregate flags.
-    pub per_key: SmallVec<[NumericAccum; 2]>,
+    pub per_key: Option<Box<[NumericAccum]>>,
 }
 
 impl Aggregates {
     /// Pre-seed `per_key` from the spec so `record` can walk by index
-    /// without re-deduping per line.
+    /// without re-deduping per line. Returns `None` when the spec has
+    /// no numeric aggregates — keeps `Aggregates` two-words slim in the
+    /// hot `--group-by` / `--bucket`-only path.
     pub fn new(spec: &AggregateSpec) -> Self {
-        let mut per_key: SmallVec<[NumericAccum; 2]> = SmallVec::new();
-        for k in spec.numeric_keys() {
-            per_key.push(NumericAccum::new(k, spec.sample_cap));
-        }
+        let per_key = if spec.has_numeric() {
+            let v: Vec<NumericAccum> = spec
+                .numeric_keys()
+                .into_iter()
+                .map(|k| NumericAccum::new(k, spec.sample_cap))
+                .collect();
+            Some(v.into_boxed_slice())
+        } else {
+            None
+        };
         Self {
             count: 0,
             min_ts: None,
@@ -349,13 +363,15 @@ impl Aggregates {
             fold_min(&mut self.min_ts, t);
             fold_max(&mut self.max_ts, t);
         }
-        for accum in &mut self.per_key {
-            match unescape_for_key(pairs, &accum.key, scratch) {
-                None => accum.missing += 1,
-                Some(s) => match s.trim().parse::<f64>() {
-                    Ok(v) if v.is_finite() => accum.record_value(v),
-                    _ => accum.non_numeric += 1,
-                },
+        if let Some(pk) = self.per_key.as_deref_mut() {
+            for accum in pk.iter_mut() {
+                match unescape_for_key(pairs, &accum.key, scratch) {
+                    None => accum.missing += 1,
+                    Some(s) => match s.trim().parse::<f64>() {
+                        Ok(v) if v.is_finite() => accum.record_value(v),
+                        _ => accum.non_numeric += 1,
+                    },
+                }
             }
         }
     }
@@ -368,25 +384,32 @@ impl Aggregates {
         if let Some(t) = other.max_ts {
             fold_max(&mut self.max_ts, t);
         }
-        // Both sides are built from the same spec, so per_key order
-        // matches. Fall back to find-by-key if it ever drifts.
-        for (i, other_accum) in other.per_key.into_iter().enumerate() {
-            let slot = if self
-                .per_key
+        let Some(other_pk) = other.per_key else {
+            return;
+        };
+        if self.per_key.is_none() {
+            // Spec mismatch (self lacks numeric); adopt other's slice
+            // wholesale so its samples aren't lost.
+            self.per_key = Some(other_pk);
+            return;
+        }
+        let self_pk = self.per_key.as_deref_mut().unwrap();
+        // Both sides built from the same spec → same order. Fall back
+        // to find-by-key on mismatch.
+        for (i, other_accum) in Vec::from(other_pk).into_iter().enumerate() {
+            let same_at_i = self_pk
                 .get(i)
                 .map(|a| a.key == other_accum.key)
-                .unwrap_or(false)
-            {
-                &mut self.per_key[i]
-            } else if let Some(found) = self.per_key.iter_mut().find(|a| a.key == other_accum.key) {
-                found
-            } else {
-                // Spec mismatch — keep the foreign accum so its samples
-                // aren't lost.
-                self.per_key.push(other_accum);
-                continue;
-            };
-            slot.merge(other_accum);
+                .unwrap_or(false);
+            if same_at_i {
+                self_pk[i].merge(other_accum);
+            } else if let Some(found) = self_pk.iter_mut().find(|a| a.key == other_accum.key) {
+                found.merge(other_accum);
+            }
+            // else: foreign accum has no matching slot here. The boxed
+            // slice is fixed-length so we can't append; drop it. In
+            // practice both sides come from the same `AggregateSpec`,
+            // so this branch is unreachable.
         }
     }
 
@@ -394,7 +417,10 @@ impl Aggregates {
     /// percentiles, which sorts lazily). `None` if the spec didn't
     /// declare that key.
     pub fn get_mut(&mut self, key: &str) -> Option<&mut NumericAccum> {
-        self.per_key.iter_mut().find(|a| a.key.as_str() == key)
+        self.per_key
+            .as_deref_mut()?
+            .iter_mut()
+            .find(|a| a.key.as_str() == key)
     }
 }
 
@@ -413,7 +439,10 @@ impl WarningTotals {
         let mut non_numeric: RapidHashMap<SmartString, u64> = RapidHashMap::default();
         let mut reservoir_engaged = false;
         for g in groups {
-            for accum in &g.per_key {
+            let Some(pk) = g.per_key.as_deref() else {
+                continue;
+            };
+            for accum in pk {
                 if accum.non_numeric > 0 {
                     *non_numeric.entry(accum.key.clone()).or_insert(0) += accum.non_numeric;
                 }

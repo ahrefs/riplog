@@ -62,6 +62,11 @@ pub(crate) struct Counter {
     counts: BTreeMap<Option<Timestamp>, RapidHashMap<Combo, Aggregates>>,
     scratch: String,
     mode: CounterMode,
+    /// Cached `!keys.is_empty() || bucket.is_some() || spec.has_numeric()`.
+    /// Read twice per line on the hot path (timestamp-extract gate +
+    /// `record` short-circuit); recomputing it forced 4 dependent loads
+    /// through `spec`'s `Vec` lengths per call.
+    is_active: bool,
 }
 
 impl Counter {
@@ -84,6 +89,7 @@ impl Counter {
             },
             _ => CounterMode::Batched,
         };
+        let is_active = !keys.is_empty() || bucket.is_some() || spec.has_numeric();
         Self {
             keys,
             bucket,
@@ -91,16 +97,16 @@ impl Counter {
             counts: BTreeMap::default(),
             scratch: String::new(),
             mode,
+            is_active,
         }
     }
 
     #[inline]
     pub(crate) fn is_active(&self) -> bool {
-        // Bare `--count` alone is handled by `count_only` in
-        // `emit_summaries`; the counter only needs to fire when there
-        // are group keys, a bucket, or a numeric aggregate (which needs
-        // per-line value extraction).
-        !self.keys.is_empty() || self.bucket.is_some() || self.spec.has_numeric()
+        // Cached at construction: bare `--count` alone is handled by
+        // `count_only` in `emit_summaries`; the counter only needs to fire
+        // when there are group keys, a bucket, or a numeric aggregate.
+        self.is_active
     }
 
     /// Borrow the spec — used by the formatter to know which aggregate
