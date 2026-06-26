@@ -3,6 +3,7 @@
 //! config) into a single struct. The streaming helpers in `run.rs` hold
 //! `&mut Pipeline` and call `process_line` for each line read.
 
+use std::collections::VecDeque;
 use std::io::Write;
 
 use crate::filter::Filter;
@@ -10,6 +11,38 @@ use crate::logfmt;
 use crate::run::TimeFilter;
 use crate::sinks::{LineEmitter, Recorders, RunConfig};
 use crate::timestamp;
+
+/// Tracks before/after context lines around matched lines.
+pub(crate) struct ContextState {
+    before_buf: VecDeque<Vec<u8>>,
+    before_n: usize,
+    after_n: usize,
+    remaining_after: usize,
+}
+
+impl ContextState {
+    pub(crate) fn new(before_n: usize, after_n: usize) -> Self {
+        Self {
+            before_buf: VecDeque::with_capacity(before_n),
+            before_n,
+            after_n,
+            remaining_after: 0,
+        }
+    }
+
+    pub(crate) fn disabled() -> Self {
+        Self::new(0, 0)
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        self.before_n > 0 || self.after_n > 0
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.before_buf.clear();
+        self.remaining_after = 0;
+    }
+}
 
 /// Per-line state bundle: the borrows that every line-processing call needs.
 ///
@@ -22,6 +55,7 @@ pub(crate) struct Pipeline<'a> {
     pub(crate) cfg: &'a RunConfig<'a>,
     pub(crate) recorders: &'a mut Recorders,
     pub(crate) emitter: &'a mut LineEmitter,
+    pub(crate) context: &'a mut ContextState,
 }
 
 impl<'a> Pipeline<'a> {
@@ -31,6 +65,7 @@ impl<'a> Pipeline<'a> {
         cfg: &'a RunConfig<'a>,
         recorders: &'a mut Recorders,
         emitter: &'a mut LineEmitter,
+        context: &'a mut ContextState,
     ) -> Self {
         Self {
             filter,
@@ -38,6 +73,7 @@ impl<'a> Pipeline<'a> {
             cfg,
             recorders,
             emitter,
+            context,
         }
     }
 
@@ -116,8 +152,30 @@ impl<'a> Pipeline<'a> {
             // `follow_loop`), which is a real win when many lines match.
             self.recorders.keys.record(parsed);
             self.recorders.values.record(parsed);
+            // Flush buffered before-context lines verbatim, then emit match.
+            if self.context.is_active() {
+                for ctx_line in self.context.before_buf.drain(..) {
+                    output.write_all(&ctx_line)?;
+                }
+                self.context.remaining_after = self.context.after_n;
+            }
             self.emitter
                 .emit(parsed, line, raw_len, parse_end, self.cfg, output)?;
+        } else if self.context.remaining_after > 0 {
+            // Emit as after-context verbatim.
+            output.write_all(line)?;
+            self.context.remaining_after -= 1;
+        } else if self.context.before_n > 0 {
+            // Buffer for potential before-context, recycling evicted slots.
+            let mut slot = if self.context.before_buf.len() == self.context.before_n {
+                let mut v = self.context.before_buf.pop_front().unwrap();
+                v.clear();
+                v
+            } else {
+                Vec::with_capacity(line.len())
+            };
+            slot.extend_from_slice(line);
+            self.context.before_buf.push_back(slot);
         }
         Ok(())
     }

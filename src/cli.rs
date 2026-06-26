@@ -141,6 +141,18 @@ pub struct Cli {
     #[arg(short = 'n', long)]
     pub limit: Option<usize>,
 
+    /// Print N lines of context before each match (like ripgrep -B).
+    #[arg(short = 'B', long = "before-context", value_name = "N")]
+    pub before_context: Option<usize>,
+
+    /// Print N lines of context after each match (like ripgrep -A).
+    #[arg(short = 'A', long = "after-context", value_name = "N")]
+    pub after_context: Option<usize>,
+
+    /// Print N lines of context before and after each match (like ripgrep -C).
+    #[arg(short = 'C', long = "context", value_name = "N")]
+    pub context: Option<usize>,
+
     /// Randomly drop matched lines, keeping each with probability `rate`
     /// (a float in `[0, 1]`). Applied after `--if` and time-window filters,
     /// before counters/sinks — so `--count`, `--count-by`, etc. reflect the
@@ -219,5 +231,13 @@ impl Cli {
     /// in `plan_file` and as the bucket-close grace in streaming-bucket mode.
     pub fn window_nanos(&self) -> i64 {
         (self.window_secs as i64).saturating_mul(1_000_000_000)
+    }
+
+    pub fn context_before(&self) -> usize {
+        self.before_context.or(self.context).unwrap_or(0)
+    }
+
+    pub fn context_after(&self) -> usize {
+        self.after_context.or(self.context).unwrap_or(0)
     }
 }

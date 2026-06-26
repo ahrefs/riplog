@@ -18,7 +18,7 @@ use crate::input::FileInput;
 use crate::json::JsonlFormat;
 use crate::logfmt::LogfmtFormat;
 use crate::output::Formatter;
-use crate::pipeline::Pipeline;
+use crate::pipeline::{ContextState, Pipeline};
 use crate::sampler::build_sampler;
 use crate::signal_handling::{install_signal_handler, interrupted};
 use crate::sinks::{LineEmitter, Recorders, RunConfig};
@@ -431,8 +431,9 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
             let mut recorders = Recorders::new(cli, bucket, streaming_grace);
             let mut emitter = LineEmitter::new(cli.raw_key.as_deref(), cli.sort_by.as_deref());
             let tf_default = TimeFilter::default();
+            let mut ctx = ContextState::new(cli.context_before(), cli.context_after());
             let mut pipeline =
-                Pipeline::new(&filter, &tf_default, &cfg, &mut recorders, &mut emitter);
+                Pipeline::new(&filter, &tf_default, &cfg, &mut recorders, &mut emitter, &mut ctx);
             stream_unbounded(&mut std::io::stdin().lock(), &mut pipeline, &mut output)?;
             output.flush()?;
             emitter.flush_sort_buf(&mut output)?;
@@ -461,6 +462,7 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
                 (cli.bucket.is_some() && (following || has_stdin)).then(|| cli.window_nanos());
             let mut recorders = Recorders::new(cli, bucket, master_streaming_grace);
             let mut emitter = LineEmitter::new(cli.raw_key.as_deref(), cli.sort_by.as_deref());
+            let mut ctx = ContextState::new(cli.context_before(), cli.context_after());
 
             // Phase 2: stream each planned range in order. Only the last file
             // may attach the follow loop (set during planning).
@@ -510,12 +512,16 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
                                 remove_keys: &remove_view,
                             };
                             {
+                                // Workers process independent byte ranges; context
+                                // across chunk boundaries would be wrong, so disable it.
+                                let mut worker_ctx = ContextState::disabled();
                                 let mut pipeline = Pipeline::new(
                                     filter_ref,
                                     &plan_tf,
                                     &worker_cfg,
                                     &mut worker_recorders,
                                     &mut worker_emitter,
+                                    &mut worker_ctx,
                                 );
                                 stream_bounded(&mut reader, byte_budget, &mut pipeline, sink)?;
                             }
@@ -536,6 +542,7 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
                         &cfg,
                         &mut recorders,
                         &mut emitter,
+                        &mut ctx,
                     )?;
                 }
             }
@@ -568,7 +575,9 @@ fn stream_plan<W: Write>(
     cfg: &RunConfig<'_>,
     recorders: &mut Recorders,
     emitter: &mut LineEmitter,
+    ctx: &mut ContextState,
 ) -> anyhow::Result<()> {
+    ctx.reset();
     let FilePlan {
         path,
         start_byte,
@@ -582,7 +591,7 @@ fn stream_plan<W: Write>(
     if is_stdin_path(path) {
         // No bisect, no follow loop. Per-line `tf` still applies (resolved
         // against the real files' span by the caller).
-        let mut pipeline = Pipeline::new(filter, &tf, cfg, recorders, emitter);
+        let mut pipeline = Pipeline::new(filter, &tf, cfg, recorders, emitter, ctx);
         return stream_unbounded(&mut std::io::stdin().lock(), &mut pipeline, output);
     }
 
@@ -590,7 +599,7 @@ fn stream_plan<W: Write>(
         // Streaming zstd: no seek, no follow (rejected earlier). Treat like
         // stdin — the per-line `TimeFilter::check` enforces the window.
         let mut input = FileInput::open(path)?;
-        let mut pipeline = Pipeline::new(filter, &tf, cfg, recorders, emitter);
+        let mut pipeline = Pipeline::new(filter, &tf, cfg, recorders, emitter, ctx);
         return stream_unbounded(&mut input, &mut pipeline, output);
     }
 
@@ -608,13 +617,15 @@ fn stream_plan<W: Write>(
         })?;
         let mut reader = BufReader::with_capacity(STREAM_BUF_CAP, file);
         {
-            let mut pipeline = Pipeline::new(filter, &tf, cfg, &mut *recorders, &mut *emitter);
+            let mut pipeline =
+                Pipeline::new(filter, &tf, cfg, &mut *recorders, &mut *emitter, ctx);
             stream_bounded(&mut reader, max_bytes, &mut pipeline, output)?;
         }
         output.flush()?;
         if !interrupted() && !pipeline_done(cfg, recorders) {
             let tf_follow = TimeFilter::default();
-            let mut pipeline = Pipeline::new(filter, &tf_follow, cfg, recorders, emitter);
+            let mut pipeline =
+                Pipeline::new(filter, &tf_follow, cfg, recorders, emitter, ctx);
             follow_loop(
                 path,
                 handle,
@@ -631,7 +642,7 @@ fn stream_plan<W: Write>(
     input.seek(SeekFrom::Start(start_byte))?;
     let mut reader = BufReader::with_capacity(STREAM_BUF_CAP, input);
     {
-        let mut pipeline = Pipeline::new(filter, &tf, cfg, &mut *recorders, &mut *emitter);
+        let mut pipeline = Pipeline::new(filter, &tf, cfg, &mut *recorders, &mut *emitter, ctx);
         stream_bounded(&mut reader, max_bytes, &mut pipeline, output)?;
     }
     output.flush()?;
