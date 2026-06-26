@@ -891,6 +891,20 @@ fn parallel_rejects_limit() {
 }
 
 #[test]
+fn parallel_rejects_context() {
+    let path = big_fixture().to_str().unwrap();
+    for flag in ["-A1", "-B1", "-C1"] {
+        let out = Command::new(riplog_bin())
+            .args(["-j=4", flag, path])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{flag} should be rejected with -j");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("cannot be combined"), "{flag} stderr was: {err}");
+    }
+}
+
+#[test]
 fn parallel_falls_back_on_small_input() {
     // Standard fixture is < MIN_BYTES_PER_WORKER, so -j=4 falls back to a
     // single-chunk pass; output should be identical to sequential.

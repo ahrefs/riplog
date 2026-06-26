@@ -280,6 +280,14 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
         anyhow::bail!("`-j`/`--parallel` cannot be combined with `-n`/`--limit`");
     }
 
+    if resolve_parallelism(cli) > 1 && (cli.context_before() > 0 || cli.context_after() > 0) {
+        anyhow::bail!(
+            "`-j`/`--parallel` cannot be combined with `-A`/`-B`/`-C`: \
+             workers split the file at arbitrary byte boundaries, so context \
+             lines at chunk edges would be missing or duplicated"
+        );
+    }
+
     let filter = Filter::parse(&cli.keys)?;
     let line_transform = parse_line_transform(cli)?;
     if let Some(ref t) = line_transform {
